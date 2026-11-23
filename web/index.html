@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#17171b">
+<meta name="robots" content="noindex, nofollow">
+<title>RemoteClaude</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<section id="auth" hidden>
+  <form id="authForm" novalidate>
+    <h1>RemoteClaude</h1>
+    <p id="authHint" class="muted">登录后查看和操作电脑上的 Claude 会话窗口</p>
+    <input id="email" type="email" placeholder="邮箱" autocomplete="username" required>
+    <div id="codeRow" class="code-row" hidden>
+      <input id="code" type="text" inputmode="numeric" maxlength="6" placeholder="6 位验证码" autocomplete="one-time-code">
+      <button id="sendCode" type="button">发送验证码</button>
+    </div>
+    <input id="password" type="password" placeholder="密码" autocomplete="current-password" required>
+    <button id="authSubmit" type="submit" class="primary">登录</button>
+    <p id="authError" class="error" hidden></p>
+    <p id="authInfo" class="info" hidden></p>
+    <p class="links">
+      <a href="#login" id="toLogin">去登录</a>
+      <a href="#register" id="toRegister">注册账号</a>
+      <a href="#forgot" id="toForgot">忘记密码</a>
+    </p>
+  </form>
+</section>
+
+<section id="app" hidden>
+  <header id="bar">
+    <button id="btnPick" type="button" class="title">
+      <span id="dot" class="dot wait"></span>
+      <span id="curTitle">选择会话</span>
+      <span class="caret">▾</span>
+    </button>
+    <button id="btnFit" type="button" title="还原缩放">适应</button>
+    <button id="btnKeys" type="button" title="显示或隐藏按键和输入栏">键盘</button>
+    <button id="btnLogout" type="button" title="退出登录">退出</button>
+  </header>
+
+  <main id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <div id="hint">正在连接…</div>
+  </main>
+
+  <footer id="tools">
+    <div id="keys">
+      <button type="button" data-k="Escape">Esc</button>
+      <button type="button" data-k="Enter">回车</button>
+      <button type="button" data-k="Enter" data-m="2">换行</button>
+      <button type="button" data-k="Backspace">退格</button>
+      <button type="button" data-k="ArrowUp">↑</button>
+      <button type="button" data-k="ArrowDown">↓</button>
+      <button type="button" data-k="ArrowLeft">←</button>
+      <button type="button" data-k="ArrowRight">→</button>
+      <button type="button" data-k="Tab">Tab</button>
+      <button type="button" data-k="Tab" data-m="2">Shift+Tab</button>
+      <button type="button" data-k="Delete">Del</button>
+      <button type="button" data-k="a" data-m="1">全选</button>
+      <button type="button" data-k="c" data-m="1">复制</button>
+      <button type="button" data-k="v" data-m="1">粘贴</button>
+      <button type="button" data-k="z" data-m="1">撤销</button>
+    </div>
+    <form id="composer">
+      <button id="btnImage" type="button" title="选一张图片粘贴进远程窗口的输入框（也可以直接在这里粘贴图片）">图片</button>
+      <input id="imageFile" type="file" accept="image/*" hidden>
+      <textarea id="text" rows="1" placeholder="在这里打字，再发到远程窗口" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+      <button id="btnType" type="button" title="只把文字填进远程窗口">填入</button>
+      <button id="btnSend" type="submit" class="primary" title="填入文字并按回车">发送</button>
+    </form>
+  </footer>
+
+  <div id="picker" hidden>
+    <div class="sheet">
+      <div class="sheet-head">
+        <strong>选择会话</strong>
+        <button id="btnRefresh" type="button">刷新</button>
+        <button id="btnClose" type="button">关闭</button>
+      </div>
+      <div id="hostTabs"></div>
+      <div id="list"></div>
+      <div class="sheet-foot muted">账号 <span id="accountEmail"></span></div>
+    </div>
+  </div>
+
+  <div id="toast" hidden></div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>

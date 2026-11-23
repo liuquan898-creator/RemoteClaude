@@ -1,0 +1,13 @@
+{
+  "name": "remote-claude",
+  "version": "0.1.0",
+  "private": true,
+  "description": "只远程控制电脑上 Claude 会话窗口的轻量远控工具",
+  "license": "MIT",
+  "scripts": {
+    "setup": "npm --prefix server install && npm --prefix host install && node scripts/init-config.js",
+    "init-config": "node scripts/init-config.js",
+    "server": "node server/server.js",
+    "host": "npm --prefix host start"
+  }
+}

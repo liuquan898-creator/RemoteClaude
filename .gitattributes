@@ -1,0 +1,5 @@
+# 仓库里统一存 LF，检出时按各平台习惯转换（服务器端代码要在 Linux 上跑）
+* text=auto
+*.png binary
+*.jpg binary
+*.ico binary

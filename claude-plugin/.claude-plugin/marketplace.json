@@ -1,0 +1,12 @@
+{
+  "name": "remoteclaude-local",
+  "owner": { "name": "RemoteClaude" },
+  "description": "RemoteClaude：在手机上审批和回答 Claude Code（本地安装包）",
+  "plugins": [
+    {
+      "name": "remoteclaude",
+      "source": "./remoteclaude",
+      "description": "Claude Code 要审批或提问时推到 RemoteClaude 手机 App，在手机上作答（需要电脑上运行 RemoteClaude 被控端，仅 Windows）。"
+    }
+  ]
+}

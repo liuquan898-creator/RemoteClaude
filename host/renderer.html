@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src ws: wss:; style-src 'self'; script-src 'self'; img-src 'self' data:">
+<title>RemoteClaude 被控端</title>
+<link rel="stylesheet" href="renderer.css">
+</head>
+<body>
+  <section id="loginView" hidden>
+    <h1>RemoteClaude 被控端</h1>
+    <p class="muted">用和手机上同一个账号登录，手机就能看到并操作这台电脑上的 Claude 会话。</p>
+    <form id="loginForm" class="card">
+      <label>邮箱<input id="email" type="email" autocomplete="username" required></label>
+      <label>密码<input id="password" type="password" autocomplete="current-password" required></label>
+      <button id="loginBtn" type="submit" class="primary">登录</button>
+      <p id="loginError" class="error" hidden></p>
+    </form>
+    <p class="links">
+      <a href="#" id="toRegister">注册账号</a>
+      <span class="muted">·</span>
+      <a href="#" id="toForgot">忘记密码</a>
+      <span class="muted">（在浏览器里打开）</span>
+    </p>
+    <p class="muted small">服务器：<span id="loginServer"></span></p>
+  </section>
+
+  <section id="mainView" hidden>
+    <header>
+      <span id="dot" class="dot off"></span>
+      <div>
+        <div id="status">正在启动…</div>
+        <div id="server" class="muted"></div>
+      </div>
+      <button id="reconnect" hidden>重新连接</button>
+    </header>
+
+    <div class="account card">
+      <span>账号 <strong id="accountEmail"></strong> · 本机名 <strong id="deviceName"></strong></span>
+      <button id="logout">退出登录</button>
+    </div>
+
+    <h2>正在远程查看的设备</h2>
+    <div id="viewers" class="card muted">暂无</div>
+
+    <h2>日志</h2>
+    <pre id="log" class="card"></pre>
+  </section>
+
+  <script src="sdp.js"></script>
+  <script src="hostcmd.js"></script>
+  <script src="winlist.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

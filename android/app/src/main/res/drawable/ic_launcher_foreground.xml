@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 图标：一个窗口加一个鼠标指针。画布 108dp，内容都在中间 66dp 的安全区内 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 窗口外框 -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M35,32 H73 A5,5 0 0 1 78,37 V67 A5,5 0 0 1 73,72 H35 A5,5 0 0 1 30,67 V37 A5,5 0 0 1 35,32 Z"
+        android:strokeWidth="4"
+        android:strokeColor="#FFFFFFFF" />
+    <!-- 标题栏分隔线 -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M30,43 H78"
+        android:strokeWidth="4"
+        android:strokeColor="#FFFFFFFF" />
+    <!-- 鼠标指针 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M58,50 L58,78 L64.5,71.5 L69,81 L73,79 L68.5,69.5 L77,69.5 Z"
+        android:strokeWidth="2.5"
+        android:strokeColor="#FFD97757"
+        android:strokeLineJoin="round" />
+</vector>

@@ -1,0 +1,10 @@
+{
+  "server": "rc.example.com",
+  "hostAppId": "com.example.remoteclaude.host",
+  "releaseSsh": "my-server",
+  "releaseDir": "/opt/remote-claude/releases",
+  "env": {
+    "ELECTRON_MIRROR": "https://npmmirror.com/mirrors/electron/",
+    "ELECTRON_BUILDER_BINARIES_MIRROR": "https://npmmirror.com/mirrors/electron-builder-binaries/"
+  }
+}

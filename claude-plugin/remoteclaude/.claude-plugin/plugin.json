@@ -1,0 +1,6 @@
+{
+  "name": "remoteclaude",
+  "version": "1.0.10",
+  "description": "Claude Code 要审批或提问时推到 RemoteClaude 手机 App，在手机上作答。需要电脑上运行 RemoteClaude 被控端（0.8.0 起），说明见仓库 docs/09-approvals.md。",
+  "author": { "name": "RemoteClaude" }
+}

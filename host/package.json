@@ -1,0 +1,21 @@
+{
+  "name": "remote-claude-host",
+  "version": "0.9.21",
+  "private": true,
+  "description": "RemoteClaude 被控端：采集并操作本机的 Claude 会话窗口",
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "dist": "electron-builder --win nsis --publish never --config electron-builder.config.js"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11",
+    "koffi": "^3.3.8"
+  },
+  "devDependencies": {
+    "electron": "^45.3.4",
+    "electron-builder": "26.18.0"
+  }
+}

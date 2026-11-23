@@ -1,0 +1,20 @@
+{
+  "name": "remote-claude-server",
+  "version": "0.2.0",
+  "private": true,
+  "description": "RemoteClaude 信令服务器：账号、按账号转发信令、托管控制端网页",
+  "license": "MIT",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "nodemailer": "^10.6.0",
+    "tencentcloud-sdk-nodejs-ses": "^4.1.271",
+    "ws": "^8.23.0"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

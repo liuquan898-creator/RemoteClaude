@@ -1,0 +1,24 @@
+# systemd 服务示例：让信令服务器开机自启、崩溃自动重启。
+# 假设代码放在 /opt/remote-claude（包含 server/ 和 web/ 两个目录），用专门的低权限用户运行。
+#   sudo useradd --system --home /opt/remote-claude remoteclaude
+#   sudo cp remote-claude.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now remote-claude
+
+[Unit]
+Description=RemoteClaude signaling server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=remoteclaude
+WorkingDirectory=/opt/remote-claude/server
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

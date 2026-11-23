@@ -1,0 +1,21 @@
+# Caddy 的站点块，把 rc.example.com 换成自己的域名。服务器上已经有 Caddy 就加到它的 Caddyfile 末尾。
+# 前提：子域名已解析到服务器；信令容器 remote-claude 和 Caddy 在同一个 docker 网络里。
+#
+# 用独立子域名而不是挂在主站的某个路径下：网页控制端把登录令牌存在浏览器里，
+# 和主站同源的话，主站一旦出现脚本注入就能读到它，而这个令牌等于能操作电脑。
+
+rc.example.com {
+	encode gzip
+	reverse_proxy remote-claude:8787 {
+		# 别的项目重载 Caddy 时，已有的 WebSocket 长连接延后 10 分钟再断，避免被控端和手机掉线
+		stream_close_delay 10m
+	}
+}
+
+# 单独一台服务器、不用 Docker 时，信令服务监听本机 8787，写成：
+# rc.example.com {
+# 	encode gzip
+# 	reverse_proxy 127.0.0.1:8787 {
+# 		stream_close_delay 10m
+# 	}
+# }

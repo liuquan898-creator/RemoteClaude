@@ -1,0 +1,51 @@
+# 服务器上的编排：信令服务 + coturn 中继。
+#
+# 目录约定（服务器上 /opt/remote-claude）：
+#   compose.yaml          本文件
+#   src/                  仓库里 server/ web/ deploy/ 的副本（构建镜像用）
+#   server.config.json    信令服务配置，含发信密码和 TURN 密钥，属主 uid 1000、权限 600
+#   turnserver.conf       coturn 配置，含共享密钥，属主 uid 65534、权限 600
+#   data/                 账号数据库（SQLite），属主 uid 1000，要定期备份
+#   releases/             安装包发布目录（android/、host/），由 scripts/release.js 上传，只读挂进容器（docs/08）
+#
+# 信令服务不占宿主机端口，只加入已有反向代理所在的 docker 网络，由反向代理按容器名转发。
+# coturn 必须用宿主机网络：它要监听 3478 和一段中继端口，用端口映射既慢又容易漏。
+name: remote-claude
+
+services:
+  signaling:
+    build:
+      context: ./src
+      dockerfile: deploy/Dockerfile
+    image: remote-claude-signaling:latest
+    container_name: remote-claude
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    environment:
+      RC_RELEASES_DIR: /app/releases
+    volumes:
+      - ./server.config.json:/app/server/config.json:ro
+      - ./data:/app/data
+      - ./releases:/app/releases:ro
+    networks: [proxy]
+
+  coturn:
+    image: coturn/coturn:4.19.1
+    container_name: remote-claude-coturn
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 128m
+    # 不用镜像默认参数（它会在启动时联网探测公网 IP），一切以配置文件为准
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+
+networks:
+  proxy:
+    # 反向代理（Caddy）所在的 docker 网络，要已经存在。名字写在同目录的 .env 里：RC_PROXY_NETWORK=实际的网络名
+    # （docker network ls 查看），不写就用 proxy
+    name: ${RC_PROXY_NETWORK:-proxy}
+    external: true

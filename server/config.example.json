@@ -1,0 +1,21 @@
+{
+  "port": 8787,
+  "bind": "127.0.0.1",
+  "trustProxy": false,
+  "registration": { "open": true },
+  "mail": {
+    "mode": "log",
+    "host": "smtp.qcloudmail.com",
+    "port": 465,
+    "secure": true,
+    "user": "发信地址，mode 为 smtp 时必填",
+    "pass": "SMTP 密码，mode 为 smtp 时必填",
+    "from": "RemoteClaude <发信地址>"
+  },
+  "iceServers": [],
+  "turn": {
+    "urls": [],
+    "secret": "",
+    "ttlSeconds": 86400
+  }
+}

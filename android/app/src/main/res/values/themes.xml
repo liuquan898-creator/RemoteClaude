@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="rc_bg">#FF17171B</color>
+    <color name="rc_accent">#FFD97757</color>
+
+    <style name="Theme.RemoteClaude" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/rc_bg</item>
+        <item name="android:colorAccent">@color/rc_accent</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

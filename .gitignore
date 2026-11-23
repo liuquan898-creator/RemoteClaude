@@ -1,0 +1,41 @@
+# 依赖
+node_modules/
+
+# 含口令和令牌的本地配置（示例见同目录的 config.example.json）
+server/config.json
+host/config.json
+host/config.*.json
+!host/config.example.json
+deploy/prod/
+
+# 信令服务器的账号数据库（本机测试时生成在 server/data/）
+server/data/
+
+# 日志
+*.log
+
+# 编好给手机安装的安装包
+dist/
+
+# 安卓工程的构建产物和本机文件
+android/.gradle/
+android/.kotlin/
+android/**/build/
+android/local.properties
+android/.idea/
+*.jks
+*.keystore
+*.apk
+*.aab
+
+# Claude Code 的本机设置（这台电脑上的免审批许可，见 docs/07 第 8 节）
+.claude/settings.local.json
+
+# 编辑器和系统文件
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# 安卓正式版签名配置（指向 deploy/prod 里的签名文件）
+android/keystore.properties

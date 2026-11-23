@@ -1,0 +1,32 @@
+# coturn 配置示例：电脑和手机无法直连时，画面经这里中继。
+# 实际部署用 scripts/init-prod-config.js 生成的 deploy/prod/turnserver.conf（规则更全，含配额限制），
+# 本文件只用来说明各项含义。
+# 安装: sudo apt install coturn    配置文件: /etc/turnserver.conf
+# 防火墙需放行: 3478/udp、3478/tcp，以及下面的中继端口段 49160-49200/udp
+
+listening-port=3478
+fingerprint
+
+# 临时凭据模式：凭据由信令服务器按这个密钥签发，24 小时过期。
+# 这里的值必须和 server/config.json 里 turn.secret 完全一致。
+use-auth-secret
+static-auth-secret=换成一段随机长字符串
+realm=rc.example.com
+
+# 中继用的端口段，开得小一点便于配防火墙（一个观看连接占一个端口）
+min-port=49160
+max-port=49200
+
+# 云服务器的公网 IP 通常不在网卡上，需要显式声明: external-ip=公网IP/内网IP
+# external-ip=203.0.113.10/10.0.0.5
+
+# 禁止把中继当跳板去访问服务器所在的内网
+no-multicast-peers
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+
+no-cli
+no-tlsv1
+no-tlsv1_1

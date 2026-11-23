@@ -1,0 +1,7 @@
+{
+  "server": "ws://127.0.0.1:8787/ws",
+  "targets": ["claude.exe"],
+  "maxBitrateKbps": 10000,
+  "maxFps": 30,
+  "codec": "VP9"
+}

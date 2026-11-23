@@ -116,12 +116,26 @@ function bumpHost(version) {
 
 // ------------------------------------------------------------------ 打包
 
+/**
+ * 打好的 App 里写的服务器要和打包配置对得上。看的是构建时生成的 BuildConfig.java（正式版）：
+ * gradle 自己读打包配置，万一它读的不是脚本读的那一份（比如环境变量没传过去），在这里拦下来
+ */
+function checkBuiltAndroidServer() {
+  if (!BUILD.server) return;
+  const f = path.join(ROOT, 'android', 'app', 'build', 'generated', 'source', 'buildConfig', 'release', 'com', 'remoteclaude', 'android', 'BuildConfig.java');
+  const text = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '';
+  if (!text.includes(`SERVER_ADDRESS = "${BUILD.server}"`) || !text.includes('SERVER_EDITABLE = false')) {
+    fail(`打好的 App 里写的服务器不是打包配置里的 ${BUILD.server}（看 android/app/build/generated/source/buildConfig/release 下的 BuildConfig.java）`);
+  }
+}
+
 function buildAndroid(version, versionCode, notes, stage) {
   if (!fs.existsSync(KEYSTORE_PROPS)) {
     fail('没有 android/keystore.properties（正式签名）。签名和手机上装的不一样就没法直接升级，见 docs/08');
   }
   const gradle = path.join(ROOT, 'android', process.platform === 'win32' ? 'gradlew.bat' : 'gradlew');
   run(gradle, ['testDebugUnitTest', 'assembleRelease', '--console=plain'], { cwd: path.join(ROOT, 'android'), shell: true });
+  checkBuiltAndroidServer();
   const built = path.join(ROOT, 'android', 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk');
   const name = `RemoteClaude-${version}.apk`;
   fs.mkdirSync(path.join(ROOT, 'dist'), { recursive: true });

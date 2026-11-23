@@ -35,8 +35,8 @@ android {
         applicationId = "com.remoteclaude.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 19
-        versionName = "0.9.7"
+        versionCode = 20
+        versionName = "0.9.8"
         // 打包配置里的服务器地址（见上面），没配是空字符串
         buildConfigField("String", "SERVER_ADDRESS", "\"$serverAddress\"")
         // 只打包 64 位 ARM 和模拟器用的 x86_64，WebRTC 的原生库很大

@@ -33,6 +33,8 @@ module.exports = {
     'winlist.js',
     'winorder.js',
     'unlockkey.js',
+    'unlockpipe.js',
+    'unlockpipe-native.js',
     'files.js',
     'account.js',
     'win32.js',

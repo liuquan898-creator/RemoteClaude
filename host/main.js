@@ -23,7 +23,6 @@ const {
   dialog,
 } = require('electron');
 const fs = require('fs');
-const net = require('net');
 const path = require('path');
 const win32 = require('./win32');
 const { Account } = require('./account');
@@ -1016,43 +1015,18 @@ const dialogWatch = dialogWatchLib.createDialogWatch({
 
 // ---------------------------------------------------------------- 锁定与解锁（协议文档 4.6，解锁服务见 docs/06）
 
-const UNLOCK_PIPE = String.raw`\\.\pipe\RemoteClaudeUnlock`;
 const LOCK_POLL_MS = 2000;
 const SERVICE_CHECK_MS = 30000;
 let lockState = { locked: false, unlock: false };
 let serviceCheckedAt = 0;
 let unlocking = false;
 
-/** 给解锁服务发一条命令，返回它回的一行；连不上或超时返回 null。服务一次只接一个连接，忙时稍等重试 */
-async function askUnlockService(line, timeoutMs) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const reply = await new Promise((resolve) => {
-      let buf = '';
-      let done = false;
-      const sock = net.connect(UNLOCK_PIPE);
-      const finish = (v) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        sock.destroy();
-        resolve(v);
-      };
-      const timer = setTimeout(() => finish({ timeout: true }), timeoutMs);
-      sock.setEncoding('utf8');
-      sock.on('connect', () => sock.write(line + '\n'));
-      sock.on('data', (d) => {
-        buf += d;
-        const i = buf.indexOf('\n');
-        if (i >= 0) finish({ line: buf.slice(0, i).trim() });
-      });
-      sock.on('error', (err) => finish({ error: err.code }));
-      sock.on('close', () => finish(buf.trim() ? { line: buf.trim() } : { error: 'closed' }));
-    });
-    if (reply.line) return reply.line;
-    if (reply.timeout || (reply.error !== 'ENOENT' && reply.error !== 'EBUSY')) return null;
-    await sleep(400);
-  }
-  return null;
+// 连上管道后先核实对面确实是装在 Program Files 里、以 SYSTEM 运行的解锁服务，才发命令（docs/06 的"管道防冒充"）
+const unlockPipe = require('./unlockpipe').createUnlockPipe({ log: (msg) => console.log('[解锁] ' + msg) });
+
+/** 给解锁服务发一条命令，返回它回的一行；没装服务、核实不过、连不上或超时返回 null */
+function askUnlockService(line, timeoutMs) {
+  return unlockPipe.ask(line, timeoutMs);
 }
 
 /** 定时看电脑是否锁屏、解锁服务在不在，有变化就告诉页面，页面再告诉所有控制端 */

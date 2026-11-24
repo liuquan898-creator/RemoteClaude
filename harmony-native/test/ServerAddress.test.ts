@@ -1,7 +1,7 @@
 // 对照 android/app/src/test/.../protocol/ServerAddressTest.kt
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseServerAddress } from '../entry/src/main/ets/protocol/ServerAddress';
+import { parseServerAddress, restoreServerAddress } from '../entry/src/main/ets/protocol/ServerAddress';
 import type { ServerAddressResult } from '../entry/src/main/ets/protocol/ServerAddress';
 
 function ok(input: string, cleartext = false): ServerAddressResult {
@@ -50,4 +50,19 @@ test('不认乱填的', () => {
   invalid('   ');
   invalid('ftp://rc.example.com');
   invalid('https://');
+});
+
+test('沿用手机上存的地址', () => {
+  // 以前的正式版登录时存下的是打包时写进去的地址（只有域名），升级后照样能用
+  const r = restoreServerAddress('rc.example.com', false);
+  assert.equal(r?.url, 'wss://rc.example.com/ws');
+  assert.equal(r?.httpBase, 'https://rc.example.com');
+  assert.equal(restoreServerAddress('', false), null);
+  assert.equal(restoreServerAddress('ws://10.0.2.2:8787', false), null);
+  assert.equal(restoreServerAddress('ws://10.0.2.2:8787', true)?.url, 'ws://10.0.2.2:8787/ws');
+});
+
+test('和被控端认同样的写法', () => {
+  assert.equal(ok('wss://rc.example.com/ws').url, 'wss://rc.example.com/ws');
+  assert.equal(ok('ws://127.0.0.1:8787/ws', true).url, 'ws://127.0.0.1:8787/ws');
 });

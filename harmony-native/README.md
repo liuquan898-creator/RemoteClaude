@@ -6,6 +6,6 @@ HarmonyOS NEXT 原生 App（ArkTS + ArkUI），功能对齐安卓 App。设计�
 pwsh -File harmony-native\scripts\install.ps1
 ```
 
-构建正式版并用 hdc 装到 USB 连着的手机。第一次要先在 DevEco Studio 里自动签名、运行 `node harmony-native/scripts/take-signing.js`（签名不入库，见 docs/10 第 5 节）。
+构建正式版并用 hdc 装到 USB 连着的手机。安装包里不带服务器地址，第一次在登录页填。第一次构建要先在 DevEco Studio 里自动签名、运行 `node harmony-native/scripts/take-signing.js`（签名不入库，见 docs/10 第 5 节）。
 
 单元测试（电脑上用 Node 24 跑）：`bash harmony-native/scripts/test.sh`

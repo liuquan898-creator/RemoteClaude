@@ -12,7 +12,7 @@ import {
   lockNowEvent, newSessionMessage, openSessionMessage, pushRegisterMessage, pushUnregisterMessage, selectMessage,
   stopMessage, tileEvent, unlockEvent, BUTTON_LEFT, BUTTON_RIGHT
 } from './protocol/Protocol';
-import { parseServerAddress, ServerAddressResult } from './protocol/ServerAddress';
+import { parseServerAddress, restoreServerAddress, ServerAddressResult } from './protocol/ServerAddress';
 import { UnlockCipher } from './protocol/UnlockCipher';
 import { AuthApi, DeviceInfo } from './net/AuthApi';
 import { SignalingClient } from './net/SignalingClient';
@@ -58,9 +58,7 @@ const DISCONNECTED_GRACE_MS = 5000;
 export const CLIENT_NAME = `harmony/${BuildProfile.VERSION_NAME}`;
 
 /** 能不能在明文的 ws:// 上连：调试版可以，方便连局域网里的测试服务器 */
-const ALLOW_CLEARTEXT = BuildProfile.DEBUG;
-/** 打包时没写服务器地址，或者是调试版：登录页显示地址框 */
-export const SERVER_EDITABLE = BuildProfile.SERVER_ADDRESS.length === 0 || BuildProfile.DEBUG;
+export const ALLOW_CLEARTEXT = BuildProfile.DEBUG;
 
 /**
  * 整个控制端的状态机，对照安卓端 RemoteController.kt：账号、信令连接、电脑与窗口列表、画面连接、输入、
@@ -151,10 +149,11 @@ export class RemoteController {
       return;
     }
     const stored = SettingsStore.load();
-    const server = SERVER_EDITABLE && stored.server.length > 0 ? stored.server : BuildProfile.SERVER_ADDRESS;
-    const parsed = parseServerAddress(server, ALLOW_CLEARTEXT);
-    this.wsUrl = parsed.ok ? parsed.url : '';
-    this.httpBase = parsed.ok ? parsed.httpBase : '';
+    // App 里不带服务器地址，只用手机上存的（登录成功时存下的那个，见 restoreServerAddress）
+    const server = stored.server;
+    const parsed = restoreServerAddress(server, ALLOW_CLEARTEXT);
+    this.wsUrl = parsed !== null ? parsed.url : '';
+    this.httpBase = parsed !== null ? parsed.httpBase : '';
     this.session = stored.session;
     this.deviceId = stored.deviceId;
     this.wantHwnd = stored.lastHwnd;
@@ -164,6 +163,8 @@ export class RemoteController {
     const loggedIn = this.session.length > 0 && this.wsUrl.length > 0;
     const s = this.state;
     s.serverInput = server;
+    // 登录过、却没存下能用的服务器地址：说明一下为什么又回到了登录页
+    s.authError = this.session.length > 0 && this.wsUrl.length === 0 ? '请填写服务器地址后重新登录' : '';
     s.email = stored.email;
     s.hostId = stored.lastHost;
     s.settings = stored.settings;
@@ -454,6 +455,30 @@ export class RemoteController {
       this.api.logout(base, token);
     }
     this.resetToAuth('');
+  }
+
+  /**
+   * 设置里更换服务器：先退出旧服务器上的登录（通知旧服务器作废令牌、注销推送），再记下新地址，
+   * 回到登录页用新服务器上的账号登录，登录后连新服务器。地址和现在的一样时什么都不做。
+   * 返回不合法的原因；换好了（或没变）返回空串
+   */
+  changeServer(serverInput: string): string {
+    const input = serverInput.trim();
+    const server = parseServerAddress(input, ALLOW_CLEARTEXT);
+    if (!server.ok) {
+      return server.reason;
+    }
+    if (server.url === this.wsUrl) {
+      return '';
+    }
+    this.logout();
+    this.wsUrl = server.url;
+    this.httpBase = server.httpBase;
+    SettingsStore.saveServer(input);
+    this.state.serverInput = input;
+    this.state.authError = '';
+    this.state.authInfo = `已换到 ${input}，请用这个服务器上的账号登录`;
+    return '';
   }
 
   /** 令牌被服务器拒绝（在别处退出、重置了密码、过期）：清掉登录状态，回到登录页 */

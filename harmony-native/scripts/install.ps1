@@ -2,12 +2,12 @@
 #
 # 用法（PowerShell，在任意目录）：
 #   pwsh -File harmony-native\scripts\install.ps1            # 正式版
-#   pwsh -File harmony-native\scripts\install.ps1 -Debug     # 调试版（登录页能填服务器地址，允许 ws:// 明文）
+#   pwsh -File harmony-native\scripts\install.ps1 -Debug     # 调试版（允许 ws:// 明文，连局域网里的测试服务器）
 #   pwsh -File harmony-native\scripts\install.ps1 -SkipBuild # 不重新构建，直接装上次的安装包
 #
 # 需要：DevEco Studio（默认 D:\Program Files\DevEco Studio，环境变量 DEVECO_HOME 可改）；
-#       本机签名 harmony-native\signing.local.json5（见 docs/10"签名"）；
-#       打包配置 deploy\prod\build.json 里的 server（环境变量 RC_BUILD_CONFIG 可改）。
+#       本机签名 harmony-native\signing.local.json5（见 docs/10"签名"）。
+# App 里不带服务器地址：第一次在登录页填，之后沿用手机上存的。
 # 手机要打开"开发者选项 > USB 调试"并信任这台电脑；无线调试时先运行 hdc tconn <手机IP>:<端口>。
 param(
     [switch]$Debug,

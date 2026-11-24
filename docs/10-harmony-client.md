@@ -67,12 +67,12 @@
 
 ## 5. 构建和签名
 
-需要 DevEco Studio（默认 `D:\Program Files\DevEco Studio`，环境变量 `DEVECO_HOME` 可改）。
+需要 DevEco Studio（默认 `D:\Program Files\DevEco Studio`，环境变量 `DEVECO_HOME` 可改）。不需要打包配置 `deploy/prod/build.json`。
 
 - **签名不入库**。`build-profile.json5` 是生成物：`scripts/gen-build-profile.js` 用 `build-profile.template.json5` 加上本机的 `signing.local.json5`（DevEco 自动签名生成的 `signingConfigs` 里的那一项）生成它，两者都被 `.gitignore` 忽略。
   - 第一次签名：DevEco 打开 `harmony-native`，File > Project Structure > Signing Configs，登录华为账号，勾自动签名，关联 AppGallery Connect 里的应用（包名 `com.remoteclaude.mobile`），"开通开放能力"里勾 Push Kit；然后 `node harmony-native/scripts/take-signing.js` 把签名存进 `signing.local.json5`。
   - 自动签名的证书、Profile 存在 `%USERPROFILE%\.ohos\config\`，按华为账号命名，同一个账号签的几个工程共用这几个文件，后签的会覆盖先签的。Profile 绑定包名，换包名要重签。
-- **服务器地址**和安卓 App 同一份打包配置：`deploy/prod/build.json` 的 `server`（环境变量 `RC_BUILD_CONFIG` 可改），写进 `BuildProfile.SERVER_ADDRESS`。写了地址的正式版登录页不显示地址框；调试版和没写地址的正式版显示。调试版还允许 `ws://` 明文。
+- **服务器地址不写进安装包**（和被控端、安卓 App 一样，见 [08](08-release-and-update.md) 第 1 节）。登录页总是显示"服务器地址"框，预填上次用的；登录成功时存在手机上，设置里能"更换服务器"（先退出旧服务器上的登录、注销推送，再回登录页用新服务器上的账号登录）。早先把地址写进安装包的 0.2.0 登录时已经把地址存在了手机上，升级后照样用它，不用重新填（`restoreServerAddress`）。正式版只认 `https`/`wss`，调试版还允许 `ws://` 明文。
 - 构建：`pwsh -File harmony-native\scripts\install.ps1`（构建正式版并装到手机），或 Git Bash 里 `bash harmony-native/scripts/build.sh [debug|release]`（只构建）。
 - 包名 `com.remoteclaude.mobile`：和 AppGallery Connect 里注册的应用（ClaudeRemote）一致，推送靠它认应用（AppGallery Connect 不允许包名里带 harmony）。早先的 ArkWeb 壳和最初的测试版用的是 `com.remoteclaude.harmony`，和新包名并存、不再覆盖。
 
@@ -109,7 +109,7 @@
 
 | 编号 | 结果 |
 |---|---|
-| A1 账号 | 登录、令牌保存、App 锁通过。注册、找回密码、各种错误提示的界面和代码都在，**没在真机上走**（服务器关了注册；不想拿正式账号试错密码） |
+| A1 账号 | 登录、令牌保存、App 锁通过；登录页的服务器地址框、设置里"更换服务器"的地址校验通过（真的更换会退出登录，没点确定）；从 0.2.0 升级到 0.2.1 沿用了手机上存的地址。注册、找回密码、各种错误提示的界面和代码都在，**没在真机上走**（服务器关了注册；不想拿正式账号试错密码） |
 | A2 会话列表 | 通过：和电脑一致、缩略图、下拉刷新、页签上的个数 |
 | A3 首帧 | 通过：约 0.2 秒连通，1 秒内出画面 |
 | A4 清晰度 | 通过：1280×2088 不放大能读清正文 |
@@ -135,7 +135,7 @@
 | A27 打开失败 | **没验** |
 | A28 审批 | 通过（模拟审批文件）：3 秒内出横幅，"拒绝并说明"的原话送回电脑 |
 | A29 提问 | 通过：单选、多选、自己填的文字，问题原文一字不差 |
-| A30 后台通知 | 改做法：推送通知能显示，点通知打开 App 并弹审批面板（直接用 AGC 服务账号发的测试推送；服务器推送要等服务器配好凭据） |
+| A30 后台通知 | 改做法，通过：App 在后台时服务器经华为推送发通知（2026-11-24 服务器配好凭据后用模拟审批测），点通知打开 App 并自动弹出审批面板，作答送回电脑 |
 | A31 别处作答 | 通过：4 秒内横幅消失 |
 | A32 复制命令 | 通过：反引号里的命令单独一块，"复制"写进手机剪贴板 |
 | A33 发文件 | 通过：小文件、30 MB 内容一致，进度条，同名存成 (1)、(2) |

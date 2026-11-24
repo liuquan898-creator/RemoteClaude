@@ -1,9 +1,10 @@
-import { controller, SERVER_EDITABLE } from '../RemoteController';
+import { controller } from '../RemoteController';
 import { AppState } from '../model/AppState';
 import { HostUpdateState } from '../protocol/Protocol';
 import { AppSettings } from '../data/SettingsStore';
 import { RcColors } from '../common/Theme';
 import BuildProfile from 'BuildProfile';
+import { RcDialog } from './Dialog';
 
 /** 电脑被控端升级状态的说明（协议 2.6） */
 function hostUpdateNote(h: HostUpdateState | null): string {
@@ -112,6 +113,19 @@ export struct SettingsView {
   private s: AppState = controller.state;
   @Event onClose: () => void = () => {
   };
+  /** 更换服务器的对话框：开着时是正在填的地址，为 null 时没开 */
+  @Local serverDraft: string | null = null;
+  @Local serverError: string = '';
+
+  private changeServer(): void {
+    const err = controller.changeServer(this.serverDraft ?? '');
+    if (err.length > 0) {
+      this.serverError = err;
+      return;
+    }
+    this.serverDraft = null;
+    this.onClose();
+  }
 
   aboutToAppear(): void {
     // 打开设置时问一次电脑被控端的版本和升级状态，之后状态有变化电脑会推过来
@@ -174,9 +188,16 @@ export struct SettingsView {
 
           Divider().color(RcColors.Line).margin({ top: 12, bottom: 12 })
           Text(`账号：${this.s.email || '未登录'}`).fontSize(13).fontColor(RcColors.Muted)
-          if (SERVER_EDITABLE) {
-            Text(`服务器：${this.s.serverInput || '未设置'}`).fontSize(13).fontColor(RcColors.Muted)
+          Row() {
+            Text(`服务器：${this.s.serverInput || '未设置'}`).fontSize(13).fontColor(RcColors.Muted).layoutWeight(1)
+            Button('更换服务器', { buttonStyle: ButtonStyleMode.TEXTUAL })
+              .fontColor(RcColors.Accent)
+              .onClick(() => {
+                this.serverDraft = this.s.serverInput;
+                this.serverError = '';
+              })
           }
+          .width('100%')
           Divider().color(RcColors.Line).margin({ top: 12, bottom: 12 })
           VersionRow({
             title: `App ${BuildProfile.VERSION_NAME}${BuildProfile.DEBUG ? '（调试版）' : ''}`,
@@ -205,6 +226,29 @@ export struct SettingsView {
       .constraintSize({ maxHeight: '85%' })
       .backgroundColor(RcColors.Bg)
       .borderRadius({ topLeft: 16, topRight: 16 })
+
+      if (this.serverDraft !== null) {
+        RcDialog({
+          title: '更换服务器',
+          message: '换服务器会退出现在的账号，之后用新服务器上的账号重新登录。',
+          confirmText: '更换并重新登录',
+          onConfirm: () => this.changeServer(),
+          onCancel: () => {
+            this.serverDraft = null;
+          }
+        }) {
+          TextInput({ text: this.serverDraft ?? '', placeholder: 'rc.example.com' })
+            .type(InputType.URL)
+            .onChange((v: string) => {
+              this.serverDraft = v;
+              this.serverError = '';
+            })
+            .onSubmit(() => this.changeServer())
+          if (this.serverError.length > 0) {
+            Text(this.serverError).fontSize(13).fontColor(RcColors.Bad)
+          }
+        }
+      }
     }
     .width('100%')
     .height('100%')

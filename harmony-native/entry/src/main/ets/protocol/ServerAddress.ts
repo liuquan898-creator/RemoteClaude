@@ -1,6 +1,6 @@
 /**
- * 把用户填的（或打包时写进来的）服务器地址整理成信令 WebSocket 地址和账号接口的 HTTP 地址。
- * 对照安卓端 protocol/ServerAddress.kt。
+ * 把用户填的服务器地址整理成信令 WebSocket 地址和账号接口的 HTTP 地址，对照安卓端 protocol/ServerAddress.kt。
+ * App 里不带任何服务器地址（docs/08 第 1 节）：登录页填，登录成功时存在手机上，设置里可以换。
  *
  *   rc.example.com             -> wss://rc.example.com/ws      https://rc.example.com
  *   https://rc.example.com     -> wss://rc.example.com/ws      https://rc.example.com
@@ -45,4 +45,13 @@ export function parseServerAddress(input: string, allowCleartext: boolean): Serv
   let basePath = path.endsWith('/') ? path.substring(0, path.length - 1) : path;
   if (basePath.endsWith('/ws')) basePath = basePath.substring(0, basePath.length - 3);
   return { ok: true, url: `${wsScheme}://${host}${port}${path}`, httpBase: `${httpScheme}://${host}${port}${basePath}`, reason: '' };
+}
+
+/**
+ * 启动时用手机上存的地址。以前的正式版把打包时写进去的地址填在登录页里，登录成功时连同令牌一起存了下来，
+ * 所以升级到不带地址的版本后照样能连；没存过（或存的不合法）返回 null，回登录页让用户填
+ */
+export function restoreServerAddress(stored: string, allowCleartext: boolean): ServerAddressResult | null {
+  const r = parseServerAddress(stored, allowCleartext);
+  return r.ok ? r : null;
 }

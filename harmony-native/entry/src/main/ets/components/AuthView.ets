@@ -1,4 +1,4 @@
-import { controller, SERVER_EDITABLE } from '../RemoteController';
+import { controller } from '../RemoteController';
 import { AppState, AuthMode } from '../model/AppState';
 import { RcColors } from '../common/Theme';
 import BuildProfile from 'BuildProfile';
@@ -23,6 +23,12 @@ export struct AuthView {
 
   aboutToDisappear(): void {
     clearInterval(this.ticker);
+  }
+
+  /** 存的地址变了（启动时读出来、在设置里换了服务器）就跟着变 */
+  @Monitor('s.serverInput')
+  onServerChanged(): void {
+    this.server = this.s.serverInput;
   }
 
   @Monitor('s.authMode')
@@ -100,14 +106,14 @@ export struct AuthView {
       Column() {
         Text('RemoteClaude').fontSize(26).fontWeight(FontWeight.Medium).fontColor(RcColors.Text)
         Text(this.subtitle()).fontSize(14).fontColor(RcColors.Muted).margin({ top: 4, bottom: 12 })
-        if (SERVER_EDITABLE) {
-          this.field('服务器地址')
-          TextInput({ text: this.server, placeholder: BuildProfile.SERVER_ADDRESS || 'rc.example.com' })
-            .type(InputType.URL)
-            .onChange((v: string) => {
-              this.server = v;
-            })
-        }
+        // App 里不带服务器地址，一直显示地址框；填过的地址登录成功后存下来，下次自动填上
+        this.field('服务器地址')
+        TextInput({ text: this.server, placeholder: 'rc.example.com' })
+          .type(InputType.URL)
+          .onChange((v: string) => {
+            this.server = v;
+          })
+        Text('和电脑被控端填的是同一个服务器').fontSize(12).fontColor(RcColors.Muted).margin({ top: 4 })
         this.field('邮箱')
         TextInput({ text: this.email, placeholder: 'a@example.com' })
           .type(InputType.Email)

@@ -104,7 +104,9 @@ namespace RemoteClaude
         const int Slots = 4;
         // 每个槽位同时最多两个实例（正在处理的连接、替它等下一个连接的），再加一个锚
         const int MaxInstances = Slots * 2 + 1;
-        // 被控端连上、核实完马上就发，用不了这么久
+        // 读一条请求总共最多等这么久（整行的总时限，不是每次读各等这么久）。被控端连上、核实完就一次写完整行，
+        // 最长的 UNLOCK 行约 1 KB（256 个字符的密码按 UTF-8 最多 768 字节，Base64 后 1024 个字符），
+        // 管道缓冲区 4 KB 一次装得下，实际几毫秒就到齐，2 秒很宽裕
         const int ReadTimeoutMs = 2000;
         const int CloseWaitMs = 1000;
         static readonly TimeSpan NameTakenLogInterval = TimeSpan.FromMinutes(10);
@@ -353,22 +355,28 @@ namespace RemoteClaude
             {
                 return; // 对面已经走了（比如被控端核实不过就断开），不算错误
             }
-            // 不用 WaitForPipeDrain：对面一直不读，它就一直不返回。等对面关掉，最多等 2 秒；
+            // 不用 WaitForPipeDrain：对面一直不读，它就一直不返回。等对面关掉，最多等 CloseWaitMs（1 秒）；
             // 回应已经在管道缓冲区里，这边关掉以后对面照样读得到
             WaitForClose(pipe, CloseWaitMs);
         }
 
-        /// <summary>读一行，最多等 timeoutMs，免得一个不说话的连接一直占着槽位</summary>
+        /// <summary>
+        /// 读一行。从开始读算起，整行总共最多等 timeoutMs，到点返回 null；每次读只等剩下的时间。
+        /// 不能每次读各等 timeoutMs：那样对面隔一会儿喂一个字节，就能一直占着槽位
+        /// </summary>
         static string ReadLine(Stream s, int max, int timeoutMs)
         {
             var buf = new byte[max];
             int len = 0;
+            Stopwatch clock = Stopwatch.StartNew();
             try
             {
                 while (len < max)
                 {
+                    long left = timeoutMs - clock.ElapsedMilliseconds;
+                    if (left <= 0) return null;
                     IAsyncResult ar = s.BeginRead(buf, len, max - len, null, null);
-                    if (!ar.AsyncWaitHandle.WaitOne(timeoutMs)) return null;
+                    if (!ar.AsyncWaitHandle.WaitOne((int)left)) return null;
                     int n = s.EndRead(ar);
                     if (n <= 0) return null;
                     len += n;

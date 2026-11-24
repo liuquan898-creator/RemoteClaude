@@ -211,7 +211,7 @@ node --test --test-timeout=20000 claude-plugin/remoteclaude/test/approval.test.j
 
 ## 10. 鸿蒙手机的系统推送（华为 Push Kit）
 
-鸿蒙 App（HarmonyOS NEXT，薄壳 ArkWeb，包名 `com.remoteclaude.harmony`）切到后台就会被冻结，保持不了信令连接，不能像 Android App 那样自己弹通知。所以由服务器在有新审批、提问时调华为推送服务（Push Kit）的服务端接口发一条系统通知，App 没开着也能收到；点通知打开 App 的审批面板。消息格式见协议文档 2.10。
+鸿蒙 App（HarmonyOS NEXT 原生版，包名 `com.remoteclaude.mobile`；早先的 ArkWeb 壳 `harmony/` 包名是 `com.remoteclaude.harmony`，已不再使用）切到后台就会被冻结，保持不了信令连接，不能像 Android App 那样自己弹通知。所以由服务器在有新审批、提问时调华为推送服务（Push Kit）的服务端接口发一条系统通知，App 没开着也能收到；点通知打开 App 的审批面板。消息格式见协议文档 2.10。
 
 ### 10.1 怎么工作
 
@@ -281,7 +281,7 @@ node --test --test-timeout=20000 claude-plugin/remoteclaude/test/approval.test.j
 
 ### 10.4 在 AppGallery Connect 里要做的
 
-1. 在 AGC 创建项目，项目下创建 HarmonyOS 应用，包名 `com.remoteclaude.harmony`。项目没设数据处理位置的先设（推送只支持中国境内）。
+1. 在 AGC 创建项目，项目下创建 HarmonyOS 应用，包名 `com.remoteclaude.mobile`（AppGallery Connect 不允许包名里带 harmony）。项目没设数据处理位置的先设（推送只支持中国境内）。
 2. 开通推送服务：「开发与服务 → 选项目 → 选应用 → 增长 → 推送服务 → 立即开通」。
 3. 签名：DevEco Studio「Project Structure → Signing」登录华为账号自动签名（能力里勾上 Push Kit），或手动申请调试证书和 Profile、注册调试设备。签名必须关联 AGC 里这个应用，否则 `getToken` 失败（1000900010）。HarmonyOS NEXT 不用再配公钥指纹和 Client ID。
 4. 下载服务账号密钥：在 API Console（AGC 的「项目设置 → 服务账号密钥」一类入口，新版界面的菜单名没核实）为这个项目创建"服务账号密钥"，下载 JSON。核对里面的 `project_id` 和项目设置里的项目 ID 一致。

@@ -581,7 +581,7 @@
 
 ### 2.10 厂商推送（鸿蒙手机的系统通知）
 
-鸿蒙 App（HarmonyOS NEXT，包名 `com.remoteclaude.harmony`）在后台保持不了信令连接。服务器在有新审批时通过华为推送服务（Push Kit）发系统通知，App 没开着也能收到（说明见 [09](09-approvals.md) 第 10 节）。服务器没配置推送时，下面的消息只回 `push-not-configured`，其余行为不变。
+鸿蒙 App（HarmonyOS NEXT 原生版，包名 `com.remoteclaude.mobile`）在后台保持不了信令连接。服务器在有新审批时通过华为推送服务（Push Kit）发系统通知，App 没开着也能收到（说明见 [09](09-approvals.md) 第 10 节）。服务器没配置推送时，下面的消息只回 `push-not-configured`，其余行为不变。
 
 **控制端登记推送令牌**。每次鉴权成功后（含重连）都发一次，令牌变了也发：
 

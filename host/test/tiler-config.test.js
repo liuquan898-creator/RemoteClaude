@@ -52,7 +52,7 @@ test('模板 config.default.toml 的键和值与内置默认值完全一致', ()
   assert.deepEqual(normalize(parsed), normalize(DEFAULTS));
 });
 
-test('默认值和 Python 版 DEFAULTS 一样（只有 monitor_order 从按屏幕序号改成了从左到右）', () => {
+test('默认值和 Python 版 DEFAULTS 一样（monitor_order 从按屏幕序号改成了从左到右，hide_main_window 默认改成不收主窗口）', () => {
   assert.deepEqual(normalize(DEFAULTS), {
     auto_arrange: true,
     max_per_monitor: 3,
@@ -61,7 +61,7 @@ test('默认值和 Python 版 DEFAULTS 一样（只有 monitor_order 从按屏�
     keep_monitor: false,
     rearrange_on_close: true,
     include_main_window: false,
-    hide_main_window: true,
+    hide_main_window: false,
     raise_all: true,
     raise_restores_minimized: true,
     skip_maximized: false,

@@ -41,10 +41,10 @@ rearrange_on_close = true
 # 是否把 Claude 主窗口（带侧边栏的那个）也一起排。默认只排会话窗口。
 include_main_window = false
 
-# 新开一个会话窗口后，自动把 Claude 主窗口收到托盘（和点主窗口右上角的关闭一样）。
-# 想再打开主窗口就点托盘里的 Claude 图标。改成 false 就不收。
-# 安全起见：Claude 设置里关掉了托盘图标时（这时关闭主窗口会让 Claude 整个退出），不会去收。
-hide_main_window = true
+# 新开一个会话窗口后，是否自动把 Claude 主窗口收到托盘（和点主窗口右上角的关闭一样）。
+# 默认不收；改成 true 就收，想再打开主窗口就点托盘里的 Claude 图标。
+# 安全起见：Claude 设置里关掉了托盘图标时（这时关闭主窗口会让 Claude 整个退出），即使开着也不会去收。
+hide_main_window = false
 
 # 新建、关闭 Claude 会话窗口，或者从任务栏 / Alt+Tab 切到任意一个 Claude 会话窗口时，
 # 把所有 Claude 会话窗口都提到最前面（不含主窗口，不抢焦点，不改位置）。

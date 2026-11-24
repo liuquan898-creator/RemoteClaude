@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# 命令行构建（Git Bash）。用法：scripts/build.sh [debug|release]
+# 命令行构建（Git Bash）。用法：scripts/build.sh [release|debug]，默认正式版（和 install.ps1 一样）
 # 需要 DevEco Studio（默认 D:/Program Files/DevEco Studio，可用 DEVECO_HOME 改）。装到手机用 scripts/install.ps1。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DEVECO_HOME="${DEVECO_HOME:-D:/Program Files/DevEco Studio}"
 export DEVECO_SDK_HOME="$DEVECO_HOME/sdk"
-MODE="${1:-debug}"
+MODE="${1:-release}"
 OUT=entry/build/default/outputs/default
 node scripts/gen-build-profile.js
 "$DEVECO_HOME/tools/ohpm/bin/ohpm.bat" install --all >/dev/null

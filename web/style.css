@@ -107,23 +107,6 @@ button.primary:active { filter: brightness(0.9); }
   text-align: left;
 }
 #curTitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-#btnMore { flex: none; min-width: 40px; padding: 0; font-size: 18px; line-height: 1; }
-
-/* "更多"菜单：#menu 整块盖住界面接住菜单以外的点击，#menuItems 才是看得见的那一块，位置由脚本贴到"⋮"下面 */
-#menu { position: absolute; inset: 0; z-index: 15; }
-#menuItems {
-  position: absolute;
-  min-width: 156px;
-  display: flex;
-  flex-direction: column;
-  padding: 4px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--card);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-}
-#menuItems button { border: none; background: none; min-height: 42px; border-radius: 6px; text-align: left; }
-#menuItems button:active { background: var(--line); }
 .caret { color: var(--muted); }
 .dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--bad); }
 .dot.on { background: var(--ok); }
@@ -174,7 +157,7 @@ button.primary:active { filter: brightness(0.9); }
 #keys::-webkit-scrollbar { display: none; }
 #keys button { flex: none; min-width: 44px; }
 
-/* 调电脑上 Claude 字体大小的一条，从顶栏的"字体"叫出来 */
+/* 调电脑上 Claude 字体大小的一条，从"⋮"菜单里的"字体大小"叫出来 */
 #fontBar { display: flex; align-items: center; gap: 6px; padding: 6px 8px; }
 #fontBar .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 #fontBar button { flex: none; min-width: 52px; }
@@ -276,7 +259,7 @@ button.primary:active { filter: brightness(0.9); }
   position: absolute;
   left: 50%;
   bottom: 130px;
-  z-index: 20;
+  z-index: 40;
   transform: translateX(-50%);
   max-width: 86%;
   padding: 8px 14px;
@@ -286,3 +269,203 @@ button.primary:active { filter: brightness(0.9); }
   text-align: center;
   pointer-events: none;
 }
+
+/* ---------------------------------------------------------------- 顶栏上的审批、更多 */
+
+button.link {
+  border: none;
+  background: none;
+  color: var(--accent);
+  padding: 0 6px;
+  min-height: 32px;
+}
+button.link:active { background: none; opacity: 0.7; }
+button:disabled { opacity: 0.45; cursor: default; }
+
+.appr-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-color: var(--warn);
+  color: var(--warn);
+  font-weight: 600;
+}
+.badge {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: var(--warn);
+  color: var(--accent-text);
+  font-size: 12px;
+  line-height: 20px;
+  text-align: center;
+}
+button.more { flex: none; min-width: 36px; padding: 0 8px; font-size: 18px; font-weight: 700; }
+
+/* ---------------------------------------------------------------- 提示条：有审批在等、电脑锁屏了 */
+
+.banners { flex: none; display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; }
+.banners:empty { display: none; }
+#pickerBanners { padding: 0 12px 10px; }
+.banner {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  text-align: left;
+  white-space: normal;
+}
+.banner.warn { border-color: var(--warn); }
+.banner.bad { border-color: var(--bad); }
+.banner-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.banner-text > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.banner-text .muted { font-size: 12px; }
+.banner-act { flex: none; color: var(--accent); }
+.banner button { flex: none; }
+
+/* ---------------------------------------------------------------- 弹出层：审批面板、对话框 */
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+}
+.overlay.center { z-index: 35; align-items: center; padding: 16px; }
+.sheet.tall { max-height: 92%; }
+@media (min-width: 700px) {
+  .overlay { align-items: center; }
+}
+
+#apprList { overflow-y: auto; padding: 0 10px 12px; overscroll-behavior: contain; }
+#approvals .empty { padding: 28px 8px; text-align: center; }
+
+.appr-card {
+  margin-bottom: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  scroll-margin-top: 8px;
+}
+.appr-card.busy { opacity: 0.75; }
+.appr-card.flash { animation: appr-flash 1.6s ease-out; }
+@keyframes appr-flash {
+  0%, 40% { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+  100% { border-color: var(--line); box-shadow: none; }
+}
+.appr-title {
+  font-weight: 600;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  word-break: break-all;
+}
+.appr-sub { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.appr-body { margin-top: 10px; }
+.appr-tool { color: var(--accent); font-weight: 600; font-size: 14px; }
+.appr-tool.small { font-size: 12px; font-weight: 400; }
+.appr-desc, .appr-qtext { margin: 2px 0 0; font-size: 14px; white-space: pre-wrap; word-break: break-word; user-select: text; }
+.appr-qtext { font-weight: 500; }
+.appr-warn { margin: 6px 0 0; color: var(--warn); font-size: 12px; }
+.appr-busy { margin: 10px 0 0; font-size: 13px; }
+
+.appr-param { margin-top: 8px; }
+.appr-param-head { display: flex; align-items: center; }
+.appr-key { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.appr-value, .appr-code pre {
+  margin: 0;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--bg);
+  font: 12.5px/1.45 ui-monospace, "Cascadia Mono", Consolas, "Sarasa Mono SC", monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.appr-value.plan { font-family: inherit; font-size: 13.5px; word-break: break-word; }
+.appr-value.folded { max-height: calc(8 * 1.45em + 16px); overflow: hidden; }
+.appr-value.plan.folded { max-height: calc(20 * 1.45em + 16px); }
+.appr-more { padding-left: 0; }
+
+.appr-question { margin-top: 2px; }
+.appr-code { display: flex; align-items: flex-start; gap: 4px; margin: 6px 0; border-radius: 6px; background: var(--bg); }
+.appr-code pre { flex: 1; min-width: 0; font-size: 13px; }
+.appr-code button { flex: none; margin-top: 2px; }
+
+.appr-q { margin-bottom: 12px; }
+.appr-opt { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 4px 2px; cursor: pointer; }
+.appr-opt input { flex: none; width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
+.appr-opt-text { flex: 1; min-width: 0; display: flex; flex-direction: column; font-size: 14px; word-break: break-word; }
+.small { font-size: 12px; }
+
+.appr-card textarea, .dialog input {
+  width: 100%;
+  min-width: 0;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 16px; /* 小于 16px 时 iOS 会在聚焦时放大页面 */
+  line-height: 20px;
+  resize: vertical;
+}
+.appr-card textarea:focus, .dialog input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.appr-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.appr-actions button { min-height: 40px; }
+.appr-actions button.primary { min-width: 76px; }
+
+/* ---------------------------------------------------------------- 更多菜单 */
+
+.menu-layer { position: absolute; inset: 0; z-index: 30; }
+.menu {
+  position: absolute;
+  top: calc(max(6px, env(safe-area-inset-top)) + 42px);
+  right: 8px;
+  width: min(300px, calc(100% - 16px));
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+.menu button { border: none; background: none; text-align: left; min-height: 44px; border-radius: 6px; }
+.menu button:active { background: var(--line); }
+.menu-note { padding: 4px 12px 6px; font-size: 12px; white-space: normal; }
+#menuEmail { word-break: break-all; }
+
+/* ---------------------------------------------------------------- 对话框：锁定确认、解锁 */
+
+.dialog {
+  width: 100%;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg);
+}
+.dialog strong { font-size: 17px; }
+.dialog p { margin: 0; font-size: 14px; }
+.dialog input { height: 44px; margin-top: 0; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.dialog-actions button { min-width: 72px; min-height: 40px; }
+
+.offscreen { position: fixed; left: -9999px; top: 0; opacity: 0; }
+.dialog input.masked { -webkit-text-security: disc; }

@@ -1,9 +1,16 @@
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
-import { window } from '@kit.ArkUI';
+import { KeyboardAvoidMode, window } from '@kit.ArkUI';
 import { Log, errText } from '../common/Log';
 import { AppContext } from '../common/AppContext';
+import { controller } from '../RemoteController';
+import { NetworkWatcher } from '../net/NetworkWatcher';
+
+/** 点审批推送通知打开 App 时带的 action（服务器的 clickAction.action，见 docs/03 和 docs/10） */
+const APPROVAL_ACTION = 'com.remoteclaude.harmony.APPROVAL';
 
 export default class EntryAbility extends UIAbility {
+  private network: NetworkWatcher = new NetworkWatcher();
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_DARK);
@@ -11,6 +18,23 @@ export default class EntryAbility extends UIAbility {
       Log.w(`setColorMode failed: ${errText(e as Object)}`);
     }
     AppContext.init(this.context);
+    controller.load();
+    this.handleWant(want);
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.handleWant(want);
+  }
+
+  /** 从审批通知点进来：连上后直接弹审批面板 */
+  private handleWant(want: Want): void {
+    const params = want.parameters;
+    const fromPush = want.action === APPROVAL_ACTION ||
+      (params !== undefined && (params['approvalId'] !== undefined || params['kind'] === 'approval'));
+    if (fromPush) {
+      Log.i('从审批通知打开');
+      controller.openApprovalsWhenReady();
+    }
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
@@ -20,7 +44,10 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       try {
-        AppContext.mainWindow = windowStage.getMainWindowSync();
+        const win = windowStage.getMainWindowSync();
+        AppContext.mainWindow = win;
+        // 软键盘弹出时把页面压短（像安卓的 imePadding），而不是整页往上推：顶栏和画面要一直看得见
+        win.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
       } catch (e) {
         Log.w(`getMainWindow failed: ${errText(e as Object)}`);
       }
@@ -29,9 +56,13 @@ export default class EntryAbility extends UIAbility {
 
   onForeground(): void {
     AppContext.foreground = true;
+    this.network.start(() => controller.onNetworkChanged());
+    controller.onForeground();
   }
 
   onBackground(): void {
     AppContext.foreground = false;
+    this.network.stop();
+    controller.onBackground();
   }
 }

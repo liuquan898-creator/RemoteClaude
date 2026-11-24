@@ -32,11 +32,11 @@
 
 - **App**：登录页一直有"服务器地址"框，登录成功时存在手机上，下次自动填上；设置里"更换服务器"可以换（退出旧服务器上的账号，回登录页）。
 - **被控端**：窗口的登录页有"服务器地址"框；登录后在窗口里点"更换服务器"、或者托盘菜单"更换服务器…"可以换（同样退出旧账号、回登录页）。填的地址写进用户自己的 `%APPDATA%\remote-claude-host\config.json` 的 `server`，别的设置不动。没设置时启动后显示登录页、地址框空着并提示要填，不再弹框退出。
-- 接受的写法两边一样：`rc.example.com`、`https://rc.example.com`、`wss://rc.example.com/ws`、`ws://127.0.0.1:8787/ws`（明文 `ws://` 只有被控端和调试版 App 认），都整理成信令地址 `wss://…/ws`（或 `ws://…/ws`）。被控端在主进程里整理和检查（`host/serveraddress.js`），只认 ws/wss。
+- 接受的写法两边一样：`rc.example.com`、`https://rc.example.com`、`wss://rc.example.com/ws`、`ws://127.0.0.1:8787/ws`（明文 `ws://` 只有被控端和调试版 App 认），都整理成信令地址 `wss://…/ws`（或 `ws://…/ws`）去连。被控端在主进程里整理和检查（`host/serveraddress.js`），只认 ws/wss；窗口里显示、`config.json` 里存的是和手机 App 一样的简写（`rc.example.com`，明文的是 `http://127.0.0.1:8787`）。
 
 **从带地址的旧版升级**（被控端 0.9.25 及以前、App 0.9.8 及以前是把 `server` 打进安装包的，用户的 `config.json` 里一般没有 `server`）。升级上来照样连原来的服务器，不用重新填、也不用重新登录：
 
-- 被控端：配置里没有 `server` 时，读登录状态 `account.json` 里记的服务器（`"server": "https://rc.example.com"`，登录时写的），换算成 `wss://rc.example.com/ws`，第一次启动就写进 `config.json`。之后哪怕退出登录也记得服务器。没登录过（没有 `account.json`）的要在登录页填一次。配置里写了 `server` 但写错了，不会拿登录状态里的顶上，登录页显示原因让用户改。
+- 被控端：配置里没有 `server` 时，读登录状态 `account.json` 里记的服务器（`"server": "https://rc.example.com"`，登录时写的），换算成信令地址去连，第一次启动就以简写 `rc.example.com` 写进 `config.json`。之后哪怕退出登录也记得服务器。没登录过（没有 `account.json`）的要在登录页填一次。配置里写了 `server` 但写错了，不会拿登录状态里的顶上，登录页显示原因让用户改。
 - App：旧正式版虽然登录页不显示地址框，登录时也把打包写进去的地址和令牌一起存在了手机上（`SettingsStore` 的 `server`），新版启动时直接用它。万一没存（有令牌但没有地址），回登录页并提示"请填写服务器地址后重新登录"。
 
 所以发不带地址的新版本可以直接上传，`release.js` 不再要求打包配置里有 `server`。

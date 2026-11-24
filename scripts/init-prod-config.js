@@ -112,7 +112,7 @@ simple-log
 `;
 
 const hostConfig = {
-  server: `wss://${domain}/ws`,
+  server: domain,
   targets: ['claude.exe'],
   maxBitrateKbps: 4000,
   maxFps: 30,

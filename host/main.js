@@ -335,7 +335,7 @@ function persistMigratedServer() {
   try {
     serverAddress.saveServer(CONFIG_PATH, serverState.url);
     serverState.migrate = false;
-    console.log(`配置里没有服务器地址，按上次登录的服务器补上: ${serverState.url}（${CONFIG_PATH}）`);
+    console.log(`配置里没有服务器地址，按上次登录的服务器补上: ${serverAddress.displayOf(serverState.url)}（${CONFIG_PATH}）`);
   } catch (err) {
     console.error(`把服务器地址写进配置文件失败（这次照样连 ${serverState.url}）: ${err.message}`);
   }
@@ -353,7 +353,9 @@ ipcMain.on('rc:status', (e, kind, text) => {
 
 ipcMain.handle('rc:config', () => ({
   server: serverState.url,
-  serverInput: serverState.url || serverState.input,
+  // 界面上显示和预填的是简写（rc.example.com），和手机 App 填的一样
+  serverDisplay: serverAddress.displayOf(serverState.url),
+  serverInput: serverState.url ? serverAddress.displayOf(serverState.url) : serverState.input,
   serverNotice: serverState.notice,
   targets: cfg.targets,
   maxBitrateKbps: cfg.maxBitrateKbps,
@@ -402,7 +404,7 @@ async function setServer(input) {
   const loggingOut = account.logout();
   account = new Account(url);
   Object.assign(serverState, { url, input: url, notice: '', migrate: false });
-  console.log(`服务器地址改为 ${url}（已写进 ${CONFIG_PATH}）`);
+  console.log(`服务器地址改为 ${serverAddress.displayOf(url)}（已写进 ${CONFIG_PATH}）`);
   await loggingOut;
   return { server: url, changed: true };
 }

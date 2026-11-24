@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const {
   wsUrlOf,
+  displayOf,
   httpBaseOf,
   wsUrlOfHttpBase,
   readConfig,
@@ -85,10 +86,10 @@ test('保存服务器地址：只改 server，别的设置原样保留', () => {
   const before = { targets: ['claude.exe'], maxBitrateKbps: 4000, maxFps: 30, claudeSelfCheck: false };
   fs.writeFileSync(file, JSON.stringify(before));
   saveServer(file, 'wss://rc.example.com/ws');
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { ...before, server: 'wss://rc.example.com/ws' });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { ...before, server: 'rc.example.com' });
 
   saveServer(file, 'ws://127.0.0.1:8787/ws');
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { ...before, server: 'ws://127.0.0.1:8787/ws' });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { ...before, server: 'http://127.0.0.1:8787' });
   // 没有留下临时文件
   assert.deepEqual(fs.readdirSync(dir), ['config.json']);
 });
@@ -97,7 +98,7 @@ test('保存服务器地址：没有配置文件（和它的目录）就新建',
   const dir = tmpDir();
   const file = path.join(dir, 'sub', 'config.json');
   saveServer(file, 'wss://rc.example.com/ws');
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { server: 'wss://rc.example.com/ws' });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { server: 'rc.example.com' });
 });
 
 test('保存服务器地址：配置文件写坏了不覆盖，地址不是 ws/wss 不写', () => {
@@ -155,7 +156,7 @@ test('启动时选服务器：旧版升级上来，配置里没有 server，按�
     assert.deepEqual(resolveServer({ configured, accountServer: 'https://rc.example.com' }), {
       server: 'wss://rc.example.com/ws',
       source: 'account',
-      input: 'wss://rc.example.com/ws',
+      input: 'rc.example.com',
       error: '',
     });
   }
@@ -178,11 +179,27 @@ test('升级迁移整个流程：配置文件补上 server，别的设置不动�
   const first = resolveServer({ configured: readConfig(configFile).server, accountServer: readAccountServer(accountFile) });
   assert.equal(first.source, 'account');
   saveServer(configFile, first.server);
-  assert.deepEqual(readConfig(configFile), { ...before, server: 'wss://rc.example.com/ws' });
+  assert.deepEqual(readConfig(configFile), { ...before, server: 'rc.example.com' });
 
   // 之后哪怕退出登录（account.json 没了），也还记得服务器
   fs.unlinkSync(accountFile);
   const second = resolveServer({ configured: readConfig(configFile).server, accountServer: readAccountServer(accountFile) });
   assert.equal(second.source, 'config');
   assert.equal(second.server, 'wss://rc.example.com/ws');
+});
+
+test('简写：界面显示和配置文件存的写法和手机 App 一样，并且能原样换算回信令地址', () => {
+  const cases = [
+    ['wss://rc.example.com/ws', 'rc.example.com'],
+    ['wss://rc.example.com:8443/ws', 'rc.example.com:8443'],
+    ['wss://rc.example.com/rc/ws', 'rc.example.com/rc/ws'],
+    ['ws://127.0.0.1:8787/ws', 'http://127.0.0.1:8787'],
+    ['ws://10.0.2.2:8787/signal', 'http://10.0.2.2:8787/signal'],
+  ];
+  for (const [ws, short] of cases) {
+    assert.equal(displayOf(ws), short);
+    assert.equal(wsUrlOf(short), ws);
+  }
+  assert.equal(displayOf(''), '');
+  assert.equal(displayOf('not a url'), 'not a url');
 });

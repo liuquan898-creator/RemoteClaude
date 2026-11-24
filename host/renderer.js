@@ -876,8 +876,8 @@ const SERVER_HINT = $('serverHint').textContent;
 
 /** 页面上显示的服务器地址跟着主进程的设置走（启动时、换了服务器后） */
 function showServer() {
-  $('server').textContent = `${cfg.server || '未设置服务器'} · 可远控进程: ${cfg.targets.join(', ')}`;
-  $('serverName').textContent = cfg.server || '未设置';
+  $('server').textContent = `${cfg.serverDisplay || '未设置服务器'} · 可远控进程: ${cfg.targets.join(', ')}`;
+  $('serverName').textContent = cfg.serverDisplay || '未设置';
   $('serverInput').value = cfg.serverInput || '';
   const missing = !cfg.server;
   $('serverHint').textContent = missing ? `还没有设置服务器地址。${SERVER_HINT}` : SERVER_HINT;
@@ -982,7 +982,7 @@ function openServerForm() {
   }
   $('serverForm').hidden = false;
   $('serverError').hidden = true;
-  $('newServer').value = cfg.server || '';
+  $('newServer').value = cfg.serverDisplay || '';
   $('newServer').focus();
   $('newServer').select();
 }

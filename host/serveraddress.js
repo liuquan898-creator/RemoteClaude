@@ -47,6 +47,29 @@ function wsUrlOf(input) {
   return `${wsScheme}://${u.host}${pathname}`;
 }
 
+/**
+ * 信令地址的简写，和手机 App 登录页填的写法一样，界面上显示、配置文件里存的都是它（wsUrlOf 能原样换算回去）：
+ *   wss://rc.example.com/ws      -> rc.example.com
+ *   wss://rc.example.com:8443/ws -> rc.example.com:8443
+ *   wss://rc.example.com/rc/ws   -> rc.example.com/rc/ws
+ *   ws://127.0.0.1:8787/ws       -> http://127.0.0.1:8787
+ * 空地址返回空字符串；不是 ws/wss 地址原样返回
+ * @param {string} wsUrl
+ * @returns {string}
+ */
+function displayOf(wsUrl) {
+  if (!wsUrl) return '';
+  let u;
+  try {
+    u = new URL(wsUrl);
+  } catch {
+    return String(wsUrl);
+  }
+  if (u.protocol !== 'wss:' && u.protocol !== 'ws:') return String(wsUrl);
+  const tail = u.pathname === '/ws' ? '' : u.pathname;
+  return u.protocol === 'wss:' ? `${u.host}${tail}` : `http://${u.host}${tail}`;
+}
+
 /** wss://rc.example.com/ws -> https://rc.example.com（和 account.js 的 httpBaseOf 一样）；空地址返回空字符串 */
 function httpBaseOf(wsUrl) {
   if (!wsUrl) return '';
@@ -99,12 +122,13 @@ function readConfig(file) {
 /**
  * 把服务器地址写进配置文件，其它设置原样保留。先写临时文件再换名，写到一半断电也不会把配置写坏
  * @param {string} file
+ * 存的是简写（displayOf，和手机 App 填的写法一样，比如 rc.example.com），读的时候 wsUrlOf 换算回信令地址
  * @param {string} server 已经整理好的 ws:// 或 wss:// 地址
  * @returns {Record<string, unknown>} 写进去的完整配置
  */
 function saveServer(file, server) {
   if (!/^wss?:\/\/[^\s]+$/.test(server)) throw new Error('服务器地址必须是 ws:// 或 wss:// 地址');
-  const next = { ...readConfig(file), server };
+  const next = { ...readConfig(file), server: displayOf(server) };
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   try {
@@ -158,8 +182,8 @@ function resolveServer({ configured, accountServer }) {
     }
   }
   const fromAccount = wsUrlOfHttpBase(accountServer);
-  if (fromAccount) return { server: fromAccount, source: 'account', input: fromAccount, error: '' };
+  if (fromAccount) return { server: fromAccount, source: 'account', input: displayOf(fromAccount), error: '' };
   return { server: '', source: 'none', input: '', error: '' };
 }
 
-module.exports = { wsUrlOf, httpBaseOf, wsUrlOfHttpBase, readConfig, saveServer, readAccountServer, resolveServer, MAX_LENGTH };
+module.exports = { wsUrlOf, displayOf, httpBaseOf, wsUrlOfHttpBase, readConfig, saveServer, readAccountServer, resolveServer, MAX_LENGTH };

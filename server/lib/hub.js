@@ -211,6 +211,14 @@ class Hub {
         acc.hosts.delete(ctx.hostId);
         this.log(`[host] ${ctx.email} 的电脑 ${ctx.hostId} 已下线`);
         this.broadcastHosts(ctx.userId);
+        // 只在这台电脑真的下线时（不是被自己的新连接顶掉的旧连接）：取消它等着的重推
+        if (this.push) {
+          try {
+            this.push.hostGone(ctx.userId, ctx.hostId);
+          } catch (err) {
+            this.log(`[push] 取消电脑 ${ctx.hostId} 的重推出错: ${err && err.message}`);
+          }
+        }
       }
     } else if (acc.viewers.get(ctx.id) === ws) {
       acc.viewers.delete(ctx.id);

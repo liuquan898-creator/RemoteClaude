@@ -38,6 +38,12 @@ class WindowCounter {
     return Math.max(1, Math.ceil((e.resetAt - this.now()) / 1000));
   }
 
+  /** 这个窗口里记了几次（超过上限的也算） */
+  count(key) {
+    const e = this.map.get(key);
+    return e && e.resetAt > this.now() ? e.count : 0;
+  }
+
   reset(key) {
     this.map.delete(key);
   }

@@ -89,8 +89,9 @@ function normalizeConfig(raw, baseDir) {
 /**
  * 华为推送（docs/09 第 10 节）。可选：没有 push.huawei、或 enabled 为 false 时不推送。
  * 环境变量 RC_PUSH_HUAWEI_KEY_FILE、RC_PUSH_HUAWEI_PROJECT_ID 优先于配置文件（容器里把密钥文件挂进去用）。
+ * 密钥文件在启动时（app.js）读，读不出来服务器起不来。
  * @returns {null | { projectId: string, serviceAccountFile: string, category: string, testMessage: boolean,
- *                    ttl: number, maxPerHour: number, apiBase: string, timeoutMs: number }}
+ *                    showDetail: boolean, ttl: number, maxPerHour: number, apiBase: string, timeoutMs: number }}
  */
 function normalizeHuaweiPush(push, baseDir) {
   const hw = push && typeof push === 'object' && push.huawei && typeof push.huawei === 'object' ? push.huawei : null;
@@ -115,7 +116,8 @@ function normalizeHuaweiPush(push, baseDir) {
     serviceAccountFile,
     category,
     testMessage: src.testMessage !== false,
-    showDetail: src.showDetail !== false, // false：通知正文只有会话名，不带命令、问题原文
+    // 默认 false：通知只说有一条审批。true 时带工具名、会话名和命令、问题原文，会经过华为服务器、显示在锁屏上
+    showDetail: src.showDetail === true,
     ttl,
     maxPerHour: Number(src.maxPerHour) > 0 ? Number(src.maxPerHour) : 60,
     apiBase: src.apiBase ? String(src.apiBase) : 'https://push-api.cloud.huawei.com',

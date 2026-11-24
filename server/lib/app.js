@@ -15,31 +15,43 @@ const { createReleases } = require('./releases');
 const { PushService } = require('./push');
 const { createHuaweiPushClient, loadServiceAccount } = require('./huawei-push');
 
-/** 按配置创建华为推送客户端；没配置时返回 null，配置了但密钥读不出来时记日志、不推送（不影响信令） */
+/**
+ * 按配置创建华为推送客户端；没配置时返回 null。配置了但密钥文件读不出来（不存在、不是 JSON、缺字段）时抛错，
+ * 服务器起不来——和配置写错一样处理：开了推送却悄悄不推，比起不来更难发现。
+ */
 function createHuaweiClient(hw, log, now, fetchImpl) {
   if (!hw) return null;
+  let account;
   try {
-    const account = loadServiceAccount(hw.serviceAccountFile);
-    const projectId = hw.projectId || account.projectId;
-    if (!projectId) throw new Error('没填 push.huawei.projectId，密钥文件里也没有 project_id');
-    if (hw.projectId && account.projectId && hw.projectId !== account.projectId) {
-      log(`警告: push.huawei.projectId（${hw.projectId}）和密钥文件里的 project_id（${account.projectId}）不一致，推送多半会被拒（80300002）`);
-    }
-    return createHuaweiPushClient({ projectId, account, apiBase: hw.apiBase, timeoutMs: hw.timeoutMs, now, fetch: fetchImpl });
+    account = loadServiceAccount(hw.serviceAccountFile);
   } catch (err) {
-    log(`警告: 华为推送没启用：${err.message}`);
-    return null;
+    throw new Error(
+      `${err.message}\n` +
+        '检查 push.huawei.serviceAccountFile（或环境变量 RC_PUSH_HUAWEI_KEY_FILE）是否指向 AppGallery Connect 下载的服务账号密钥 JSON；' +
+        '暂时不用推送就把 push.huawei.enabled 设为 false。'
+    );
   }
+  const projectId = hw.projectId || account.projectId;
+  if (!projectId) throw new Error(`没填 push.huawei.projectId，密钥文件 ${hw.serviceAccountFile} 里也没有 project_id`);
+  if (hw.projectId && account.projectId && hw.projectId !== account.projectId) {
+    log(`警告: push.huawei.projectId（${hw.projectId}）和密钥文件里的 project_id（${account.projectId}）不一致，推送多半会被拒（80300002）`);
+  }
+  return createHuaweiPushClient({ projectId, account, apiBase: hw.apiBase, timeoutMs: hw.timeoutMs, now, fetch: fetchImpl });
 }
 
 /**
+ * 配置有问题（比如推送密钥文件读不出来）时抛错。
  * @param {ReturnType<import('./config').normalizeConfig>} cfg
- * @param {{ log?: (...args:any[]) => void, now?: () => number, fetch?: typeof fetch }} [opts]
- *   now、fetch 只给推送用（测试里换成假的时钟和假的华为接口）
+ * @param {{ log?: (...args:any[]) => void, now?: () => number, fetch?: typeof fetch,
+ *           timers?: { setTimeout: Function, clearTimeout: Function } }} [opts]
+ *   now、fetch、timers 只给推送用（测试里换成假的时钟、假的华为接口和手动触发的定时器）
  */
 function createApp(cfg, opts = {}) {
   const log = opts.log || ((...a) => console.log(new Date().toISOString(), ...a));
   const now = opts.now || Date.now;
+  const hw = cfg.push && cfg.push.huawei;
+  // 先于打开数据库：读不出密钥时直接抛错，不留下打开着的数据库
+  const huawei = createHuaweiClient(hw, log, now, opts.fetch || fetch);
   const store = new Store(cfg.dataDir === ':memory:' ? ':memory:' : path.join(cfg.dataDir, 'remote-claude.db'));
   const mailer = createMailer(cfg.mail, log);
 
@@ -64,9 +76,7 @@ function createApp(cfg, opts = {}) {
     log,
     onRevoke: (ids, userId) => hub && hub.revoke(ids, userId),
   });
-  const hw = cfg.push && cfg.push.huawei;
-  const huawei = createHuaweiClient(hw, log, now, opts.fetch || fetch);
-  const push = new PushService({ store, huawei, options: hw || {}, log, now });
+  const push = new PushService({ store, huawei, options: hw || {}, log, now, ...(opts.timers ? { timers: opts.timers } : {}) });
   hub = new Hub({ auth, iceServers, limits: cfg.limits, log, push });
   push.onTokensChanged = (userId) => hub.syncPushViewer(userId);
 

@@ -27,6 +27,13 @@ const CODE_OK = '80000000';
 const CODE_PARTIAL = '80100000';
 const CODE_JWT_EXPIRED = '80200005';
 const CODE_ALL_TOKENS_INVALID = '80300007';
+/**
+ * 80300007 说"这批令牌全都无效"，但令牌和项目、应用对不上（projectId、密钥文件配错了，App 包名不对）也回这个码，
+ * 照单全删会把所有账号的令牌删光。所以只有这台服务器在这么久之内确实推成功过（说明配置是对的）才当死令牌删，
+ * 否则只提示去查配置。代价：服务器刚启动、或者服务器上的令牌恰好全失效时删不掉死令牌，每次推送白发一个请求，
+ * 等那次登录作废时令牌跟着删（同一台手机重新登录就会作废旧登录）。
+ */
+const CONFIG_PROVEN_MS = 24 * 3600 * 1000;
 /** 部分成功时 msg 里 illegalTokens 下这些原因的令牌已经不能用了，删掉；其余原因（权益、地区、处罚）是配置问题，不删 */
 const DEAD_TOKEN_REASONS = ['tokenFormatError', 'noRight'];
 
@@ -53,7 +60,7 @@ function loadServiceAccount(file) {
     // 有的密钥文件里换行是字面的 \n
     privateKey = crypto.createPrivateKey(raw.private_key.replace(/\\n/g, '\n'));
   } catch (err) {
-    throw new Error(`华为推送服务账号密钥里的 private_key 读不出来: ${err.message}`);
+    throw new Error(`华为推送服务账号密钥 ${file} 里的 private_key 读不出来: ${err.message}`);
   }
   return {
     projectId: typeof raw.project_id === 'string' ? raw.project_id : '',
@@ -106,6 +113,7 @@ function createHuaweiPushClient({ projectId, account, apiBase = DEFAULT_API_BASE
   const url = `${String(apiBase).replace(/\/+$/, '')}/v3/${encodeURIComponent(projectId)}/messages:send`;
   let jwt = '';
   let jwtExp = 0;
+  let lastSuccessAt = null; // 最近一次有令牌推成功（80000000、80100000）的时间，毫秒
 
   function bearer() {
     const t = Math.floor(now() / 1000);
@@ -149,7 +157,8 @@ function createHuaweiPushClient({ projectId, account, apiBase = DEFAULT_API_BASE
      * @param {string[]} tokens 最多 10 个（测试消息的上限）
      * @param {object} notification payload.notification
      * @param {object} pushOptions
-     * @returns {Promise<{ ok: boolean, status: number, code: string, msg: string, requestId: string, deadTokens: string[] }>}
+     * @returns {Promise<{ ok: boolean, status: number, code: string, msg: string, requestId: string, deadTokens: string[],
+     *                     configSuspect: boolean }>} configSuspect：回了 80300007 但不能确定是令牌失效，多半是配置不对，没删令牌
      */
     async send(tokens, notification, pushOptions) {
       const body = { payload: { notification }, target: { token: tokens }, pushOptions };
@@ -159,10 +168,17 @@ function createHuaweiPushClient({ projectId, account, apiBase = DEFAULT_API_BASE
         jwt = '';
         r = await post(body);
       }
+      const ok = r.code === CODE_OK || r.code === CODE_PARTIAL;
+      if (ok) lastSuccessAt = now();
       let deadTokens = [];
-      if (r.code === CODE_ALL_TOKENS_INVALID) deadTokens = tokens.slice();
-      else if (r.code === CODE_PARTIAL) deadTokens = deadTokensFromPartial(r.msg).filter((t) => tokens.includes(t));
-      return { ok: r.code === CODE_OK || r.code === CODE_PARTIAL, ...r, deadTokens };
+      let configSuspect = false;
+      if (r.code === CODE_ALL_TOKENS_INVALID) {
+        if (lastSuccessAt !== null && now() - lastSuccessAt <= CONFIG_PROVEN_MS) deadTokens = tokens.slice();
+        else configSuspect = true;
+      } else if (r.code === CODE_PARTIAL) {
+        deadTokens = deadTokensFromPartial(r.msg).filter((t) => tokens.includes(t));
+      }
+      return { ok, ...r, deadTokens, configSuspect };
     },
   };
 }

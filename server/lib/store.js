@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS push_tokens_by_user ON push_tokens(user_id, platform)
 CREATE INDEX IF NOT EXISTS push_tokens_by_auth ON push_tokens(auth_token_id);
 
 -- 已经推送过的审批，免得电脑重连、重发列表、服务器重启后再推一遍。审批编号随机不重复，
--- 审批最长等 7 天，所以记录留 8 天后清掉，不随审批从列表里消失而删。
+-- 审批最长等 7 天，所以记录留 8 天后清掉，不随审批从列表里消失而删。每个账号最多留的条数见 push.js。
 CREATE TABLE IF NOT EXISTS push_notified (
   user_id     INTEGER NOT NULL,
   host_id     TEXT NOT NULL,
@@ -109,6 +109,9 @@ class Store {
       deletePushTokenIfOwner: p('DELETE FROM push_tokens WHERE token = ? AND user_id = ? AND updated_at <= ?'),
       pushTokensOfUser: p('SELECT token FROM push_tokens WHERE user_id = ? AND platform = ? ORDER BY updated_at DESC'),
       markNotified: p('INSERT OR IGNORE INTO push_notified (user_id, host_id, approval_id, at) VALUES (?, ?, ?, ?)'),
+      countNotified: p('SELECT COUNT(*) AS n FROM push_notified WHERE user_id = ?'),
+      trimNotified: p(`DELETE FROM push_notified WHERE rowid IN
+                       (SELECT rowid FROM push_notified WHERE user_id = ? ORDER BY at, rowid LIMIT ?)`),
       unmarkNotified: p('DELETE FROM push_notified WHERE user_id = ? AND host_id = ? AND approval_id = ?'),
       purgeNotified: p('DELETE FROM push_notified WHERE at <= ?'),
 
@@ -230,12 +233,28 @@ class Store {
     return this.q.pushTokensOfUser.all(userId, platform).map((r) => r.token);
   }
 
-  /** 记下这条审批推送过了；第一次记时返回 true */
-  markNotified(userId, hostId, approvalId, now) {
-    return Number(this.q.markNotified.run(userId, hostId, approvalId, now).changes) > 0;
+  /**
+   * 记下这一批审批推送过了，返回第一次记下的编号。整批一个事务：一份列表最多 100 条，逐条提交太慢，
+   * 中途出错也不会只记了一半。账号的记录超过 maxPerUser 条时删最旧的，表的大小有上限。
+   * @returns {string[]}
+   */
+  markNotifiedBatch(userId, hostId, approvalIds, now, maxPerUser) {
+    this.db.exec('BEGIN');
+    try {
+      const fresh = approvalIds.filter((id) => Number(this.q.markNotified.run(userId, hostId, id, now).changes) > 0);
+      if (fresh.length) {
+        const over = Number(this.q.countNotified.get(userId).n) - maxPerUser;
+        if (over > 0) this.q.trimNotified.run(userId, over);
+      }
+      this.db.exec('COMMIT');
+      return fresh;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
   }
 
-  /** 推送没发出去（网络、对方服务器出错、超过每小时上限）：撤掉记录，电脑下次发列表时再推 */
+  /** 推送没发出去（网络、对方服务器出错、超过每小时上限）：撤掉记录，之后重推或等电脑下次发列表 */
   unmarkNotified(userId, hostId, approvalId) {
     this.q.unmarkNotified.run(userId, hostId, approvalId);
   }

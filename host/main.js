@@ -552,7 +552,7 @@ let chain = Promise.resolve(); // 所有输入事件串行执行，保证顺序
 
 /** 切不到前台时，分清是电脑锁屏了还是别的原因 */
 function frontFailure() {
-  return win32.isLocked() ? 'locked' : 'front-failed';
+  return lock.lockedNow() ? 'locked' : 'front-failed';
 }
 
 function reportError(viewerId, code) {
@@ -1083,11 +1083,6 @@ const dialogWatch = dialogWatchLib.createDialogWatch({
 // ---------------------------------------------------------------- 锁定与解锁（协议文档 4.6，解锁服务见 docs/06）
 
 const LOCK_POLL_MS = 2000;
-const SERVICE_CHECK_MS = 30000;
-// untrusted：管道那头有服务，但核实不过（多半是被控端自动升级了、解锁服务还是旧版），要在电脑上重新安装服务
-let lockState = { locked: false, unlock: false, untrusted: false };
-let serviceCheckedAt = 0;
-let unlocking = false;
 
 // 连上管道后先核实对面确实是装在 Program Files 里、以 SYSTEM 运行的解锁服务，才发命令（docs/06 的"管道防冒充"）
 const unlockPipe = require('./unlockpipe').createUnlockPipe({ log: (msg) => console.log('[解锁] ' + msg) });
@@ -1097,27 +1092,30 @@ function askUnlockService(line, timeoutMs) {
   return unlockPipe.request(line, timeoutMs);
 }
 
-/** 定时看电脑是否锁屏、解锁服务在不在，有变化就告诉页面，页面再告诉所有控制端 */
-async function pollLock() {
-  const locked = win32.isLocked();
-  let { unlock, untrusted } = lockState;
-  if (locked !== lockState.locked || Date.now() - serviceCheckedAt > SERVICE_CHECK_MS) {
-    serviceCheckedAt = Date.now();
-    const r = await askUnlockService('STATUS', 1500);
-    unlock = r.line !== undefined && r.line.startsWith('OK');
-    untrusted = r.error === 'untrusted';
-  }
-  if (locked === lockState.locked && unlock === lockState.unlock && untrusted === lockState.untrusted) return;
-  lockState = { locked, unlock, untrusted };
-  if (mainWindow) mainWindow.webContents.send('rc:lock-state', lockState);
+// 锁屏，以及"远程桌面断开了、没有画面"（对控制端也算锁屏，解锁时先把会话接回电脑的显示器，docs/06）
+const lockStateLib = require('./lockstate');
+const lock = lockStateLib.createLockState({
+  screenLocked: () => win32.isLocked(),
+  sessionInfo: () => require('./sessioninfo').current(),
+  ask: askUnlockService,
+  log: (msg) => console.log('[解锁] ' + msg),
+  // 页面再告诉所有控制端。detached 只给页面用（接回后重新采集），发给控制端的消息只取 locked、unlock、untrusted
+  onChange: (state) => {
+    if (mainWindow) mainWindow.webContents.send('rc:lock-state', state);
+  },
+});
+
+/** 定时看电脑是否锁屏、远程桌面是否断开、解锁服务在不在，有变化就告诉页面 */
+function pollLock() {
+  return lock.poll().catch((err) => console.error('查锁屏状态出错:', err));
 }
 
-ipcMain.handle('rc:lock-state', () => lockState);
+ipcMain.handle('rc:lock-state', () => lock.current());
 
-// 画面停了时问一下：窗口还在不在、是不是锁屏了
+// 画面停了时问一下：窗口还在不在、是不是锁屏了（远程桌面断开也算）
 ipcMain.handle('rc:window-state', (e, hwnd) => {
   hwnd = Number(hwnd);
-  return { alive: Number.isInteger(hwnd) && win32.isTargetWindow(hwnd, cfg.targets), locked: win32.isLocked() };
+  return { alive: Number.isInteger(hwnd) && win32.isTargetWindow(hwnd, cfg.targets), locked: lock.lockedNow() };
 });
 
 // 只在控制端明确要求时锁定；控制端断开时不会自动锁定
@@ -1128,20 +1126,14 @@ ipcMain.handle('rc:lock-now', (e) => {
   return ok;
 });
 
-/** 把控制端输入的 Windows 密码交给解锁服务。返回错误码，成功返回 null。密码不写日志、不保存 */
+/**
+ * 把控制端输入的 Windows 密码交给解锁服务。返回错误码，成功返回 null。密码不写日志、不保存。
+ * 远程桌面断开时发的是 ATTACH（先接回电脑的显示器），否则是 UNLOCK，见 lockstate.js
+ */
 async function unlockWith(password) {
-  if (typeof password !== 'string' || !password || password.length > 256) return 'failed';
-  if (unlocking) return 'busy';
-  if (!win32.isLocked()) return 'not-locked';
-  unlocking = true;
   try {
-    const r = await askUnlockService('UNLOCK ' + Buffer.from(password, 'utf8').toString('base64'), 40000);
-    if (r.line === undefined) return r.error === 'untrusted' ? 'bad-service' : 'no-service';
-    const reply = r.line;
-    if (reply === 'OK') return null;
-    return reply.startsWith('ERR ') ? reply.slice(4).trim() || 'failed' : 'failed';
+    return await lock.unlock(password);
   } finally {
-    unlocking = false;
     setTimeout(pollLock, 300);
   }
 }

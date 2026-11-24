@@ -49,10 +49,13 @@
 
 | 请求 | 回应 |
 |---|---|
-| `STATUS` | `OK locked=1` 或 `OK locked=0` |
-| `UNLOCK <base64>` | `OK`，或 `ERR <code>`，code 同 03 的 4.6（另一次解锁还没结束时是 `ERR busy`；密码格式不对，包括含控制字符，是 `ERR failed`，不算一次失败） |
+| `STATUS` | 控制台会话里的程序：`OK locked=1 attach=0` 或 `OK locked=0 attach=0`；远程桌面断开、可以接回的会话里的程序：`OK locked=1 attach=1`（见下面"远程桌面断开后从手机接回"）。旧版服务只回 `OK locked=0/1`，没有 `attach` |
+| `UNLOCK <base64>` | `OK`，或 `ERR <code>`，code 同 03 的 4.6（另一次解锁还没结束时是 `ERR busy`；密码格式不对，包括含控制字符，是 `ERR failed`，不算一次失败）。只认控制台会话里的程序 |
+| `ATTACH <base64>` | 把发请求的程序所在的会话接回控制台，接回后还锁着就照常输入密码。回应同 `UNLOCK`。控制台会话里的程序发来时等同 `UNLOCK` |
 
-服务同时开 4 个处理槽位，每个连接在自己的线程里处理。一个连上不说话、或者隔一会儿才发一个字节拖着不发完的程序，最多占住一个槽位约 3 秒：读一条请求从开始读算起总共只等 2 秒（整行的总时限，不是每次读各等 2 秒），到点回 `ERR failed`；回应后最多再等 1 秒对面关掉。其它槽位照常处理，`STATUS` 照常回应。真正的解锁同一时间只做一次。只服务控制台会话里的程序（`GetNamedPipeClientSessionId`），别的用户、远程桌面会话里的程序连上就被断开。所以被控端要在控制台会话里运行，通过远程桌面登录时用不了解锁。
+回应里的字段是空格分开的 `key=value`，被控端忽略认不出的字段，旧版被控端只看开头是不是 `OK`，所以加字段不影响旧版。
+
+服务同时开 4 个处理槽位，每个连接在自己的线程里处理。一个连上不说话、或者隔一会儿才发一个字节拖着不发完的程序，最多占住一个槽位约 3 秒：读一条请求从开始读算起总共只等 2 秒（整行的总时限，不是每次读各等 2 秒），到点回 `ERR failed`；回应后最多再等 1 秒对面关掉。其它槽位照常处理，`STATUS` 照常回应。真正的解锁（以及接回）同一时间只做一次。只服务控制台会话里的程序（`GetNamedPipeClientSessionId`），别的用户、正连着的远程桌面会话里的程序连上就被断开。唯一的例外是远程桌面断开后可以接回控制台的会话，它只能问 `STATUS`、发 `ATTACH`，见下一节。
 
 ## 安全措施
 
@@ -74,11 +77,85 @@
 - **能解锁的人**：要同时有 RemoteClaude 账号（手机已登录）和 Windows 密码。账号密码泄露本身解不了锁。
 - **经服务器转发时**（没连画面解锁）：服务器只见到密文；录下密文重发无效（被控端记着用过的密文，重启后换密钥）。服务器要是被换成恶意的、主动把公钥换掉，能骗到密码，这和画面连接的信任前提一样（WebRTC 的证书指纹也经它交换）。
 
+## 远程桌面断开后从手机接回
+
+### 问题
+
+经常用远程桌面（RDP）连到电脑上用。这时被控端和 Claude 跑在远程桌面会话里，不在控制台（电脑自己的显示器）上。关掉远程桌面窗口后，会话变成**断开**状态：程序照常在跑，但没有显示器，被控端采集不到窗口；以前的解锁服务又只理控制台会话里的程序，手机上就显示"没装解锁服务"。手动的办法是在那个会话里以管理员身份运行 `tscon <会话号> /dest:console`，把会话挪到电脑的显示器上，挪过去时是**未锁定**的。
+
+### 做法
+
+控制端（网页、安卓、鸿蒙）和信令协议都不用改，用户照常点"解锁电脑"：
+
+1. 被控端每 2 秒查一次自己所在的会话（`host/sessioninfo.js`，`ProcessIdToSessionId` + `WTSGetActiveConsoleSessionId` + `WTSQuerySessionInformationW(WTSConnectState)`）。会话号不是控制台会话、并且连接状态是 `WTSDisconnected`，就算"远程桌面断开了"（`host/lockstate.js` 的 `isDetached`）。这时对控制端报 `locked: true`（同 03 的 2.9 `host-state` 和 4.6 `lock`，字段不变）；`unlock` 取决于服务对 `STATUS` 的回应里有没有 `attach=1`。正连着的远程桌面会话（Active）不算，照旧只看屏幕锁没锁。
+2. 用户在手机上输入密码，被控端发 `ATTACH <密码的 Base64>`（不是 `UNLOCK`）。服务：
+   1. 检查发请求的程序所在的会话（下面"谁能触发接回"）。
+   2. 用这个会话自己的用户名、域名和收到的密码做一次交互式登录 `LogonUserW(LOGON32_LOGON_INTERACTIVE)`，再用 `WTSQueryUserToken` 取会话的令牌，确认两边是同一个账户（比 SID）。不对就算一次失败，回 `ERR still-locked`（密码不对）或 `ERR failed`（别的错误，比如账户被锁、没有本地登录权限），不接回。
+   3. 再检查一次第 1 步（核对密码要一两秒，期间情况可能变了），然后 `WTSConnectSessionW(会话, 控制台会话, ...)` 把会话接到电脑的显示器上：先不带密码，失败了再带上已核对过的密码试一次。
+   4. 等最多 10 秒，直到控制台会话就是这个会话。再等约 2.5 秒：会话是锁着的（断开前就锁了），按 `UNLOCK` 的流程输入密码；没锁着就回 `OK`。
+3. 被控端发现自己回到控制台，状态变回未锁定，推给控制端；页面把所有连着的画面重新采集一次（断开期间画面不一定报"停了"，分辨率也换了）。输入、剪贴板每次都现查前台窗口，不用特别处理。
+
+回给控制端的码都是 4.6 里已有的：`ok`、`still-locked`（密码不对）、`rate-limited`、`busy`、`failed`（不满足接回条件或接回失败）、`no-service`（旧版服务或没装服务）。没有新码。
+
+### 谁能触发接回
+
+服务只在这些条件全都满足时接回，否则回 `ERR failed` 并在日志里写明原因：
+
+- 要接回的会话就是发请求的程序所在的会话。会话号由 `GetNamedPipeClientSessionId` 给出，请求里不带会话号。
+- 这个会话处于 `WTSDisconnected`。`WTSActive`（有人正连着远程桌面在用）不接，免得把正在用的远程桌面抢走。会话 0（服务用的，它也显示为断开）永远不接。
+- 这个会话有登录用户（`WTSUserName` 不为空）。
+- 控制台此刻有会话（`WTSGetActiveConsoleSessionId` 不是 `0xFFFFFFFF`），并且上面没有别的用户：只有登录界面（没有用户），或者是同一个用户而且锁着。
+- 失败次数限制和解锁共用（15 分钟内失败 3 次就回 `rate-limited`），另外接回本身 15 分钟内最多 5 次（不论成败）。和解锁共用一把锁，同时只做一件。
+
+不满足条件的非控制台程序，连 `STATUS` 都得不到回应（和以前一样直接断开）；满足条件的也只认 `STATUS`、`ATTACH`，发 `UNLOCK` 回 `ERR failed`：往安全桌面输入密码仍然只为控制台会话做。输入密码前服务还确认控制台会话仍是请求的那个会话，注入进程也确认自己就在控制台会话里，控制台中途换了会话就不输入。
+
+### 为什么接回前要核对 Windows 密码
+
+不核对也能接回：服务以 SYSTEM 运行，`tscon` 以 SYSTEM 运行时不要密码。但那样的话，只要有手机上的 RemoteClaude 账号（比如手机丢了、账号密码泄露），就能：
+
+- 把这个用户**未锁定**的桌面亮到电脑的显示器上，被在电脑跟前的人看到、操作；
+- 接回后被控端恢复采集，远程看到、操作 Claude 窗口。
+
+这等于没有 Windows 密码就"解锁"了电脑，和普通锁屏的前提（"要同时有 RemoteClaude 账号和 Windows 密码"）不一致。所以要求先核对密码。代价：
+
+- **只认账户密码，不认 PIN**。Windows Hello 的 PIN 绑定在本机 TPM 上，只有登录界面能核对，服务没有办法核对。远程桌面登录本来也是用账户密码，所以用户知道它。输入 PIN 会核对不过，提示"没解开，请检查密码或 PIN"，并算一次失败。
+- 核对失败会在 Windows 安全日志里留一条登录失败（4625），也计入 Windows 的账户锁定阈值，和在锁屏上输错一样。服务自己的 15 分钟 3 次限制远低于默认阈值。
+- 用的是交互式登录：账户要有"允许本地登录"的权限。接回控制台本来就是在电脑跟前登录，这个要求是对的。
+
+### 剩下的风险
+
+- **会话里已经在运行的恶意程序**（以这个用户身份运行）也能连上管道发 `ATTACH`。它不知道密码就接不回；它要是已经知道密码（比如记录了键盘），本来就能自己运行 `tscon` 把会话挪到控制台（同一个用户不需要密码），服务没有给它多出能力。所以这一条可以接受。
+- 被控端的检查（核实管道对面是真服务）和以前一样，冒充服务骗密码的风险不变。
+- 接回后电脑的显示器上就是这个用户的桌面（断开前没锁的话）。这是用户在手机上主动要的，和在跟前 `tscon` 一样；建议用户确认电脑跟前没有别人。
+- 服务调用 `LogonUserW`、`WTSConnectSessionW`（等待完成）没有超时。正常几秒内完成；如果卡住（比如域控连不上），这期间别的解锁请求回 `busy`，被控端最多等 60 秒后按 `no-service` 处理（控制端 30 秒收不到回执就自己提示超时）。
+
+### 兼容
+
+| 被控端 | 服务 | 远程桌面断开时 |
+|---|---|---|
+| 新 | 新 | 显示锁屏、可以解锁，解锁即接回 |
+| 新 | 旧 | 旧服务直接断开非控制台的连接，`STATUS` 没回应：显示锁屏、不能解锁（"没装解锁服务"） |
+| 旧 | 新 | 旧被控端不认断开状态，按屏幕锁没锁报；新服务对它的 `STATUS` 回 `OK ... attach=1`，旧被控端会以为能解锁，发 `UNLOCK` 得到 `failed`。两边一起升级即可 |
+| 旧 | 旧 | 和以前一样，用不了 |
+
+在控制台上时，新旧组合的行为都和以前一样（`STATUS` 多出的 `attach=0` 旧被控端不看）。
+
+### 参考的微软文档
+
+- [WTSConnectSessionW](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsconnectsessionw)：`LogonId` 是要接过去的会话，它的输出转到 `TargetLogonId`；密码是 `LogonId` 那个用户的，"调用者和会话是同一个用户时可以为空"，不能是 NULL。文档**没写** SYSTEM 调用时要不要密码、原来在控制台上的会话会怎样、接过去后锁不锁。所以服务先不带密码、再带核对过的密码，并且接回后自己检查锁没锁。
+- [tscon](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/tscon)：`/dest` 指定的会话会被断开；连接别人的会话要密码，自己的不用。
+- [WTSQuerySessionInformationW](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsquerysessioninformationw)、[WTS_INFO_CLASS](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/ne-wtsapi32-wts_info_class)、[WTS_CONNECTSTATE_CLASS](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/ne-wtsapi32-wts_connectstate_class)：`WTSConnectState`（`WTSDisconnected` = 4）、`WTSUserName`、`WTSDomainName`；`WTSClientProtocolType` 为 0 表示在控制台。查别的用户的会话要有查询权限，SYSTEM 有。
+- [WTSGetActiveConsoleSessionId](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-wtsgetactiveconsolesessionid)：控制台正在接上或断开时返回 `0xFFFFFFFF`。
+- [LogonUserW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-logonuserw)：交互式登录要求账户有 `SE_INTERACTIVE_LOGON_NAME`；只有登录 Microsoft 账户（文档里的 Passport）才要 `SE_TCB_NAME`，SYSTEM 有。
+- [Remote Desktop Services permissions](https://learn.microsoft.com/en-us/windows/win32/termserv/terminal-services-permissions)：Connect 权限是"连接到另一个会话"。
+- [GetNamedPipeClientSessionId](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeclientsessionid)：管道客户端所在的会话。
+
 ## 不支持的情况
 
 - 要求先按 Ctrl+Alt+Del 的电脑（组策略"交互式登录：无须按 Ctrl+Alt+Del"被关掉）。会返回 `still-locked`。
 - 只设置了人脸、指纹而没有 PIN 或密码的账户。
 - 多个用户共用一台电脑、锁屏界面停在别的用户上。
+- 远程桌面断开时：电脑跟前有别的用户登录着（不接回）；只设了 PIN 而记不得账户密码；Azure AD（Entra）账户可能核对不过（会话的域名是 `AzureAD`，`LogonUserW` 不一定认），需要在那样的电脑上实测。
 
 ## 安装与卸载
 
@@ -123,6 +200,24 @@ powershell -ExecutionPolicy Bypass -File host\unlock-service\install.ps1 -Uninst
 - 编译，命令同 `install.ps1`。
 - 用 `--console` 模式运行，检查这些：`STATUS`；没锁屏时拒绝解锁；含控制字符的密码回 `ERR failed`；几个连上不说话的连接挡不住别的请求；同名管道已被占用时不服务、日志里有警告；占用者走后自动拿回名字。控制台模式下管道所有者是当前用户、路径也不在 Program Files，被控端的核实必须拒绝它。
 - 被控端的核实逻辑和协议处理有单元测试（`host/test/unlockpipe.test.js`，Win32 层换成假的）。
+- 远程桌面断开的判断、`STATUS` 的解析、`ATTACH`/`UNLOCK` 的选择、回应到错误码的映射有单元测试（`host/test/lockstate.test.js`，会话信息和管道换成假的）。
+- 控制台模式下：控制台会话发 `STATUS` 回 `OK locked=… attach=0`；控制台会话发 `ATTACH` 等同 `UNLOCK`（没锁屏回 `not-locked`，锁着回 `no-service`，不输入）；`ATTACH` 的密码含控制字符、不是 Base64、为空都回 `ERR failed`。服务已经装着、占着管道名时，把源码里的管道名换一个再编译测试。
+- 接回的条件判断（`RemoteSession.CanAttach`）可以单独编译一个小程序调用它：控制台会话、会话 0、不存在的会话、控制台为 `0xFFFFFFFF` 时都必须拒绝。
+
+只能在通过远程桌面使用的电脑上测的，见下面"远程桌面接回的实测"。
+
+### 远程桌面接回的实测
+
+在要用的那台电脑上（新版被控端，用 `install.ps1` 装好新版服务）：
+
+1. 通过远程桌面登录，启动被控端，手机能看到 Claude 窗口。
+2. **断开且未锁**：直接关掉远程桌面窗口（不注销、不锁）。约 2 秒内手机显示电脑锁屏、可以解锁；被控端日志有"远程桌面已断开"。`query session` 里这个会话是"断开"，控制台是一个没有用户的新会话。
+3. 手机上输入 Windows **账户密码**（远程桌面登录用的那个）解锁：几秒内回成功；电脑的显示器上出现桌面；`query session` 里这个会话变成 console、Active；手机能重新看到 Claude 窗口画面、能输入。`C:\ProgramData\RemoteClaude\unlock.log` 有"密码核对通过，把会话 N 接回控制台""已接回控制台，没有锁屏"，以及（如果有）"不带密码接回失败（错误 …）"——记下这个错误码，它说明 SYSTEM 调用 `WTSConnectSessionW` 时要不要密码。
+4. **密码错误**：重复第 2 步后输入错误的密码：回"没解开"，会话仍是断开，日志有"核对 Windows 密码没通过（错误 1326）"。输入 PIN：同样核对不过。连续 3 次后回"失败次数太多"。
+5. **断开前锁着**：远程桌面里按 Win+L 后关掉窗口，手机上解锁：接回后日志有"已接回控制台，但是锁着，接着输入密码"，最终解锁成功。
+6. **正连着的远程桌面**：远程桌面开着（Active）时手机上的状态和以前一样（看屏幕锁没锁）；锁屏时点解锁应得到"失败"或"没装解锁服务"，远程桌面不能被断开。
+7. **控制台上有别的用户**：（有第二个账户时）让另一个用户在电脑跟前登录着，再断开远程桌面：手机上显示锁屏、不能解锁；`unlock.log` 有"拒绝了不在控制台会话里的连接（会话 N：控制台上是别的用户的会话）"。
+8. 账户类型：分别记录本地账户、Microsoft 账户、（如有）Azure AD 账户下第 3 步的结果；不通过时记下日志里的错误码。
 
 只能装好服务后测的：
 

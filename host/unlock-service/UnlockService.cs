@@ -95,11 +95,14 @@ namespace RemoteClaude
     ///     只负责让名字一刻也不空出来：干活的实例怎么建、怎么关、出什么错，普通进程都没机会抢注；
     ///   - 管道的所有者明确设为 SYSTEM，被控端连上后据此（以及进程路径）确认对面是真的服务。
     /// 几个槽位各用一个线程，一个不说话的连接只占住一个槽位几秒，卡不住整个服务；
-    /// 不在控制台会话里的客户端（别的用户、远程桌面会话）连上就断开。
+    /// 不在控制台会话里的客户端（别的用户、远程桌面会话）连上就断开，
+    /// 唯一的例外是远程桌面断开后可以接回控制台的会话（见 RemoteSession），它只能问 STATUS、发 ATTACH。
     /// </summary>
     class PipeServer
     {
         const int MaxFailures = 3;
+        // 接回控制台（不论成败）15 分钟内最多几次。接回后会话就不再是断开的，正常用不了这么多
+        const int MaxAttaches = 5;
         static readonly TimeSpan FailureWindow = TimeSpan.FromMinutes(15);
         const int Slots = 4;
         // 每个槽位同时最多两个实例（正在处理的连接、替它等下一个连接的），再加一个锚
@@ -114,6 +117,7 @@ namespace RemoteClaude
         readonly bool asService;
         readonly byte[] securityDescriptor;
         readonly List<DateTime> failures = new List<DateTime>();
+        readonly List<DateTime> attaches = new List<DateTime>();
         readonly object unlockGate = new object();
         readonly object instanceGate = new object();
         readonly HashSet<NamedPipeServerStream> instances = new HashSet<NamedPipeServerStream>();
@@ -331,19 +335,46 @@ namespace RemoteClaude
 
         void Handle(NamedPipeServerStream pipe)
         {
-            // 只服务控制台会话里的程序：别的用户、远程桌面会话里的程序连上就断开，
-            // 免得它们拿错误密码烧掉失败次数，或者占着槽位
+            // 只服务两种程序，别的（别的用户、正连着的远程桌面会话里的程序）连上就断开，
+            // 免得它们拿错误密码烧掉失败次数，或者占着槽位：
+            //   - 控制台会话里的程序：STATUS、UNLOCK、ATTACH（ATTACH 这时等同 UNLOCK）；
+            //   - 远程桌面断开后、可以接回控制台的会话里的程序（docs/06"远程桌面断开后从手机接回"）：只认 STATUS、ATTACH。
+            // 会话号只认 GetNamedPipeClientSessionId，不看请求里写了什么
             uint clientSession;
-            if (!Native.GetNamedPipeClientSessionId(pipe.SafePipeHandle, out clientSession) || clientSession != Session.Console())
+            if (!Native.GetNamedPipeClientSessionId(pipe.SafePipeHandle, out clientSession))
             {
-                Log.Throttled("other-session", "拒绝了不在控制台会话里的连接");
+                Log.Throttled("other-session", "拒绝了查不到会话号的连接");
+                return;
+            }
+            uint console = Session.Console();
+            bool atConsole = clientSession == console;
+            string why;
+            if (!atConsole && !RemoteSession.CanAttach(clientSession, console, out why))
+            {
+                Log.Throttled("other-session", "拒绝了不在控制台会话里的连接（会话 " + clientSession + "：" + why + "）");
                 return;
             }
             string line = ReadLine(pipe, 2048, ReadTimeoutMs);
             string reply;
             if (line == null) reply = "ERR failed";
-            else if (line == "STATUS") reply = "OK locked=" + (Session.IsLocked(Session.Console()) ? "1" : "0");
-            else if (line.StartsWith("UNLOCK ", StringComparison.Ordinal)) reply = Unlock(line.Substring(7));
+            else if (line == "STATUS")
+            {
+                // 旧版被控端只看开头是不是 OK，后面多出的字段不影响它
+                reply = atConsole
+                    ? "OK locked=" + (Session.IsLocked(console) ? "1" : "0") + " attach=0"
+                    : "OK locked=1 attach=1";
+            }
+            else if (line.StartsWith("UNLOCK ", StringComparison.Ordinal))
+            {
+                if (atConsole) reply = Unlock(clientSession, line.Substring(7));
+                else
+                {
+                    // 往安全桌面输入密码只为控制台会话做；断开的会话要先 ATTACH
+                    Log.Throttled("remote-unlock", "拒绝了不在控制台会话里的解锁输入请求（会话 " + clientSession + "）");
+                    reply = "ERR failed";
+                }
+            }
+            else if (line.StartsWith("ATTACH ", StringComparison.Ordinal)) reply = Attach(clientSession, line.Substring(7));
             else reply = "ERR failed";
             byte[] bytes = Encoding.UTF8.GetBytes(reply + "\n");
             try
@@ -402,7 +433,8 @@ namespace RemoteClaude
             catch (Exception) { }
         }
 
-        string Unlock(string b64)
+        /// <summary>clientSession：发请求的程序所在的会话，接受连接时它是控制台会话；输入前再确认它仍是控制台</summary>
+        string Unlock(uint clientSession, string b64)
         {
             string password = Password.Decode(b64);
             if (password == null)
@@ -419,7 +451,7 @@ namespace RemoteClaude
             }
             try
             {
-                return UnlockLocked(password);
+                return UnlockLocked(password, clientSession);
             }
             finally
             {
@@ -427,18 +459,130 @@ namespace RemoteClaude
             }
         }
 
-        string UnlockLocked(string password)
+        /// <summary>
+        /// 把发请求的程序所在的会话（远程桌面断开后没有画面）接回控制台。先核对 Windows 密码，
+        /// 接回后会话仍是锁着的，再按 UNLOCK 的流程输入密码。发请求的程序已经在控制台时，等同 UNLOCK
+        /// </summary>
+        string Attach(uint clientSession, string b64)
+        {
+            string password = Password.Decode(b64);
+            if (password == null)
+            {
+                Log.Throttled("bad-request", "接回请求的密码格式不对，已拒绝，什么都没做");
+                return "ERR failed";
+            }
+            // 和解锁共用一把锁：同一时间只做一件，限流的检查和记录也在锁里
+            if (!Monitor.TryEnter(unlockGate))
+            {
+                Log.Throttled("busy", "上一次解锁或接回还没结束，拒绝新的接回请求");
+                return "ERR busy";
+            }
+            try
+            {
+                if (clientSession == Session.Console()) return UnlockLocked(password, clientSession);
+                return AttachLocked(clientSession, password);
+            }
+            finally
+            {
+                Monitor.Exit(unlockGate);
+            }
+        }
+
+        string AttachLocked(uint session, string password)
+        {
+            if (RateLimited()) return "ERR rate-limited";
+            lock (attaches)
+            {
+                attaches.RemoveAll(t => DateTime.UtcNow - t > FailureWindow);
+                if (attaches.Count >= MaxAttaches)
+                {
+                    Log.Throttled("rate-limited", "接回控制台的次数太多，拒绝接回请求");
+                    return "ERR rate-limited";
+                }
+            }
+            string why;
+            if (!RemoteSession.CanAttach(session, Session.Console(), out why))
+            {
+                Log.Write("拒绝把会话 " + session + " 接回控制台：" + why);
+                return "ERR failed";
+            }
+            // 控制台测试模式没有 SYSTEM 身份，核对不了密码、也接不回会话
+            if (!asService) return "ERR no-service";
+
+            // 接回前先核对 Windows 密码：光有手机上的账号（比如手机丢了）不能把桌面亮到电脑跟前、也不能借此远程看到画面
+            int err = RemoteSession.CheckPassword(session, password);
+            if (err != 0)
+            {
+                lock (failures) failures.Add(DateTime.UtcNow);
+                Log.Write("接回会话 " + session + " 前核对 Windows 密码没通过（错误 " + err + "），没有接回");
+                return err == RemoteSession.ErrorLogonFailure ? "ERR still-locked" : "ERR failed";
+            }
+            // 核对密码要一两秒，期间情况可能变了：再查一次
+            uint console = Session.Console();
+            if (!RemoteSession.CanAttach(session, console, out why))
+            {
+                Log.Write("拒绝把会话 " + session + " 接回控制台：" + why);
+                return "ERR failed";
+            }
+            lock (attaches) attaches.Add(DateTime.UtcNow);
+            Log.Write("密码核对通过，把会话 " + session + " 接回控制台（原控制台会话 " + console + "）");
+            int connectError = RemoteSession.Connect(session, console, password);
+            if (connectError != 0)
+            {
+                Log.Write("接回控制台失败，错误 " + connectError);
+                return "ERR failed";
+            }
+            // 等它真的到了控制台
+            bool arrived = false;
+            for (int i = 0; i < 40 && !arrived; i++)
+            {
+                if (Session.Console() == session) arrived = true;
+                else Thread.Sleep(250);
+            }
+            if (!arrived)
+            {
+                Log.Write("已请求接回，但 10 秒内会话 " + session + " 没有到控制台");
+                return "ERR failed";
+            }
+            // 断开前锁着的会话，接回后还是锁屏，登录界面要过一会儿才出来：等一下，锁着就照常输入密码
+            for (int i = 0; i < 10; i++)
+            {
+                Thread.Sleep(250);
+                if (Session.IsLocked(session))
+                {
+                    Log.Write("会话 " + session + " 已接回控制台，但是锁着，接着输入密码");
+                    return UnlockLocked(password, session);
+                }
+            }
+            lock (failures) failures.Clear();
+            Log.Write("会话 " + session + " 已接回控制台，没有锁屏");
+            return "OK";
+        }
+
+        bool RateLimited()
         {
             lock (failures)
             {
                 failures.RemoveAll(t => DateTime.UtcNow - t > FailureWindow);
-                if (failures.Count >= MaxFailures)
-                {
-                    Log.Throttled("rate-limited", "失败次数太多，拒绝解锁请求");
-                    return "ERR rate-limited";
-                }
+                if (failures.Count < MaxFailures) return false;
             }
+            Log.Throttled("rate-limited", "失败次数太多，拒绝请求");
+            return true;
+        }
+
+        /// <summary>
+        /// 往控制台会话的登录界面输入密码。expectedSession 是请求方所在的会话：控制台此刻已经换成别的会话
+        /// （比如有人在电脑前切换了用户），就不输入，免得把这个用户的密码打进别人的登录界面
+        /// </summary>
+        string UnlockLocked(string password, uint expectedSession)
+        {
+            if (RateLimited()) return "ERR rate-limited";
             uint session = Session.Console();
+            if (session != expectedSession)
+            {
+                Log.Write("控制台会话已经不是发请求的会话（" + expectedSession + " → " + session + "），没有输入");
+                return "ERR failed";
+            }
             if (!Session.IsLocked(session))
             {
                 Log.Throttled("not-locked", "收到解锁请求，但电脑没锁屏，什么都没做");
@@ -598,6 +742,172 @@ namespace RemoteClaude
             if (!LogonUiRunning(session)) return false;
             if (!useEvents) return true;
             lock (locked) return locked.Contains(session);
+        }
+    }
+
+    /// <summary>
+    /// 远程桌面断开后把会话接回控制台（docs/06"远程桌面断开后从手机接回"）。
+    /// 只接这样的会话：它就是发请求的程序所在的会话（会话号由管道给出）；处于断开状态（不是有人正连着的远程桌面）；
+    /// 有登录用户；控制台上此刻没有别的用户的会话（只有登录界面，或者就是同一个用户）
+    /// </summary>
+    static class RemoteSession
+    {
+        public const int ErrorLogonFailure = 1326; // ERROR_LOGON_FAILURE：用户名或密码不对
+        const int NoSuchUser = 1317;               // ERROR_NO_SUCH_USER
+        const int WTSUserName = 5;
+        const int WTSDomainName = 7;
+        const int WTSConnectState = 8;
+        const int WTSDisconnected = 4;
+        const int Logon32LogonInteractive = 2;
+        const int Logon32ProviderDefault = 0;
+
+        public static bool CanAttach(uint session, uint console, out string why)
+        {
+            why = null;
+            if (console == 0xFFFFFFFF) { why = "控制台此刻没有会话（正在切换）"; return false; }
+            if (session == console) { why = "已经在控制台上"; return false; }
+            if (session == 0) { why = "会话 0 是服务用的"; return false; }
+            int state;
+            if (!ConnectState(session, out state)) { why = "查不到连接状态"; return false; }
+            if (state != WTSDisconnected) { why = "不是断开状态（状态 " + state + "），可能正有人连着远程桌面"; return false; }
+            string user = Text(session, WTSUserName), domain = Text(session, WTSDomainName);
+            if (string.IsNullOrEmpty(user)) { why = "没有登录用户"; return false; }
+            string consoleUser = Text(console, WTSUserName), consoleDomain = Text(console, WTSDomainName);
+            if (consoleUser == null) { why = "查不到控制台会话的用户"; return false; }
+            if (consoleUser.Length > 0)
+            {
+                if (!(SameName(consoleUser, user) && SameName(consoleDomain, domain)))
+                {
+                    why = "控制台上是别的用户的会话";
+                    return false;
+                }
+                // 同一用户的另一个会话（只有允许一人多会话的系统才会有）：没锁着就说明有人正在用，不抢
+                if (!Session.IsLocked(console))
+                {
+                    why = "控制台上同一用户的另一个会话正在使用";
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 用会话自己的用户名、域名和给的密码做一次交互式登录（LogonUserW），再确认登录出来的账户和会话的账户是同一个（比 SID）。
+        /// 通过返回 0，否则返回错误码（密码不对是 1326）。只认账户密码，Windows Hello 的 PIN 核对不了
+        /// </summary>
+        public static int CheckPassword(uint session, string password)
+        {
+            string user = Text(session, WTSUserName), domain = Text(session, WTSDomainName);
+            if (string.IsNullOrEmpty(user)) return 87; // ERROR_INVALID_PARAMETER
+            IntPtr logon = IntPtr.Zero, owner = IntPtr.Zero, pw = IntPtr.Zero;
+            try
+            {
+                pw = Marshal.StringToCoTaskMemUni(password);
+                if (!Native.LogonUserW(user, domain, pw, Logon32LogonInteractive, Logon32ProviderDefault, out logon))
+                {
+                    int e = Marshal.GetLastWin32Error();
+                    return e != 0 ? e : ErrorLogonFailure;
+                }
+                if (!Native.WTSQueryUserToken(session, out owner))
+                {
+                    int e = Marshal.GetLastWin32Error();
+                    return e != 0 ? e : NoSuchUser;
+                }
+                try
+                {
+                    using (var a = new WindowsIdentity(logon))
+                    using (var b = new WindowsIdentity(owner))
+                    {
+                        if (a.User == null || a.User != b.User) return NoSuchUser; // 不是会话的那个账户
+                    }
+                }
+                catch (Exception e)
+                {
+                    Log.Write("比对账户出错: " + e.Message);
+                    return NoSuchUser;
+                }
+                return 0;
+            }
+            finally
+            {
+                if (pw != IntPtr.Zero) Marshal.ZeroFreeCoTaskMemUnicode(pw);
+                if (logon != IntPtr.Zero) Native.CloseHandle(logon);
+                if (owner != IntPtr.Zero) Native.CloseHandle(owner);
+            }
+        }
+
+        /// <summary>
+        /// WTSConnectSessionW：把 session 的画面接到 console 上（LogonId = session，TargetLogonId = console，同 tscon session /dest:console）。
+        /// 文档只写了"调用者和会话是同一个用户时密码可以为空"，没写 SYSTEM 调用时怎样（tscon 以 SYSTEM 运行时不要密码）。
+        /// 所以先不带密码，失败了再带上已核对过的密码试一次：能不带就不把明文交出去；两次都只在核对通过之后。
+        /// 成功返回 0，否则返回错误码
+        /// </summary>
+        public static int Connect(uint session, uint console, string password)
+        {
+            int first = ConnectWith(session, console, "");
+            if (first == 0) return 0;
+            int second = ConnectWith(session, console, password);
+            if (second == 0)
+            {
+                Log.Write("不带密码接回失败（错误 " + first + "），带密码接回成功");
+                return 0;
+            }
+            Log.Write("不带密码接回失败（错误 " + first + "），带密码也失败（错误 " + second + "）");
+            return second;
+        }
+
+        static int ConnectWith(uint session, uint console, string password)
+        {
+            IntPtr pw = Marshal.StringToCoTaskMemUni(password);
+            try
+            {
+                if (Native.WTSConnectSessionW(session, console, pw, true)) return 0;
+                int e = Marshal.GetLastWin32Error();
+                return e != 0 ? e : -1;
+            }
+            finally
+            {
+                Marshal.ZeroFreeCoTaskMemUnicode(pw);
+            }
+        }
+
+        static bool SameName(string a, string b)
+        {
+            return string.Equals(a ?? "", b ?? "", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static bool ConnectState(uint session, out int state)
+        {
+            state = -1;
+            IntPtr buf;
+            uint bytes;
+            if (!Native.WTSQuerySessionInformationW(IntPtr.Zero, session, WTSConnectState, out buf, out bytes)) return false;
+            try
+            {
+                if (buf == IntPtr.Zero || bytes < 4) return false;
+                state = Marshal.ReadInt32(buf);
+                return true;
+            }
+            finally
+            {
+                if (buf != IntPtr.Zero) Native.WTSFreeMemory(buf);
+            }
+        }
+
+        /// <summary>会话的文字信息（用户名、域名）。查询失败返回 null，没有（比如登录界面的会话没有用户）返回空串</summary>
+        static string Text(uint session, int infoClass)
+        {
+            IntPtr buf;
+            uint bytes;
+            if (!Native.WTSQuerySessionInformationW(IntPtr.Zero, session, infoClass, out buf, out bytes)) return null;
+            try
+            {
+                return buf == IntPtr.Zero ? "" : (Marshal.PtrToStringUni(buf) ?? "");
+            }
+            finally
+            {
+                if (buf != IntPtr.Zero) Native.WTSFreeMemory(buf);
+            }
         }
     }
 
@@ -809,6 +1119,11 @@ namespace RemoteClaude
             if (password == null) return BadInput;
 
             uint session = Session.Console();
+            // 服务把注入进程放进请求的那个会话；控制台在这期间换了会话，就不是要解锁的那个了
+            using (Process self = Process.GetCurrentProcess())
+            {
+                if ((uint)self.SessionId != session) return NoLogonScreen;
+            }
             if (!Session.IsLocked(session)) return NotLocked;
 
             // 1. 唤醒屏幕，按空格收起锁屏画面
@@ -1066,6 +1381,16 @@ namespace RemoteClaude
 
         [DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId();
         [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        public static extern bool WTSQuerySessionInformationW(IntPtr server, uint sessionId, int infoClass, out IntPtr buffer, out uint bytes);
+        [DllImport("wtsapi32.dll")] public static extern void WTSFreeMemory(IntPtr memory);
+        // 密码参数用 IntPtr：调用方自己分配、用完清零（Marshal.ZeroFreeCoTaskMemUnicode）
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        public static extern bool WTSConnectSessionW(uint logonId, uint targetLogonId, IntPtr password, bool wait);
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        public static extern bool WTSQueryUserToken(uint sessionId, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool LogonUserW(string user, string domain, IntPtr password, int logonType, int provider, out IntPtr token);
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern uint GetFileAttributesW(string path);
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]

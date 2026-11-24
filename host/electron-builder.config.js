@@ -31,6 +31,8 @@ module.exports = {
     'unlockkey.js',
     'unlockpipe.js',
     'unlockpipe-native.js',
+    'lockstate.js',
+    'sessioninfo.js',
     'files.js',
     'account.js',
     'serveraddress.js',

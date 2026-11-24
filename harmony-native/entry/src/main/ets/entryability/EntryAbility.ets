@@ -5,8 +5,8 @@ import { AppContext } from '../common/AppContext';
 import { controller } from '../RemoteController';
 import { NetworkWatcher } from '../net/NetworkWatcher';
 
-/** 点审批推送通知打开 App 时带的 action（服务器的 clickAction.action，见 docs/03 和 docs/10） */
-const APPROVAL_ACTION = 'com.remoteclaude.harmony.APPROVAL';
+/** 留着的自定义 action：服务器以后改用 clickAction.actionType 1 时用它（现在用 actionType 0，靠 parameters 认，协议 2.10） */
+const APPROVAL_ACTION = 'com.remoteclaude.mobile.APPROVAL';
 
 export default class EntryAbility extends UIAbility {
   private network: NetworkWatcher = new NetworkWatcher();

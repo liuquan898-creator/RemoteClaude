@@ -31,9 +31,17 @@ struct Index {
     }
   }
 
+  /** 验证框正在显示：回到前台时 @Monitor 和 onPageShow 都会叫解锁，只弹一个 */
+  private authInFlight: boolean = false;
+
   private unlock(): void {
+    if (this.authInFlight) {
+      return;
+    }
+    this.authInFlight = true;
     controller.authenticating = true;
     AppLock.authenticate((ok: boolean) => {
+      this.authInFlight = false;
       controller.authenticating = false;
       if (ok) {
         controller.onUnlocked();

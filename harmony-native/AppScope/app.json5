@@ -1,6 +1,6 @@
 {
   "app": {
-    "bundleName": "com.remoteclaude.harmony",
+    "bundleName": "com.remoteclaude.mobile",
     "vendor": "remoteclaude",
     "versionCode": 2000000,
     "versionName": "0.2.0",

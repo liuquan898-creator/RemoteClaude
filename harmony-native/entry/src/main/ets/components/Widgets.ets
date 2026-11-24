@@ -111,6 +111,7 @@ export struct ApprovalBanner {
 
   build() {
     if (this.s.approvals.length > 0) {
+      Column() {
       Row() {
         Column() {
           Text(this.title()).fontSize(14).fontWeight(FontWeight.Medium).fontColor(RcColors.Text)
@@ -122,13 +123,16 @@ export struct ApprovalBanner {
 
         Text('处理').fontSize(14).fontColor(RcColors.Accent).margin({ left: 12 })
       }
-      .width('100%')
       .padding({ left: 12, right: 12, top: 8, bottom: 8 })
       .backgroundColor(RcColors.Card)
       .borderRadius(8)
       .border({ width: 1, color: RcColors.Warn })
-      .margin({ left: 12, right: 12, top: 4, bottom: 4 })
       .onClick(() => this.onOpen())
+      // 外面再包一层留边距：width('100%') 加 margin 会超出屏幕
+      .width('100%')
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 4, bottom: 4 })
     }
   }
 }

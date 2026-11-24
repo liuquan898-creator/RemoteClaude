@@ -42,6 +42,7 @@
 | `server/` | 信令服务器（Node.js）。账号、邮件验证码、按账号转发信令、签发中继的临时凭据、托管网页和安装包 |
 | `web/` | 控制端网页，纯静态文件，无需构建 |
 | `android/` | 安卓控制端（Kotlin + Compose），构建和联调方法见 [android/README.md](android/README.md) |
+| `harmony-native/` | 鸿蒙原生控制端（ArkTS + ArkUI，HarmonyOS NEXT），功能对齐安卓 App，见 [10](docs/10-harmony-client.md) |
 | `claude-plugin/` | Claude Code 插件：把审批和提问交给被控端转到手机（[09](docs/09-approvals.md)） |
 | `deploy/` | 服务器部署用的文件：Docker 编排、Caddy 和 coturn 配置示例、打包配置样例 |
 | `scripts/` | 生成配置（`init-config.js`、`init-prod-config.js`）、发版本（`release.js`）、Claude 升级后的自检（`claude-selfcheck.js`） |
@@ -230,7 +231,7 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 - **剪贴板只同步文字**：只在看着画面时、只同步新复制的文字，图片和文件不同步；网页控制端没有。手机发过去的长文字、图片、文件路径不会再同步回来。
 - **最小化的窗口**被选中时会自动还原。
 - **浏览、打开、新建会话认的是 Claude 界面上的文字**，目前认简体中文和英文（英文没实测过），Claude 桌面端升级后可能要改，见 [07](docs/07-claude-sessions.md) 第 5、6 节。
-- 被控端只支持 Windows，控制端 App 只有安卓。
+- 被控端只支持 Windows。控制端 App 有安卓和鸿蒙（HarmonyOS NEXT）两个；鸿蒙版不能后台常驻，审批提醒靠华为推送，见 [10](docs/10-harmony-client.md)。
 
 ## 部署到服务器
 
@@ -281,6 +282,7 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 | [02 架构设计](docs/02-architecture.md) | 组件与流程、被控端实现要点、安全模型、技术选型、踩过的坑 |
 | [03 通信协议](docs/03-protocol.md) | 账号接口、信令消息、WebRTC 约定、输入事件格式 |
 | [04 安卓控制端设计](docs/04-android-client.md) | 技术栈、页面、手势、接入要点、验收标准 |
+| [10 鸿蒙原生控制端](docs/10-harmony-client.md) | 鸿蒙版的技术选型、和安卓的不同、构建签名、推送、升级、验收记录 |
 | [05 开发记录](docs/05-handoff-tasks.md) | 开发过程中的工作日志：每项功能怎么验证的、哪些没验证、任务清单。很长，按需查 |
 | [06 解锁服务](docs/06-unlock-service.md) | 从手机解锁电脑用的 Windows 服务：原理、安全措施、安装 |
 | [07 浏览和打开 Claude 会话](docs/07-claude-sessions.md) | 手机上浏览全部会话、打开和新建会话窗口：被控端怎么做到的、Claude 升级后怎么修 |
@@ -307,6 +309,6 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 
 ## 许可
 
-[MIT](LICENSE)。用到的第三方库（Electron、koffi、electron-updater、ws、nodemailer、OkHttp、Jetpack Compose、stream-webrtc-android 等）各有自己的许可证。
+[MIT](LICENSE)。用到的第三方库（Electron、koffi、electron-updater、ws、nodemailer、OkHttp、Jetpack Compose、stream-webrtc-android、@ohos/webrtc 等）各有自己的许可证。
 
 远程控制软件能操作你的电脑，请只连自己搭的、信得过的服务器；作者不对使用造成的损失负责。

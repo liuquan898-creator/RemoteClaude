@@ -19,7 +19,13 @@ export class FileSource {
   /** 打开文件。超过 max 字节时抛 FileTooLarge */
   static open(uri: string, max: number): FileSource {
     const file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
-    const size = fs.statSync(file.fd).size;
+    let size = 0;
+    try {
+      size = fs.statSync(file.fd).size;
+    } catch (e) {
+      fs.closeSync(file);
+      throw e as Error;
+    }
     let raw = file.name;
     if (!raw) {
       try {

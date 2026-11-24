@@ -200,11 +200,15 @@ export struct RemoteView {
       })
 
       Button('适应', { buttonStyle: ButtonStyleMode.TEXTUAL })
+        .fontSize(15)
+        .padding({ left: 6, right: 6 })
         .fontColor(RcColors.Accent)
         .onClick(() => {
           this.stageCommands.resetSeq++;
         })
       Button(this.toolsVisible ? '收起' : '键盘', { buttonStyle: ButtonStyleMode.TEXTUAL })
+        .fontSize(15)
+        .padding({ left: 6, right: 6 })
         .fontColor(RcColors.Accent)
         .onClick(() => {
           this.toolsVisible = !this.toolsVisible;

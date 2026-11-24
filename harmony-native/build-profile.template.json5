@@ -1,5 +1,5 @@
 {
-  // 构建用的是同目录的 build-profile.json5（不入库）：scripts/build.ps1 用本文件加上本机签名生成它。
+  // 构建用的是同目录的 build-profile.json5（不入库）：scripts/gen-build-profile.js 用本文件加上本机签名、服务器地址生成它（install.ps1、build.sh 会先跑它）。
   // 本机签名放在 signing.local.json5（不入库），内容是 DevEco 自动签名写出的 signingConfigs 数组里的那一项。
   "app": {
     "signingConfigs": [],

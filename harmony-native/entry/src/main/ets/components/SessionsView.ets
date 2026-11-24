@@ -265,7 +265,7 @@ export struct SessionsView {
             GridItem() {
               this.windowCard(w)
             }
-          }, (w: WindowItem) => `${w.hwnd}:${w.title}:${w.thumb?.length ?? 0}:${w.closable}`)
+          }, (w: WindowItem) => `${w.hwnd}:${w.title}:${w.thumb?.length ?? 0}:${w.closable}:${w.thumbLoading}:${w.minimized}`)
         }
         .columnsTemplate(this.gridColumns())
         .columnsGap(10)

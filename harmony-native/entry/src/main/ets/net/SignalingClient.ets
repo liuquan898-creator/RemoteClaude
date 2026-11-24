@@ -56,7 +56,9 @@ export class SignalingClient {
       Log.w(`信令连接出错：${errText(err)}`);
       this.ended(gen);
     });
-    ws.connect(url).catch((err: BusinessError) => {
+    // 自己也定时探测（API 21 起支持）：断网后半分钟内发现连接已死，对应安卓端 OkHttp 的 pingInterval(20s)
+    const options: webSocket.WebSocketRequestOptions = { pingInterval: 20, pongTimeout: 15 };
+    ws.connect(url, options).catch((err: BusinessError) => {
       Log.w(`信令连不上：${errText(err)}`);
       this.ended(gen);
     });

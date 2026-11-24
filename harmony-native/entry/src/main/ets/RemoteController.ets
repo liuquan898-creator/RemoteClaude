@@ -90,6 +90,10 @@ export class RemoteController {
   private refreshTimer: number = -1;
   private catalogTimer: number = -1;
   private openTimer: number = -1;
+  private logoutTimer: number = -1;
+  private approvalsWaitTimer: number = -1;
+  /** 服务器因为失败太多暂时锁了这个 IP（auth-fail locked）：这之前不要重连 */
+  private reconnectNotBefore: number = 0;
   private openSeq: number = 0;
   private approvalSeq: number = 0;
   private approvalsByHost: Map<string, Approval[]> = new Map<string, Approval[]>();
@@ -205,6 +209,7 @@ export class RemoteController {
     if (this.picking || this.fileUploading()) {
       BackgroundGuard.begin(this.picking ? '选择要发给电脑的图片或文件' : '把文件发到电脑上');
       const start = Date.now();
+      this.clearTimer(this.pickGuardTimer);
       this.pickGuardTimer = setInterval(() => {
         if (this.foreground) {
           this.clearTimer(this.pickGuardTimer);
@@ -236,7 +241,8 @@ export class RemoteController {
     }
     Log.i('网络已切换，立即重连');
     this.backoffMs = INITIAL_BACKOFF_MS;
-    this.stopStreaming(false);
+    // 旧连接作废（connect 会关掉它，不会再走 onSocketClosed），跟它有关的状态在这里清掉
+    this.forgetConnection();
     this.openSocket();
   }
 
@@ -397,6 +403,9 @@ export class RemoteController {
   }
 
   private signedIn(serverInput: string, server: ServerAddressResult, token: string, email: string): void {
+    // 刚退出又马上登录：上次退出时延后的断开不要再执行
+    this.clearTimer(this.logoutTimer);
+    this.logoutTimer = -1;
     this.wsUrl = server.url;
     this.httpBase = server.httpBase;
     this.session = token;
@@ -418,17 +427,24 @@ export class RemoteController {
 
   logout(): void {
     this.stopStreaming(true);
-    // 先在还连着的信令上注销推送，免得退出后还收到这个账号的通知
+    // 先在还连着的信令上注销推送，免得退出后还收到这个账号的通知。没连着时靠下面删掉本机令牌
+    // （服务器那边，这个登录作废时推送令牌也一起删，协议 2.10）
     if (this.pushToken.length > 0 && this.authed) {
       this.signaling.send(pushUnregisterMessage(this.pushToken));
     }
+    // 马上算作没连上：还在取推送令牌的 registerPush 回来后就不会再登记
+    this.authed = false;
     const token = this.session;
     const base = this.httpBase;
     this.pushToken = '';
     SettingsStore.savePushToken('');
     PushRegistrar.drop();
     // 稍等一下再断，让注销推送的消息发出去
-    setTimeout(() => this.disconnect(), 300);
+    this.clearTimer(this.logoutTimer);
+    this.logoutTimer = setTimeout(() => {
+      this.logoutTimer = -1;
+      this.disconnect();
+    }, 300);
     this.approvalsByHost.clear();
     this.session = '';
     this.wantHwnd = 0;
@@ -480,6 +496,9 @@ export class RemoteController {
     if (!this.foreground || this.state.locked) {
       return;
     }
+    if (Date.now() < this.reconnectNotBefore) {
+      return; // 服务器暂时锁了，等定好的重连
+    }
     if (this.session.length > 0 && this.wsUrl.length > 0 && !this.signaling.isActive) {
       this.openSocket();
     }
@@ -523,14 +542,7 @@ export class RemoteController {
   }
 
   private onSocketClosed(): void {
-    this.authed = false;
-    this.forgetHostStates();
-    this.stopStreaming(false);
-    if (this.state.opening !== null) {
-      this.cancelOpening();
-      this.toast('和服务器的连接断开了，不知道会话打开了没有，重连后看看');
-    }
-    this.forgetCloseRequests();
+    this.forgetConnection();
     const retry = this.foreground && this.session.length > 0;
     this.state.link = retry ? Link.Connecting : Link.Offline;
     this.state.refreshing = false;
@@ -540,12 +552,25 @@ export class RemoteController {
     }
   }
 
+  /** 信令连接没了：画面、等着的打开会话和关窗口、电脑状态、解锁回执都跟着作废（重连后电脑会重新推） */
+  private forgetConnection(): void {
+    this.authed = false;
+    this.forgetHostStates();
+    this.stopStreaming(false);
+    if (this.state.opening !== null) {
+      this.cancelOpening();
+      this.toast('和服务器的连接断开了，不知道会话打开了没有，重连后看看');
+    }
+    this.forgetCloseRequests();
+  }
+
   private scheduleReconnect(): void {
     this.clearTimer(this.retryTimer);
     const wait = this.backoffMs;
     this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
     this.retryTimer = setTimeout(() => {
       this.retryTimer = -1;
+      this.reconnectNotBefore = 0;
       if (this.foreground && this.session.length > 0) {
         this.openSocket();
       }
@@ -641,7 +666,9 @@ export class RemoteController {
         }
         break;
       case 'push-register-result':
-        if (!msg.ok) {
+        if (msg.ok) {
+          Log.i('服务器收下了推送令牌');
+        } else {
           Log.w(`服务器没收下推送令牌：${msg.code}`);
         }
         break;
@@ -681,7 +708,12 @@ export class RemoteController {
   /** 每次连上都登记一次推送令牌（令牌可能变，服务器按令牌去重） */
   private async registerPush(): Promise<void> {
     const token = await PushRegistrar.token();
-    if (token.length === 0 || !this.authed) {
+    // 取令牌是异步的，这期间可能已经退出登录或断线了
+    if (token.length === 0 || !this.authed || this.session.length === 0) {
+      return;
+    }
+    await PushRegistrar.ensureNotifications();
+    if (!this.authed || this.session.length === 0) {
       return;
     }
     if (this.signaling.send(pushRegisterMessage(token))) {
@@ -698,6 +730,7 @@ export class RemoteController {
         this.toast('连接失败次数太多，稍后自动重试');
         this.state.link = Link.Connecting;
         this.backoffMs = 60000;
+        this.reconnectNotBefore = Date.now() + 60000;
         this.scheduleReconnect();
         break;
       case 'bad-proto':
@@ -1081,7 +1114,9 @@ export class RemoteController {
       return;
     }
     this.approvalsRequested = true;
-    setTimeout(() => {
+    this.clearTimer(this.approvalsWaitTimer);
+    this.approvalsWaitTimer = setTimeout(() => {
+      this.approvalsWaitTimer = -1;
       this.approvalsRequested = false;
     }, 15000);
   }
@@ -1903,6 +1938,9 @@ export class RemoteController {
     transform(next);
     this.state.settings = next;
     SettingsStore.saveSettings(next);
+    if (next.showStats && this.peer !== null) {
+      this.startStats();
+    }
   }
 
   /**
@@ -1925,6 +1963,11 @@ export class RemoteController {
           this.state.hasVideo = true;
         }
         this.state.stats = this.state.settings.showStats && st !== null ? st.view : null;
+        // 已经出了画面、又不显示统计：不用再读了，省电（打开"显示统计信息"时 updateSettings 会重新开始）
+        if (this.state.hasVideo && !this.state.settings.showStats) {
+          this.clearTimer(this.statsTimer);
+          this.statsTimer = -1;
+        }
       }).catch(() => {
       });
     }, 1000);

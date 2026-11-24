@@ -233,6 +233,7 @@ struct ApprovalCard {
         Row({ space: 8 }) {
           if (q.multiSelect) {
             Checkbox().select((this.picked[i] ?? []).includes(o.label)).selectedColor(RcColors.Accent)
+              .shape(CheckBoxShape.ROUNDED_SQUARE)
               .hitTestBehavior(HitTestMode.None)
           } else {
             Radio({ value: o.label, group: `${q.question}` }).checked((this.picked[i] ?? []).includes(o.label))
@@ -328,6 +329,14 @@ struct ApprovalCard {
               .fontColor(RcColors.Accent)
               .onClick(() => {
                 this.denyNote = '';
+                // 输入框出来后把焦点给它，软键盘直接弹出来
+                setTimeout(() => {
+                  try {
+                    this.getUIContext().getFocusController().requestFocus(`deny-${this.a.item.id}`);
+                  } catch (e) {
+                    // 没聚焦上就让用户自己点
+                  }
+                }, 100);
               })
           }
         }
@@ -336,7 +345,7 @@ struct ApprovalCard {
           TextArea({ text: this.denyNote ?? '', placeholder: '告诉 Claude 为什么拒绝、应该怎么做' })
             .height(100)
             .margin({ top: 8 })
-            .defaultFocus(true)
+            .id(`deny-${this.a.item.id}`)
             .onChange((v: string) => {
               this.denyNote = v;
             })

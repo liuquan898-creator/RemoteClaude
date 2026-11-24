@@ -447,7 +447,8 @@ export function parseIncoming(text: string): Incoming | null {
     }
     case 'push-register-result': {
       const ok = bool(o, 'ok') === true;
-      return { type: 'push-register-result', ok, code: ok ? '' : str(o, 'code') ?? 'failed' };
+      // 协议 2.10：失败原因在 error 字段
+      return { type: 'push-register-result', ok, code: ok ? '' : str(o, 'error') ?? str(o, 'code') ?? 'failed' };
     }
     default:
       return null;
@@ -635,7 +636,7 @@ export function closeWindowMessage(host: string, hwnd: number, title: string, re
   return JSON.stringify({ type: 'close-window', host, hwnd, title, req });
 }
 
-/** 登记华为 Push Kit 的推送令牌（以 docs/03-protocol.md 最终写定的为准） */
+/** 登记华为 Push Kit 的推送令牌（协议 2.10）。每次鉴权成功后都发一次 */
 export function pushRegisterMessage(token: string): string {
   return JSON.stringify({ type: 'push-register', platform: 'harmony', token });
 }

@@ -29,13 +29,16 @@ export class Waiter<T> {
   }
 }
 
-/** 等 promise，超过 ms 毫秒还没结果就返回 null */
+/** 等 promise，超过 ms 毫秒还没结果（或者出错）就返回 null */
 export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   return new Promise<T | null>((resolve: (v: T | null) => void) => {
     const timer = setTimeout(() => resolve(null), ms);
     promise.then((v: T) => {
       clearTimeout(timer);
       resolve(v);
+    }).catch(() => {
+      clearTimeout(timer);
+      resolve(null);
     });
   });
 }

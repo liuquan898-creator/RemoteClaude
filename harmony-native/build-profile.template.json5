@@ -1,0 +1,40 @@
+{
+  // 构建用的是同目录的 build-profile.json5（不入库）：scripts/build.ps1 用本文件加上本机签名生成它。
+  // 本机签名放在 signing.local.json5（不入库），内容是 DevEco 自动签名写出的 signingConfigs 数组里的那一项。
+  "app": {
+    "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "5.0.3(15)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "arkOptions": {
+            // 生成到 BuildProfile.ets；SERVER_ADDRESS 由 scripts/gen-build-profile.js 从打包配置填进来
+            "buildProfileFields": {
+              "SERVER_ADDRESS": ""
+            }
+          },
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      { "name": "debug" },
+      { "name": "release" }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        { "name": "default", "applyToProducts": ["default"] }
+      ]
+    }
+  ]
+}

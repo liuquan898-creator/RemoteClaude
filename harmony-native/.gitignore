@@ -1,0 +1,13 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+/.preview
+/.clang-format
+**/.test
+**/oh_modules
+# 本机签名和由它生成的构建配置，不入库
+/build-profile.json5
+/signing.local.json5

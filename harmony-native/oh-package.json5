@@ -1,0 +1,8 @@
+{
+  "modelVersion": "5.1.0",
+  "description": "RemoteClaude 鸿蒙原生控制端",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hypium": "1.0.21"
+  }
+}

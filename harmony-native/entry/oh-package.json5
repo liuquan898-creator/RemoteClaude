@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "0.2.0",
+  "description": "RemoteClaude 鸿蒙原生控制端",
+  "main": "",
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@ohos/webrtc": "1.0.5"
+  }
+}

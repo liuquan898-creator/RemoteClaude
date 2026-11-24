@@ -98,6 +98,8 @@ powershell -ExecutionPolicy Bypass -File host\unlock-service\install.ps1 -Uninst
 
 安装脚本只在以管理员身份运行的 64 位 Windows PowerShell 5.1 里干活，否则会用它重新打开自己。程序装在 64 位的 Program Files（`%ProgramW6432%`）里，和被控端核实的路径一致。
 
+重新安装时，脚本先把源码复制到安装目录里的临时文件名、核对哈希、编译成临时的 exe，都成功了才停掉旧服务、换上新程序、建服务。在这之前取消（不输 `y`）、`-ExpectSha256` 不一致、编译失败，原来的服务照常运行、程序文件不变，临时文件会删掉。停旧服务以后出错时：换程序时原来的 exe 先改名成 `RemoteClaudeUnlock.old.exe` 备份，新程序就位失败就改回去；脚本再看服务的实际状态，服务还注册着、程序也在，就试着把它重新启动起来，并说清用的是原来的还是新编译的程序；服务注册已经删掉的，提示处理后重新运行脚本。
+
 安装脚本还会做两件事：
 
 - 建好 `C:\ProgramData\RemoteClaude` 并锁住权限。权限用 SID 设置，中文 Windows 上也适用。如果这个目录已经存在，并且它是链接、所有者不是管理员或 SYSTEM，或者里面有子目录、链接、普通用户放进去的文件，就把整个目录改名挪开（`RemoteClaude.untrusted-时间`，不删除、不跟随链接），再建一个新的，并提示用户确认后自行删除。

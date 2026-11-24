@@ -134,7 +134,8 @@
   </div>
 
   <div id="unlockDlg" class="overlay center" hidden>
-    <!-- 不用 <form>、不用 type=password（能遮字时）：免得浏览器把 Windows 密码当成网站密码提示保存 -->
+    <!-- 不用 <form>：免得浏览器把 Windows 密码当成网站密码提示保存。一直用 type=password：
+         手机输入法才会当密码框处理，不记联想词、不走云联想，也不会在中文输入状态下打字 -->
     <div id="unlockForm" class="dialog" role="dialog" aria-labelledby="unlockDlgTitle">
       <strong id="unlockDlgTitle">解锁电脑</strong>
       <p class="muted">输入这台电脑的 Windows 登录密码或 PIN。只用这一次，手机和电脑都不保存。</p>

@@ -468,4 +468,3 @@ button.more { flex: none; min-width: 36px; padding: 0 8px; font-size: 18px; font
 .dialog-actions button { min-width: 72px; min-height: 40px; }
 
 .offscreen { position: fixed; left: -9999px; top: 0; opacity: 0; }
-.dialog input.masked { -webkit-text-security: disc; }

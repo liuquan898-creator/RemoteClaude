@@ -1031,7 +1031,8 @@
       sendImage(file);
       return;
     }
-    if (el.app.hidden || inEditable(e.target) || !isLive()) return;
+    // 弹出层（面板、菜单、对话框）开着时文字也不发给电脑，和按键一样
+    if (el.app.hidden || topOverlay() || inEditable(e.target) || !isLive()) return;
     const s = e.clipboardData ? e.clipboardData.getData('text') : '';
     if (!s) return;
     e.preventDefault();
@@ -1583,14 +1584,6 @@
     el.unlockPw.value = '';
     el.unlockDlg.hidden = true;
   }
-
-  // 浏览器能遮住普通文本框里的字时就用文本框，密码管理器不会把它当成网站密码提示保存
-  try {
-    if (window.CSS && CSS.supports('-webkit-text-security', 'disc')) {
-      el.unlockPw.type = 'text';
-      el.unlockPw.classList.add('masked');
-    }
-  } catch { /* 用 type=password */ }
 
   $('unlockCancel').addEventListener('click', closeUnlock);
   $('unlockOk').addEventListener('click', submitUnlock);

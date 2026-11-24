@@ -1,5 +1,4 @@
 {
-  "server": "rc.example.com",
   "hostAppId": "com.example.remoteclaude.host",
   "releaseSsh": "my-server",
   "releaseDir": "/opt/remote-claude/releases",

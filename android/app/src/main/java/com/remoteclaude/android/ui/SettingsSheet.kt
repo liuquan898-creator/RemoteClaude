@@ -10,19 +10,28 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.remoteclaude.android.AppState
@@ -35,6 +44,7 @@ import com.remoteclaude.android.protocol.HostUpdateState
 @Composable
 fun SettingsSheet(state: AppState, controller: RemoteController, onDismiss: () -> Unit) {
     val s = state.settings
+    var editServer by remember { mutableStateOf(false) }
     // 打开设置时问一次电脑被控端的版本和升级状态，之后状态有变化电脑会推过来
     LaunchedEffect(state.hostId, state.hostOnline) { if (state.hostOnline) controller.hostUpdate("status") }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = RcColors.Bg) {
@@ -68,8 +78,14 @@ fun SettingsSheet(state: AppState, controller: RemoteController, onDismiss: () -
 
             HorizontalDivider(Modifier.padding(vertical = 12.dp), color = RcColors.Line)
             Text("账号：${state.email.ifEmpty { "未登录" }}", color = RcColors.Muted, fontSize = 13.sp)
-            if (BuildConfig.SERVER_EDITABLE) {
-                Text("服务器：${state.serverInput.ifEmpty { "未设置" }}", color = RcColors.Muted, fontSize = 13.sp)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "服务器：${state.serverInput.ifEmpty { "未设置" }}",
+                    color = RcColors.Muted,
+                    fontSize = 13.sp,
+                    modifier = Modifier.weight(1f).padding(end = 12.dp),
+                )
+                TextButton(onClick = { editServer = true }) { Text("更换服务器") }
             }
 
             HorizontalDivider(Modifier.padding(vertical = 12.dp), color = RcColors.Line)
@@ -111,6 +127,53 @@ fun SettingsSheet(state: AppState, controller: RemoteController, onDismiss: () -
             }
         }
     }
+    if (editServer) {
+        ChangeServerDialog(
+            current = state.serverInput,
+            onChange = { input ->
+                controller.changeServer(input).also { err -> if (err == null) onDismiss() }
+            },
+            onDismiss = { editServer = false },
+        )
+    }
+}
+
+/** 更换服务器：填新地址，确定后退出现在的账号、回到登录页（[RemoteController.changeServer]） */
+@Composable
+private fun ChangeServerDialog(current: String, onChange: (String) -> String?, onDismiss: () -> Unit) {
+    var input by remember { mutableStateOf(current) }
+    var error by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("更换服务器") },
+        text = {
+            Column {
+                Text("换服务器会退出现在的账号，之后用新服务器上的账号重新登录。", color = RcColors.Muted, fontSize = 13.sp)
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = {
+                        input = it
+                        error = null
+                    },
+                    label = { Text("服务器地址") },
+                    placeholder = { Text("rc.example.com") },
+                    singleLine = true,
+                    isError = error != null,
+                    supportingText = error?.let { e -> { Text(e) } },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done, autoCorrectEnabled = false),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                error = onChange(input)
+                if (error == null) onDismiss()
+            }) { Text("更换并重新登录") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 /** 电脑被控端升级状态的说明（协议文档 2.6） */

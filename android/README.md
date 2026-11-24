@@ -23,11 +23,11 @@ $env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
 
 两个版本包名不同，可以同时装在一台手机上。
 
-**服务器地址**不写在仓库里，构建时从仓库根目录的 `deploy/prod/build.json`（不入库，样例 `deploy/build.example.json`）读 `server`，写进 `BuildConfig.SERVER_ADDRESS`，见 [docs/08](../docs/08-release-and-update.md) 第 1 节：
+**服务器地址**不写在仓库里，也不写进 App（构建时不读 `deploy/prod/build.json`），见 [docs/08](../docs/08-release-and-update.md) 第 1 节：
 
-- 配了：正式版只连这个地址，登录页不显示地址框。
-- 没配：正式版的登录页也显示"服务器地址"框，自己填。
-- 调试版总是显示地址框，没填时用配的那个。
+- 调试版和正式版的登录页都有"服务器地址"框（填域名 `rc.example.com` 就行），登录成功时存在手机上，下次自动填上。
+- 设置里"更换服务器"可以换：退出旧服务器上的账号，回到登录页，用新服务器上的账号登录后连新服务器。
+- 从打包时写了地址的旧正式版（0.9.8 及以前）升级：旧版登录时也把地址存在了手机上，新版直接用，不用重新登录。
 
 如果依赖下载慢，可以在命令后面加本机代理参数，例如 `-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=7897`。不要把代理写进仓库里的 `gradle.properties`。
 

@@ -70,6 +70,8 @@ async function connect() {
   clearTimeout(reconnectTimer);
   if (stopped) return;
   const token = await bridge.getToken();
+  // 等令牌的时候可能已经断开了（退出登录、正在换服务器），不能再连
+  if (stopped) return;
   if (!token) {
     showLogin('请先登录');
     return;
@@ -870,20 +872,33 @@ bridge.onInputError((viewerId, code) => {
 
 // ---------------------------------------------------------------- 登录与界面切换
 
+const SERVER_HINT = $('serverHint').textContent;
+
+/** 页面上显示的服务器地址跟着主进程的设置走（启动时、换了服务器后） */
+function showServer() {
+  $('server').textContent = `${cfg.server || '未设置服务器'} · 可远控进程: ${cfg.targets.join(', ')}`;
+  $('serverName').textContent = cfg.server || '未设置';
+  $('serverInput').value = cfg.serverInput || '';
+  const missing = !cfg.server;
+  $('serverHint').textContent = missing ? `还没有设置服务器地址。${SERVER_HINT}` : SERVER_HINT;
+  $('serverHint').classList.toggle('warn', missing);
+}
+
 function showLogin(message) {
   disconnect();
-  setStatus('off', '未登录，请在窗口里登录');
+  setStatus('off', cfg && cfg.server ? '未登录，请在窗口里登录' : '未设置服务器，请在窗口里填写服务器地址');
   $('mainView').hidden = true;
   $('loginView').hidden = false;
   $('loginError').hidden = !message;
   $('loginError').textContent = message || '';
   $('password').value = '';
-  $('email').focus();
+  (cfg && cfg.server ? $('email') : $('serverInput')).focus();
 }
 
 function showMain(acct) {
   $('loginView').hidden = true;
   $('mainView').hidden = false;
+  $('serverForm').hidden = true;
   $('accountEmail').textContent = acct.email || '';
   $('deviceName').textContent = acct.deviceName || '';
   $('reconnect').hidden = true;
@@ -893,6 +908,19 @@ function showMain(acct) {
   connect();
 }
 
+/**
+ * 把填的地址交给主进程（它负责整理、检查、写进配置文件，换了服务器时退出旧服务器上的登录）。
+ * 返回 { server, changed } 或 { error }；换成功后刷新页面上用到的配置
+ */
+async function applyServer(input) {
+  const res = (await bridge.setServer(input)) || { error: '参数不对' };
+  if (res.error) return res;
+  cfg = await bridge.getConfig();
+  showServer();
+  if (res.changed) log(`服务器地址改为 ${res.server}`);
+  return res;
+}
+
 $('loginForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const btn = $('loginBtn');
@@ -900,6 +928,13 @@ $('loginForm').addEventListener('submit', async (e) => {
   btn.textContent = '正在登录…';
   $('loginError').hidden = true;
   try {
+    const srv = await applyServer($('serverInput').value);
+    if (srv.error) {
+      $('loginError').textContent = srv.error;
+      $('loginError').hidden = false;
+      $('serverInput').focus();
+      return;
+    }
     const res = await bridge.login($('email').value, $('password').value);
     if (res && res.error) {
       $('loginError').textContent = res.error;
@@ -914,13 +949,82 @@ $('loginForm').addEventListener('submit', async (e) => {
   }
 });
 
+/** 注册和找回密码在服务器的网页上，先按地址框里填的服务器设置好再打开 */
+async function openAccountPage(which) {
+  $('loginError').hidden = true;
+  const srv = await applyServer($('serverInput').value);
+  if (srv.error) {
+    $('loginError').textContent = srv.error;
+    $('loginError').hidden = false;
+    $('serverInput').focus();
+    return;
+  }
+  bridge.openAccountPage(which);
+}
+
 $('toRegister').addEventListener('click', (e) => {
   e.preventDefault();
-  bridge.openAccountPage('register');
+  openAccountPage('register');
 });
 $('toForgot').addEventListener('click', (e) => {
   e.preventDefault();
-  bridge.openAccountPage('forgot');
+  openAccountPage('forgot');
+});
+
+// ---------------------------------------------------------------- 更换服务器（登录后）
+
+function openServerForm() {
+  if ($('mainView').hidden) {
+    // 还没登录：登录页上就有地址框
+    $('serverInput').focus();
+    $('serverInput').select();
+    return;
+  }
+  $('serverForm').hidden = false;
+  $('serverError').hidden = true;
+  $('newServer').value = cfg.server || '';
+  $('newServer').focus();
+  $('newServer').select();
+}
+
+$('changeServer').addEventListener('click', openServerForm);
+$('cancelServer').addEventListener('click', () => {
+  $('serverForm').hidden = true;
+});
+bridge.onEditServer(openServerForm);
+
+$('serverForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = $('serverForm').querySelector('button[type="submit"]');
+  btn.disabled = true;
+  $('serverError').hidden = true;
+  // 先断开旧服务器，免得主进程作废旧令牌时页面又收到"登录已失效"去重连
+  const wasRunning = !stopped;
+  disconnect();
+  try {
+    const res = await applyServer($('newServer').value);
+    if (res.error || !res.changed) {
+      if (wasRunning) {
+        stopped = false;
+        backoff = 1000;
+        connect();
+      }
+      if (res.error) {
+        $('serverError').textContent = res.error;
+        $('serverError').hidden = false;
+        $('newServer').focus();
+      } else {
+        $('serverForm').hidden = true;
+      }
+      return;
+    }
+    $('serverForm').hidden = true;
+    log('已退出旧服务器上的登录');
+    showLogin(`已换到 ${res.server}，请用这个服务器上的账号登录`);
+    $('email').focus();
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 $('logout').addEventListener('click', async () => {
@@ -940,8 +1044,7 @@ $('reconnect').addEventListener('click', () => {
 (async () => {
   cfg = await bridge.getConfig();
   const acct = await bridge.getAccount();
-  $('server').textContent = `${cfg.server} · 可远控进程: ${cfg.targets.join(', ')}`;
-  $('loginServer').textContent = acct.httpBase;
-  if (acct.loggedIn) showMain(acct);
-  else showLogin('');
+  showServer();
+  if (acct.loggedIn && cfg.server) showMain(acct);
+  else showLogin(cfg.serverNotice || '');
 })();

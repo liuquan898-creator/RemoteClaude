@@ -8,6 +8,10 @@ contextBridge.exposeInMainWorld('rc', {
   getToken: () => ipcRenderer.invoke('rc:token'),
   login: (email, password) => ipcRenderer.invoke('rc:login', email, password),
   logout: () => ipcRenderer.invoke('rc:logout'),
+  // 设置或更换服务器：地址在主进程里整理和检查，返回 { server, changed } 或 { error }
+  setServer: (input) => ipcRenderer.invoke('rc:set-server', String(input)),
+  // 托盘菜单点了"更换服务器…"
+  onEditServer: (cb) => ipcRenderer.on('rc:edit-server', () => cb()),
   sessionInvalid: () => ipcRenderer.invoke('rc:session-invalid'),
   openAccountPage: (which) => ipcRenderer.invoke('rc:open-account-page', which),
   // opts.thumbs 为 false 时不截缩略图，马上就回

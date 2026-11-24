@@ -49,7 +49,8 @@ import kotlinx.coroutines.delay
 /** 登录、注册、找回密码共用一个页面，按模式显示不同的输入项 */
 @Composable
 fun AuthScreen(state: AppState, controller: RemoteController) {
-    var server by rememberSaveable { mutableStateOf(state.serverInput) }
+    // 存的地址变了（启动时读出来、在设置里换了服务器）就跟着变；旋转屏幕时保留正在填的
+    var server by rememberSaveable(state.serverInput) { mutableStateOf(state.serverInput) }
     var email by rememberSaveable { mutableStateOf(state.email) }
     var code by rememberSaveable { mutableStateOf("") }
     // 密码只放在内存里，不进保存状态
@@ -105,19 +106,18 @@ fun AuthScreen(state: AppState, controller: RemoteController) {
             )
             Spacer(Modifier.height(24.dp))
 
-            // 打包时写进了服务器地址的正式版不显示地址框；调试版、没写地址的正式版要自己填
-            if (BuildConfig.SERVER_EDITABLE) {
-                OutlinedTextField(
-                    value = server,
-                    onValueChange = { server = it },
-                    label = { Text("服务器地址") },
-                    placeholder = { Text(BuildConfig.SERVER_ADDRESS.ifEmpty { "rc.example.com" }) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next, autoCorrectEnabled = false),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(12.dp))
-            }
+            // App 里不带服务器地址，一直显示地址框；填过的地址登录成功后存下来，下次自动填上
+            OutlinedTextField(
+                value = server,
+                onValueChange = { server = it },
+                label = { Text("服务器地址") },
+                placeholder = { Text("rc.example.com") },
+                supportingText = { Text("和电脑被控端填的是同一个服务器") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next, autoCorrectEnabled = false),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(4.dp))
             OutlinedTextField(
                 value = email,
                 onValueChange = { email = it },

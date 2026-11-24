@@ -4,7 +4,7 @@
  *   server.config.json   信令服务配置：发信（SMTP）、注册开关、TURN 共享密钥
  *   turnserver.conf      coturn 配置，共享密钥与上面一致
  *   host.config.json     电脑上被控端用的配置（连生产服务器，用账号登录）
- *   build.json           本机的打包配置：打 App 和被控端安装包时把这个服务器地址写进去（已有就不动，见 docs/08 第 1 节）
+ *   build.json           本机的打包配置：安装包传到哪里（已有就不动，见 docs/08 第 1 节）。服务器地址不写进安装包
  *
  * 发信配置从 deploy/prod/mail.json 读取，内容就是服务器配置里的 mail 一节，
  * 例如 { "mode": "tencent-ses", "secretId": "...", "secretKey": "...", "region": "ap-guangzhou", "templateId": 12345, "from": "RemoteClaude <a@b.com>" }，
@@ -127,9 +127,9 @@ console.log(`已生成：\n  ${Object.values(files).join('\n  ')}`);
 // 打包配置：打安装包时把这个服务器地址写进 App 和被控端。里面可能已经写了别的项（上传到哪台服务器等），已有就不动
 const buildFile = path.join(outDir, 'build.json');
 if (fs.existsSync(buildFile)) {
-  console.log(`打包配置已存在，没有改动（里面的 server 要是 ${domain}）：\n  ${buildFile}`);
+  console.log(`打包配置已存在，没有改动（里面的 server 已不再使用，可以删掉）：\n  ${buildFile}`);
 } else {
-  const buildConfig = { server: domain, releaseSsh: '', releaseDir: '/opt/remote-claude/releases' };
+  const buildConfig = { releaseSsh: '', releaseDir: '/opt/remote-claude/releases' };
   fs.writeFileSync(buildFile, JSON.stringify(buildConfig, null, 2) + '\n');
   console.log(`已生成打包配置（要用 scripts/release.js 上传安装包，再填上 releaseSsh）：\n  ${buildFile}`);
 }

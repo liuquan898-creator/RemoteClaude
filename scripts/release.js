@@ -16,9 +16,9 @@
  * 手机 App 下次打开时提示更新；电脑被控端几小时内自己下载，没人看画面时重启换新。
  * 版本号改动不会自动提交，发布完记得提交。
  *
- * 自己的服务器地址、安装包传到哪台服务器，写在本机的打包配置 deploy/prod/build.json 里（不入库，
- * 样例 deploy/build.example.json，说明见 scripts/build-config.js）。没有这个文件只能用 --no-upload 打包，
- * 打出来的 App 和被控端不带默认服务器。
+ * 安装包传到哪台服务器，写在本机的打包配置 deploy/prod/build.json 里（不入库，
+ * 样例 deploy/build.example.json，说明见 scripts/build-config.js）。没有这个文件只能用 --no-upload 打包。
+ * 安装包里不带服务器地址：App 和被控端装好后在登录页自己填，升级时沿用已经填过的地址。
  * 环境变量 RC_RELEASE_SSH、RC_RELEASE_DIR 可以临时换上传的服务器和目录。
  */
 const fs = require('fs');
@@ -38,7 +38,7 @@ function fail(msg) {
   process.exit(1);
 }
 
-/** 本机的打包配置：服务器地址、上传到哪里、打包时的环境变量（比如 Electron 的下载镜像） */
+/** 本机的打包配置：上传到哪里、被控端的应用标识、打包时的环境变量（比如 Electron 的下载镜像） */
 const BUILD = (() => {
   try {
     return require('./build-config').load();
@@ -116,26 +116,12 @@ function bumpHost(version) {
 
 // ------------------------------------------------------------------ 打包
 
-/**
- * 打好的 App 里写的服务器要和打包配置对得上。看的是构建时生成的 BuildConfig.java（正式版）：
- * gradle 自己读打包配置，万一它读的不是脚本读的那一份（比如环境变量没传过去），在这里拦下来
- */
-function checkBuiltAndroidServer() {
-  if (!BUILD.server) return;
-  const f = path.join(ROOT, 'android', 'app', 'build', 'generated', 'source', 'buildConfig', 'release', 'com', 'remoteclaude', 'android', 'BuildConfig.java');
-  const text = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '';
-  if (!text.includes(`SERVER_ADDRESS = "${BUILD.server}"`) || !text.includes('SERVER_EDITABLE = false')) {
-    fail(`打好的 App 里写的服务器不是打包配置里的 ${BUILD.server}（看 android/app/build/generated/source/buildConfig/release 下的 BuildConfig.java）`);
-  }
-}
-
 function buildAndroid(version, versionCode, notes, stage) {
   if (!fs.existsSync(KEYSTORE_PROPS)) {
     fail('没有 android/keystore.properties（正式签名）。签名和手机上装的不一样就没法直接升级，见 docs/08');
   }
   const gradle = path.join(ROOT, 'android', process.platform === 'win32' ? 'gradlew.bat' : 'gradlew');
   run(gradle, ['testDebugUnitTest', 'assembleRelease', '--console=plain'], { cwd: path.join(ROOT, 'android'), shell: true });
-  checkBuiltAndroidServer();
   const built = path.join(ROOT, 'android', 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk');
   const name = `RemoteClaude-${version}.apk`;
   fs.mkdirSync(path.join(ROOT, 'dist'), { recursive: true });
@@ -173,7 +159,6 @@ function buildHost(version, stage) {
   if (!fs.existsSync(native)) {
     fail('打好的程序里没有 koffi 的原生模块（koffi.node），装上会启动不了。host/node_modules 要是真实目录，不能是目录链接');
   }
-  checkBuiltHostServer(out);
   const name = `RemoteClaude-Host-Setup-${version}.exe`;
   for (const f of [name, 'latest.yml']) {
     if (!fs.existsSync(path.join(out, f))) fail(`打包结果里没有 ${f}`);
@@ -185,20 +170,6 @@ function buildHost(version, stage) {
   console.log(`被控端安装程序 dist/${name}（${(fs.statSync(path.join(out, name)).size / 1048576).toFixed(1)} MB）`);
 }
 
-/**
- * 打好的被控端里写的服务器要和现在的打包配置对得上。看的是打包工具生成的 app-update.yml：
- * 里面的地址和写进程序的默认服务器是同一项配置算出来的。在没有打包配置的副本里打的包
- * （不带默认服务器）会在这里拦下来，不会被 --upload-only 传上去
- */
-function checkBuiltHostServer(out) {
-  if (!BUILD.serverHttpBase) return;
-  const yml = path.join(out, 'win-unpacked', 'resources', 'app-update.yml');
-  const text = fs.existsSync(yml) ? fs.readFileSync(yml, 'utf8') : '';
-  if (!text.includes(`${BUILD.serverHttpBase}/download/host`)) {
-    fail(`打好的被控端里写的服务器不是打包配置里的 ${BUILD.serverHttpBase}（看 host/dist/win-unpacked/resources/app-update.yml）。重新打包`);
-  }
-}
-
 /** 不打包：把 host/dist 里已经打好的这个版本的安装程序和 latest.yml 放进待上传的目录 */
 function stageBuiltHost(version, stage) {
   const out = path.join(ROOT, 'host', 'dist');
@@ -206,7 +177,6 @@ function stageBuiltHost(version, stage) {
   for (const f of [name, 'latest.yml']) {
     if (!fs.existsSync(path.join(out, f))) fail(`host/dist 里没有 ${f}，先用 --no-upload 打包`);
   }
-  checkBuiltHostServer(out);
   const yml = fs.readFileSync(path.join(out, 'latest.yml'), 'utf8');
   const built = (/^version:\s*(\S+)\s*$/m.exec(yml) || [])[1];
   if (built !== version) fail(`host/dist/latest.yml 是 ${built || '?'} 的，不是 ${version}`);
@@ -247,18 +217,13 @@ function upload(stage, channels) {
 // ------------------------------------------------------------------ 主流程
 
 /**
- * 要上传就得先有打包配置。没写服务器地址的安装包传上去，已经装着的 App 和被控端自动升级以后
- * 就不知道连哪里了（App 回到登录页，被控端启动报"还没有设置服务器地址"），所以宁可不发
+ * 要上传就得知道传到哪台服务器。安装包里不带服务器地址，已经装着的 App 和被控端升级后沿用自己存的地址
+ * （旧版的被控端从登录状态里找回，见 host/serveraddress.js），所以不再要求打包配置里写 server
  */
 function checkBuildConfig(upload) {
   const where = path.relative(ROOT, BUILD.file) || BUILD.file;
-  if (!upload) {
-    if (!BUILD.serverWsUrl) console.log(`提示: ${where} 里没有 server，打出来的 App 和被控端不带默认服务器，装好后要自己填`);
-    return;
-  }
-  if (!BUILD.serverWsUrl) {
-    fail(`${where} ${BUILD.exists ? '里没有 server' : '不存在'}。要上传的安装包必须写进服务器地址，照 deploy/build.example.json 写一份；只想打包就加 --no-upload`);
-  }
+  if (BUILD.legacyServer) console.log(`提示: ${where} 里的 server 已不再使用（服务器地址不写进安装包），可以删掉`);
+  if (!upload) return;
   if (!SSH) fail(`不知道传到哪台服务器：在 ${where} 里写 releaseSsh，或者设环境变量 RC_RELEASE_SSH；只想打包就加 --no-upload`);
 }
 
@@ -278,7 +243,7 @@ function main() {
   }
 
   console.log(`发布 ${args.version}：${channels.join('、')}${args.upload ? `，上传到 ${SSH}:${REMOTE_DIR}` : '，不上传'}`);
-  if (BUILD.serverWsUrl) console.log(`写进安装包的服务器地址：${BUILD.serverWsUrl}（被控端应用标识 ${BUILD.hostAppId}）`);
+  console.log(`被控端应用标识 ${BUILD.hostAppId}；安装包里不带服务器地址`);
   const st = spawnSync('git', ['status', '--porcelain'], { cwd: ROOT, encoding: 'utf8' });
   if (st.stdout && st.stdout.trim()) console.log('提示: 工作区有未提交的改动，会一起打进安装包');
 

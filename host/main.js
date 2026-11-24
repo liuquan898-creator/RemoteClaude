@@ -25,7 +25,8 @@ const {
 const fs = require('fs');
 const path = require('path');
 const win32 = require('./win32');
-const { Account } = require('./account');
+const { Account, AUTH_FILE } = require('./account');
+const serverAddress = require('./serveraddress');
 const files = require('./files');
 const { isClosable } = require('./sessions');
 const { sortByPosition } = require('./winorder');
@@ -33,12 +34,6 @@ const { createLogFile, teeConsole } = require('./logfile');
 const { createClipWatch } = require('./clipwatch');
 
 const MAX_TEXT = 20000;
-/**
- * 装好的正式版默认连的服务器；用户数据目录里的 config.json 可以改。
- * 地址不写在源码里：打包时从本机的打包配置写进 package.json 的 defaultServer（见 electron-builder.config.js），
- * 没配就是空的，装好后要在 config.json 里写 server
- */
-const DEFAULT_SERVER = String(require('./package.json').defaultServer || '');
 
 // 用户数据目录（登录状态、设备编号）固定为 %APPDATA%\remote-claude-host，开发版和装好的正式版共用，
 // 换成安装版不用重新登录，也还是同一台电脑。两个同时启动时，后启动的会因为单实例锁退出。
@@ -53,25 +48,25 @@ app.setPath(
 teeConsole(createLogFile(path.join(app.getPath('userData'), 'logs', 'host.log')));
 console.log(`被控端 ${app.getVersion()} 启动（进程 ${process.pid}）`);
 
-/** 配置文件：开发版是 host/config.json；装好的正式版在用户数据目录里，没有就全用默认值 */
+/**
+ * 配置文件：开发版是 host/config.json；装好的正式版在用户数据目录里，没有就全用默认值。
+ * 服务器地址（server）也在这里：在窗口里填或改了会写回这个文件（只改 server，别的设置不动）
+ */
 const CONFIG_PATH =
   process.env.RC_HOST_CONFIG || (app.isPackaged ? path.join(app.getPath('userData'), 'config.json') : path.join(__dirname, 'config.json'));
 
 function loadConfig() {
   let raw;
   try {
-    raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    raw = serverAddress.readConfig(CONFIG_PATH);
   } catch (err) {
-    if (app.isPackaged && err.code === 'ENOENT') {
-      raw = {};
-    } else {
-      console.error(`读取配置失败: ${CONFIG_PATH}\n${err.message}\n先在项目根目录运行 "node scripts/init-config.js" 生成配置。`);
-      process.exit(1);
-    }
+    const msg = `读取配置失败: ${CONFIG_PATH}\n${err.message}\n改好或删掉这个文件后重新打开。`;
+    console.error(msg);
+    // 装好的正式版没有控制台，不弹个框的话双击了什么反应都没有
+    if (app.isPackaged) dialog.showErrorBox('RemoteClaude 被控端', msg);
+    process.exit(1);
   }
-  if (app.isPackaged && !raw.server) raw.server = DEFAULT_SERVER;
   const cfg = {
-    server: String(raw.server || ''),
     targets: (Array.isArray(raw.targets) && raw.targets.length ? raw.targets : ['claude.exe']).map((s) => String(s).toLowerCase()),
     // 默认值见 docs/05 的 2.14：满屏文字滚动时 VP8 一帧要 90KB 上下，VP9 同样带宽下能稳定 30 帧
     maxBitrateKbps: Number(raw.maxBitrateKbps) || 10000,
@@ -90,20 +85,28 @@ function loadConfig() {
     // Claude 桌面端的日志文件，不写就自己找
     claudeLogFile: raw.claudeLogFile ? path.resolve(String(raw.claudeLogFile)) : '',
   };
-  if (!/^wss?:\/\//.test(cfg.server)) {
-    const msg = cfg.server
-      ? `配置不完整: server 必须是 ws:// 或 wss:// 地址。\n${CONFIG_PATH}`
-      : `还没有设置服务器地址。\n\n在下面这个文件里写上你的信令服务器地址，然后重新打开：\n${CONFIG_PATH}\n\n内容形如：\n{ "server": "wss://rc.example.com/ws" }`;
-    console.error(msg);
-    // 装好的正式版没有控制台，不弹个框的话双击了什么反应都没有
-    if (app.isPackaged) dialog.showErrorBox('RemoteClaude 被控端', msg);
-    process.exit(1);
-  }
   if (raw.hostToken) console.warn('提示: hostToken 已不再使用，被控端改为用账号登录，可以从配置里删掉。');
-  return cfg;
+  return { cfg, configuredServer: raw.server };
 }
 
-const cfg = loadConfig();
+const loaded = loadConfig();
+const cfg = loaded.cfg;
+/**
+ * 现在连的服务器。安装包里不带地址（docs/08 第 1 节）：配置文件里没写 server 时，从上次的登录状态找回
+ * （旧版安装包升级上来的情况，见 serveraddress.js 的 resolveServer），都没有就空着，窗口里显示登录页让用户填。
+ *   url     整理好的 ws:// 或 wss:// 地址，没设置时为空
+ *   input   登录页地址框里预填的内容
+ *   notice  给用户看的问题说明（比如配置文件里的地址写错了）
+ *   migrate 地址是从登录状态找回的，启动后要写进配置文件
+ */
+const serverState = (() => {
+  const r = serverAddress.resolveServer({
+    configured: loaded.configuredServer,
+    accountServer: serverAddress.readAccountServer(path.join(app.getPath('userData'), AUTH_FILE)),
+  });
+  if (r.error) console.error(`${r.error}（${CONFIG_PATH}）`);
+  return { url: r.server, input: r.input, notice: r.error, migrate: r.source === 'account' };
+})();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 被控端窗口经常在后台或被挡住，不能让 Chromium 因此降频，否则画面会卡
@@ -198,6 +201,7 @@ function trayMenu() {
   }
   return Menu.buildFromTemplate([
     { label: '显示窗口', click: showWindow },
+    { label: '更换服务器…', click: editServer },
     { type: 'separator' },
     ...tileItems,
     ...updateMenuItems(),
@@ -209,6 +213,15 @@ function trayMenu() {
       },
     },
   ]);
+}
+
+/** 托盘菜单"更换服务器…"：打开窗口，让页面显示改地址的输入框（没登录时就是登录页的地址框） */
+function editServer() {
+  showWindow();
+  const wc = mainWindow && mainWindow.webContents;
+  if (!wc) return;
+  if (wc.isLoading()) wc.once('did-finish-load', () => wc.send('rc:edit-server'));
+  else wc.send('rc:edit-server');
 }
 
 function refreshTrayMenu() {
@@ -266,7 +279,8 @@ function createWindow() {
 
 app.whenReady().then(() => {
   if (!gotLock) return;
-  account = new Account(cfg.server);
+  persistMigratedServer();
+  account = new Account(serverState.url);
   setupAutoStart();
   createUpdater();
   approvals.start();
@@ -312,6 +326,21 @@ app.on('window-all-closed', () => {
   if (quitting) app.quit();
 });
 
+/**
+ * 从旧版升级上来、配置文件里没有 server 时，把从登录状态找回的地址写进配置文件，以后启动就不再依赖登录状态。
+ * 写不进去也照样用这个地址连，下次启动再试
+ */
+function persistMigratedServer() {
+  if (!serverState.migrate) return;
+  try {
+    serverAddress.saveServer(CONFIG_PATH, serverState.url);
+    serverState.migrate = false;
+    console.log(`配置里没有服务器地址，按上次登录的服务器补上: ${serverState.url}（${CONFIG_PATH}）`);
+  } catch (err) {
+    console.error(`把服务器地址写进配置文件失败（这次照样连 ${serverState.url}）: ${err.message}`);
+  }
+}
+
 // 页面把连接状态告诉主进程，用来更新托盘图标和提示文字
 ipcMain.on('rc:status', (e, kind, text) => {
   if (!mainWindow || e.sender !== mainWindow.webContents) return;
@@ -323,7 +352,9 @@ ipcMain.on('rc:status', (e, kind, text) => {
 // ---------------------------------------------------------------- 窗口列表与采集准备
 
 ipcMain.handle('rc:config', () => ({
-  server: cfg.server,
+  server: serverState.url,
+  serverInput: serverState.url || serverState.input,
+  serverNotice: serverState.notice,
   targets: cfg.targets,
   maxBitrateKbps: cfg.maxBitrateKbps,
   maxFps: cfg.maxFps,
@@ -347,6 +378,40 @@ ipcMain.handle('rc:account', (e) => {
   };
 });
 
+/**
+ * 设置或更换服务器（登录页的地址框、登录后的"更换服务器"）。地址在主进程里整理和检查，只接受 ws:// 和 wss://；
+ * 写进配置文件后退出旧服务器上的登录（通知旧服务器作废令牌），换成新服务器，页面接着显示登录页。
+ * 返回 { server, changed } 或 { error }
+ */
+async function setServer(input) {
+  let url;
+  try {
+    url = serverAddress.wsUrlOf(input);
+  } catch (err) {
+    return { error: err.message };
+  }
+  if (!url) return { error: '请填写服务器地址' };
+  if (!/^wss?:\/\/[^\s]+$/.test(url)) return { error: '服务器地址必须是 ws:// 或 wss:// 地址' };
+  if (url === serverState.url) return { server: url, changed: false };
+  try {
+    serverAddress.saveServer(CONFIG_PATH, url);
+  } catch (err) {
+    return { error: `服务器地址没保存上：${err.message}` };
+  }
+  // logout() 先同步清掉本地登录状态、再去通知旧服务器，所以下面新建的 Account 读不到旧令牌
+  const loggingOut = account.logout();
+  account = new Account(url);
+  Object.assign(serverState, { url, input: url, notice: '', migrate: false });
+  console.log(`服务器地址改为 ${url}（已写进 ${CONFIG_PATH}）`);
+  await loggingOut;
+  return { server: url, changed: true };
+}
+
+ipcMain.handle('rc:set-server', (e, input) => {
+  if (!fromOwnWindow(e) || typeof input !== 'string' || input.length > serverAddress.MAX_LENGTH) return { error: '参数不对' };
+  return setServer(input);
+});
+
 ipcMain.handle('rc:token', (e) => (fromOwnWindow(e) && account.state ? account.state.token : null));
 
 ipcMain.handle('rc:login', async (e, email, password) => {
@@ -365,7 +430,7 @@ ipcMain.handle('rc:session-invalid', (e) => {
 
 // 注册和找回密码在网页上完成，用系统浏览器打开
 ipcMain.handle('rc:open-account-page', (e, which) => {
-  if (!fromOwnWindow(e) || !['register', 'forgot'].includes(which)) return;
+  if (!fromOwnWindow(e) || !['register', 'forgot'].includes(which) || !account.httpBase) return;
   shell.openExternal(`${account.httpBase}/#${which}`);
 });
 

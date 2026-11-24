@@ -2,11 +2,10 @@
 /**
  * 被控端安装程序的打包配置（electron-builder）。用法：npm run dist，或者经 scripts/release.js。
  *
- * 自己的服务器地址和应用标识不写在仓库里，从本机的打包配置读（deploy/prod/build.json，
- * 见 scripts/build-config.js 和 docs/08 第 1 节）：
- *   - server 写进装好的程序的 package.json（defaultServer），main.js 拿它当默认服务器；
- *     没配就不带默认服务器，装好后要在 %APPDATA%\remote-claude-host\config.json 里写
- *   - 升级地址运行时由登录的服务器推出来（main.js 的 getFeed），这里的 publish 只用来让打包工具生成 latest.yml
+ * 应用标识不写在仓库里，从本机的打包配置读（deploy/prod/build.json，见 scripts/build-config.js 和 docs/08 第 1 节）。
+ * 安装包里不带任何服务器地址：装好后在被控端窗口的登录页填，地址存在用户自己的 config.json 里。
+ * 升级地址运行时由登录的服务器推出来（main.js 的 getFeed），这里的 publish 只用来让打包工具生成 latest.yml，
+ * 写的是占位地址，不会被用到
  */
 const buildConfig = require('../scripts/build-config').load();
 
@@ -17,9 +16,6 @@ module.exports = {
   artifactName: 'RemoteClaude-Host-Setup-${version}.${ext}',
   directories: {
     output: 'dist',
-  },
-  extraMetadata: {
-    defaultServer: buildConfig.serverWsUrl,
   },
   files: [
     'package.json',
@@ -37,6 +33,7 @@ module.exports = {
     'unlockpipe-native.js',
     'files.js',
     'account.js',
+    'serveraddress.js',
     'win32.js',
     'updater.js',
     'logfile.js',
@@ -64,7 +61,7 @@ module.exports = {
   publish: [
     {
       provider: 'generic',
-      url: `${buildConfig.serverHttpBase || 'https://rc.example.com'}/download/host`,
+      url: 'https://rc.example.com/download/host',
     },
   ],
   electronLanguages: ['zh-CN', 'en-US'],

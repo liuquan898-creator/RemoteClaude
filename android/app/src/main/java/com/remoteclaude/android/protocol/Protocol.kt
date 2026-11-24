@@ -243,7 +243,7 @@ object Protocol {
                 Incoming.HostStatePush(
                     host,
                     HostState(
-                        lock = LockState(locked = lock?.bool("locked") == true, unlockAvailable = lock?.bool("unlock") == true),
+                        lock = lockStateOf(lock),
                         tile = TileState(available = tile?.bool("available") == true, paused = tile?.bool("paused") == true),
                         key = obj.string("key")?.ifEmpty { null },
                     ),
@@ -307,7 +307,17 @@ object Protocol {
     fun parseLockState(text: String): LockState? {
         val obj = parseObject(text) ?: return null
         if (obj.string("t") != "lock") return null
-        return LockState(locked = obj.bool("locked") == true, unlockAvailable = obj.bool("unlock") == true)
+        return lockStateOf(obj)
+    }
+
+    /** host-state 的 lock（协议文档 2.9）、数据通道的 lock 消息（4.6） */
+    private fun lockStateOf(o: JsonObject?): LockState {
+        val unlock = o?.bool("unlock") == true
+        return LockState(
+            locked = o?.bool("locked") == true,
+            unlockAvailable = unlock,
+            unlockUntrusted = !unlock && o?.bool("untrusted") == true,
+        )
     }
 
     /** 被控端的窗口平铺状态（协议文档 4.7） */
@@ -596,8 +606,11 @@ data class ImageReply(val id: String, val code: String?)
  */
 data class FileReply(val id: String, val path: String?, val name: String?, val pasted: Boolean, val code: String?)
 
-/** 电脑是否锁屏，[unlockAvailable] 表示电脑上装了解锁服务 */
-data class LockState(val locked: Boolean, val unlockAvailable: Boolean)
+/**
+ * 电脑是否锁屏，[unlockAvailable] 表示电脑上装了解锁服务。
+ * [unlockUntrusted]：电脑上有解锁服务，但被控端核实不过它（多半是旧版，要在电脑上重新安装），这时 [unlockAvailable] 是 false
+ */
+data class LockState(val locked: Boolean, val unlockAvailable: Boolean, val unlockUntrusted: Boolean = false)
 
 data class UnlockResult(val id: String, val code: String?)
 

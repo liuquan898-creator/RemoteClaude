@@ -231,6 +231,15 @@ class ProtocolTest {
     fun lockAndUnlockMessagesMatchSection46() {
         assertEquals(LockState(locked = true, unlockAvailable = false), Protocol.parseLockState("""{"t":"lock","locked":true,"unlock":false}"""))
         assertEquals(LockState(locked = false, unlockAvailable = true), Protocol.parseLockState("""{"t":"lock","locked":false,"unlock":true}"""))
+        // 解锁服务核实不过（旧版要重新安装）：和"没装"分开；能解锁时 untrusted 不算数
+        assertEquals(
+            LockState(locked = true, unlockAvailable = false, unlockUntrusted = true),
+            Protocol.parseLockState("""{"t":"lock","locked":true,"unlock":false,"untrusted":true}"""),
+        )
+        assertEquals(
+            LockState(locked = true, unlockAvailable = true, unlockUntrusted = false),
+            Protocol.parseLockState("""{"t":"lock","locked":true,"unlock":true,"untrusted":true}"""),
+        )
         assertNull(Protocol.parseLockState("""{"t":"err","code":"locked"}"""))
 
         assertEquals(UnlockResult("u1", null), Protocol.parseUnlockResult("""{"t":"unlock-result","id":"u1","ok":true}"""))

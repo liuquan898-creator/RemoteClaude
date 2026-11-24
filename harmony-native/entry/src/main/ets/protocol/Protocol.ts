@@ -103,6 +103,8 @@ export interface LockState {
   locked: boolean;
   /** 电脑上装了解锁服务 */
   unlockAvailable: boolean;
+  /** 电脑上有解锁服务，但被控端核实不过它（多半是旧版服务，要在电脑上重新安装）；unlockAvailable 为 true 时总是 false */
+  unlockUntrusted: boolean;
 }
 
 export interface TileState {
@@ -221,6 +223,16 @@ function obj(o: Json, key: string): Json | null {
 function arr(o: Json, key: string): unknown[] {
   const v = o[key];
   return Array.isArray(v) ? v : [];
+}
+
+/** 协议 2.9 host-state 的 lock、4.6 的 lock 消息 */
+function lockStateOf(o: Json | null): LockState {
+  const unlock = o !== null && bool(o, 'unlock') === true;
+  return {
+    locked: o !== null && bool(o, 'locked') === true,
+    unlockAvailable: unlock,
+    unlockUntrusted: !unlock && o !== null && bool(o, 'untrusted') === true,
+  };
 }
 
 function asObj(v: unknown): Json | null {
@@ -422,10 +434,7 @@ export function parseIncoming(text: string): Incoming | null {
         type: 'host-state',
         host,
         state: {
-          lock: {
-            locked: lock !== null && bool(lock, 'locked') === true,
-            unlockAvailable: lock !== null && bool(lock, 'unlock') === true,
-          },
+          lock: lockStateOf(lock),
           tile: {
             available: tile !== null && bool(tile, 'available') === true,
             paused: tile !== null && bool(tile, 'paused') === true,
@@ -489,7 +498,7 @@ export function parseChannelMessage(text: string): ChannelMessage | null {
     case 'clip-skip':
       return { t: 'clip-skip', code: str(o, 'code') ?? 'unknown' };
     case 'lock':
-      return { t: 'lock', state: { locked: bool(o, 'locked') === true, unlockAvailable: bool(o, 'unlock') === true } };
+      return { t: 'lock', state: lockStateOf(o) };
     case 'tile-state':
       return { t: 'tile-state', state: { available: bool(o, 'available') === true, paused: bool(o, 'paused') === true } };
     case 'unlock-result': {

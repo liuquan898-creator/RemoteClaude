@@ -298,11 +298,20 @@ test('图片回执', () => {
 test('锁定和解锁消息符合 4.6 节', () => {
   assert.deepEqual(parseChannelMessage('{"t":"lock","locked":true,"unlock":false}'), {
     t: 'lock',
-    state: { locked: true, unlockAvailable: false },
+    state: { locked: true, unlockAvailable: false, unlockUntrusted: false },
   });
   assert.deepEqual(parseChannelMessage('{"t":"lock","locked":false,"unlock":true}'), {
     t: 'lock',
-    state: { locked: false, unlockAvailable: true },
+    state: { locked: false, unlockAvailable: true, unlockUntrusted: false },
+  });
+  // 解锁服务核实不过（旧版要重新安装）：和"没装"分开；能解锁时 untrusted 不算数
+  assert.deepEqual(parseChannelMessage('{"t":"lock","locked":true,"unlock":false,"untrusted":true}'), {
+    t: 'lock',
+    state: { locked: true, unlockAvailable: false, unlockUntrusted: true },
+  });
+  assert.deepEqual(parseChannelMessage('{"t":"lock","locked":true,"unlock":true,"untrusted":true}'), {
+    t: 'lock',
+    state: { locked: true, unlockAvailable: true, unlockUntrusted: false },
   });
 
   assert.deepEqual(parseChannelMessage('{"t":"unlock-result","id":"u1","ok":true}'), {
@@ -517,14 +526,19 @@ test('host-state 和不连画面的命令符合 2.9 节', () => {
     {
       type: 'host-state',
       host: 'pc-1',
-      state: { lock: { locked: true, unlockAvailable: true }, tile: { available: true, paused: false }, key: 'MIIB' },
+      state: { lock: { locked: true, unlockAvailable: true, unlockUntrusted: false }, tile: { available: true, paused: false }, key: 'MIIB' },
     },
   );
   // 被控端刚启动、公钥还没生成好时不带 key；缺的字段都当 false
   assert.deepEqual(parseIncoming('{"type":"host-state","host":"pc-1","lock":{"locked":false},"key":""}'), {
     type: 'host-state',
     host: 'pc-1',
-    state: { lock: { locked: false, unlockAvailable: false }, tile: { available: false, paused: false }, key: null },
+    state: { lock: { locked: false, unlockAvailable: false, unlockUntrusted: false }, tile: { available: false, paused: false }, key: null },
+  });
+  assert.deepEqual(parseAs('{"type":"host-state","host":"pc-1","lock":{"locked":true,"unlock":false,"untrusted":true}}', 'host-state').state.lock, {
+    locked: true,
+    unlockAvailable: false,
+    unlockUntrusted: true,
   });
   assert.deepEqual(parseAs('{"type":"host-state","host":"pc-1","tile":{"paused":true}}', 'host-state').state.tile, {
     available: false,

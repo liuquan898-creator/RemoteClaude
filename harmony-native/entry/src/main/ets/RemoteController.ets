@@ -1280,6 +1280,7 @@ export class RemoteController {
           if (this.peer === session) {
             this.state.pcLocked = st.locked;
             this.state.unlockAvailable = st.unlockAvailable;
+            this.state.unlockUntrusted = st.unlockUntrusted;
           }
         },
         onUnlockResult: (r: UnlockResult) => {
@@ -2021,6 +2022,8 @@ export class RemoteController {
         return '电脑没有锁屏';
       case 'no-service':
         return '电脑上没装解锁服务';
+      case 'bad-service':
+        return '电脑上的解锁服务要重新安装（版本太旧或没通过核实）';
       case 'rate-limited':
         return '失败次数太多，15 分钟后再试';
       case 'still-locked':

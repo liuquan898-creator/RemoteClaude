@@ -19,7 +19,7 @@ let reconnectTimer = null;
  */
 const peers = new Map();
 /** 电脑是否锁屏、能否从控制端解锁（协议文档 4.6），主进程有变化时推过来 */
-let lockState = { locked: false, unlock: false };
+let lockState = { locked: false, unlock: false, untrusted: false };
 /** 窗口平铺是否在运行、是否暂停（协议文档 4.7） */
 let tileState = { available: false, paused: false };
 const pendingIce = new Map(); // 对端应答到达前先收到的 ICE 候选
@@ -653,7 +653,9 @@ function closePeer(viewerId) {
 // ---------------------------------------------------------------- 锁定与解锁（协议文档 4.6）
 
 function lockMessage() {
-  return { t: 'lock', locked: lockState.locked, unlock: lockState.unlock };
+  const msg = { t: 'lock', locked: lockState.locked, unlock: lockState.unlock };
+  if (lockState.untrusted) msg.untrusted = true; // 只在是 true 时带，旧控制端不认这个字段
+  return msg;
 }
 
 bridge.getLockState().then((s) => {
@@ -663,8 +665,13 @@ bridge.getLockState().then((s) => {
 
 bridge.onLockState((s) => {
   const wasLocked = lockState.locked;
+  const wasUntrusted = lockState.untrusted;
   lockState = s;
-  log(s.locked ? '电脑已锁屏' + (s.unlock ? '（可以从控制端解锁）' : '（没装解锁服务）') : '电脑已解锁');
+  if (s.untrusted && !wasUntrusted) log('解锁服务要重新安装：管道那头的服务核实不过（多半是旧版），手机上解不了锁，见 docs/06');
+  if (s.locked !== wasLocked) {
+    const how = s.unlock ? '（可以从控制端解锁）' : s.untrusted ? '（解锁服务要重新安装）' : '（没装解锁服务）';
+    log(s.locked ? '电脑已锁屏' + how : '电脑已解锁');
+  }
   const msg = lockMessage();
   for (const p of peers.values()) sendToViewer(p, msg);
   broadcastHostState();

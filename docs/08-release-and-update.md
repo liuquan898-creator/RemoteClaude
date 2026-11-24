@@ -100,6 +100,8 @@ cd $env:TEMP\rc-rel; node scripts/release.js 0.9.6 --only host --notes "…"
 
 解锁服务（docs/06）是单独装的 Windows 服务，不随被控端升级；要改它时照旧用 `host/unlock-service/install.ps1` 重新安装。
 
+**升级顺序：先装新的解锁服务，再升被控端。** 被控端 0.9.25 起会核实解锁服务，之前装的旧服务过不了核实，手机就解不了锁；被控端又是自动升级的，人不在电脑前时发现不了。所以发布 0.9.25 及以后的被控端之前，先在每台要从手机解锁的电脑上重新运行 `install.ps1`（新服务兼容旧被控端）。顺序反了时，手机上会提示"电脑上的解锁服务要重新安装"（被控端 0.9.28 起），只能回到电脑前解锁、重装服务。已经自动升到 0.9.25～0.9.27、手机上显示"没装解锁服务"的电脑也是这种情况，同样要在电脑上重装服务。详见 [06](06-unlock-service.md) 的"升级"。
+
 **注意：别从 Claude 桌面端的会话里启动被控端。** Claude 桌面端是商店版（MSIX）应用，从它的 Claude Code 会话里启动的程序（包括 Claude 替你运行的命令）写 `%APPDATA%` 时会被系统悄悄转到 `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\` 下。这样启动的被控端把登录状态存在那里，正常启动（开机自启、安装程序、双击快捷方式）的被控端看不到，就会显示登录页、换一个设备编号。2026-11-19 切换到安装版时就遇到了：之前 Claude 替用户启动的开发版把登录状态存在了转向的目录里，切换时把其中的 `account.json`、`device.json`、`Local State` 复制到了真正的 `%APPDATA%\remote-claude-host`。以后要由 Claude 重启被控端，用不经过 Claude 的方式启动，比如 `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '"<安装目录>\RemoteClaude Host.exe"' }`（WMI 起的进程不在 Claude 的容器里）。
 
 ## 4. App 的签名

@@ -152,11 +152,25 @@ test('冒充的管道：所有者不是 SYSTEM 时同样不发', async () => {
   assert.deepEqual(native.written, []);
 });
 
-test('查不到对面进程路径（比如旧版服务没开放查询权限）当作没装服务', async () => {
+test('查不到对面进程路径（比如旧版服务没开放查询权限）：不发命令，报 untrusted，和"没装"分开', async () => {
   const native = fakeNative({ image: '' });
   const { pipe } = make(native);
   assert.equal(await pipe.ask('STATUS', 1500), null);
+  assert.deepEqual(await pipe.request('STATUS', 1500), { error: 'untrusted' });
   assert.deepEqual(native.written, []);
+});
+
+test('request：拿到回应带 line；没装服务报 not-found（重试 3 次后）；核实不过报 untrusted', async () => {
+  const ok = make(fakeNative({ reply: 'OK locked=1\n' }));
+  assert.deepEqual(await ok.pipe.request('STATUS', 1500), { line: 'OK locked=1' });
+
+  const none = fakeNative({ openResults: [{ error: 'not-found' }, { error: 'not-found' }, { error: 'not-found' }] });
+  assert.deepEqual(await make(none).pipe.request('STATUS', 1500), { error: 'not-found' });
+  assert.equal(none.opens, 3);
+
+  const fake = fakeNative({ owner: 'S-1-5-21-9-9-9-1001' });
+  assert.deepEqual(await make(fake).pipe.request('UNLOCK c2VjcmV0', 40000), { error: 'untrusted' });
+  assert.deepEqual(fake.written, []);
 });
 
 test('同一个不可信原因只记一次；核实通过后记一条恢复', async () => {

@@ -1084,29 +1084,31 @@ const dialogWatch = dialogWatchLib.createDialogWatch({
 
 const LOCK_POLL_MS = 2000;
 const SERVICE_CHECK_MS = 30000;
-let lockState = { locked: false, unlock: false };
+// untrusted：管道那头有服务，但核实不过（多半是被控端自动升级了、解锁服务还是旧版），要在电脑上重新安装服务
+let lockState = { locked: false, unlock: false, untrusted: false };
 let serviceCheckedAt = 0;
 let unlocking = false;
 
 // 连上管道后先核实对面确实是装在 Program Files 里、以 SYSTEM 运行的解锁服务，才发命令（docs/06 的"管道防冒充"）
 const unlockPipe = require('./unlockpipe').createUnlockPipe({ log: (msg) => console.log('[解锁] ' + msg) });
 
-/** 给解锁服务发一条命令，返回它回的一行；没装服务、核实不过、连不上或超时返回 null */
+/** 给解锁服务发一条命令，返回 { line } 或 { error }（'untrusted' 是核实不过，其余是没装、连不上、超时等） */
 function askUnlockService(line, timeoutMs) {
-  return unlockPipe.ask(line, timeoutMs);
+  return unlockPipe.request(line, timeoutMs);
 }
 
 /** 定时看电脑是否锁屏、解锁服务在不在，有变化就告诉页面，页面再告诉所有控制端 */
 async function pollLock() {
   const locked = win32.isLocked();
-  let unlock = lockState.unlock;
+  let { unlock, untrusted } = lockState;
   if (locked !== lockState.locked || Date.now() - serviceCheckedAt > SERVICE_CHECK_MS) {
     serviceCheckedAt = Date.now();
-    const reply = await askUnlockService('STATUS', 1500);
-    unlock = !!reply && reply.startsWith('OK');
+    const r = await askUnlockService('STATUS', 1500);
+    unlock = r.line !== undefined && r.line.startsWith('OK');
+    untrusted = r.error === 'untrusted';
   }
-  if (locked === lockState.locked && unlock === lockState.unlock) return;
-  lockState = { locked, unlock };
+  if (locked === lockState.locked && unlock === lockState.unlock && untrusted === lockState.untrusted) return;
+  lockState = { locked, unlock, untrusted };
   if (mainWindow) mainWindow.webContents.send('rc:lock-state', lockState);
 }
 
@@ -1133,8 +1135,9 @@ async function unlockWith(password) {
   if (!win32.isLocked()) return 'not-locked';
   unlocking = true;
   try {
-    const reply = await askUnlockService('UNLOCK ' + Buffer.from(password, 'utf8').toString('base64'), 40000);
-    if (reply === null) return 'no-service';
+    const r = await askUnlockService('UNLOCK ' + Buffer.from(password, 'utf8').toString('base64'), 40000);
+    if (r.line === undefined) return r.error === 'untrusted' ? 'bad-service' : 'no-service';
+    const reply = r.line;
     if (reply === 'OK') return null;
     return reply.startsWith('ERR ') ? reply.slice(4).trim() || 'failed' : 'failed';
   } finally {

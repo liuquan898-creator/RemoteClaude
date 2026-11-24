@@ -156,6 +156,8 @@ export class AppState {
   @Trace hostTooOld: boolean = false;
   @Trace pcLocked: boolean = false;
   @Trace unlockAvailable: boolean = false;
+  /** 电脑上的解锁服务核实不过（多半是旧版，要在电脑上重新安装），和"没装"分开提示 */
+  @Trace unlockUntrusted: boolean = false;
   @Trace unlocking: boolean = false;
   @Trace tileAvailable: boolean = false;
   @Trace tilePaused: boolean = false;
@@ -187,6 +189,7 @@ export class AppState {
     this.hostTooOld = false;
     this.pcLocked = hs !== null && hs.lock.locked;
     this.unlockAvailable = hs !== null && hs.lock.unlockAvailable;
+    this.unlockUntrusted = hs !== null && hs.lock.unlockUntrusted;
     this.tileAvailable = hs !== null && hs.tile.available;
     this.tilePaused = hs !== null && hs.tile.paused;
   }

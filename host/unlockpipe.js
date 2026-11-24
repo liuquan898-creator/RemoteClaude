@@ -7,7 +7,8 @@
  *      %ProgramFiles%\RemoteClaude\RemoteClaudeUnlock.exe（只有管理员能往那里放东西）；
  *   2. 管道对象的所有者必须是 SYSTEM（S-1-5-18）。服务建管道时明确设了，普通用户建不出这样的管道。
  *      光看路径不够：普通用户也能自己以 --console 方式跑那个程序。
- * 核实不过就当作没装服务，不发 UNLOCK，也不发 STATUS。
+ * 核实不过就不发 UNLOCK，也不发 STATUS；request() 报 error: 'untrusted'，被控端据此告诉控制端
+ * "服务要重新安装"，和"没装"分开（旧版服务开不出查询权限，也会核实不过）。
  *
  * 真正调 Win32 的部分在 unlockpipe-native.js，这里只有逻辑，测试时换成假的。
  */
@@ -82,7 +83,7 @@ function createUnlockPipe(opts = {}) {
       lastDistrust = null;
       return;
     }
-    if (verdict.reason !== lastDistrust) log(`管道对面不是可信的解锁服务，当作没装服务：${verdict.reason}`);
+    if (verdict.reason !== lastDistrust) log(`管道对面不是可信的解锁服务（旧版服务也会这样，要重新安装），不发命令：${verdict.reason}`);
     lastDistrust = verdict.reason;
   }
 
@@ -132,21 +133,28 @@ function createUnlockPipe(opts = {}) {
   }
 
   /**
-   * 发一条命令，返回回应的那一行；没装服务、核实不过、连不上、超时都返回 null。
+   * 发一条命令，返回 { line } 或 { error }（error 同 once，最后一次尝试的那个）。
    * 打不开管道（服务没起来、实例都忙，或别的错误）时稍等重试：已经连上之后的失败不重试，
    * 不依赖错误码，取 GetLastError 万一不准也只是多试两次
    */
-  async function ask(line, timeoutMs) {
+  async function request(line, timeoutMs) {
+    let r = { error: 'not-found' };
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
-      const r = await once(line, timeoutMs);
-      if (r.line !== undefined) return r.line;
-      if (r.error !== 'not-found' && r.error !== 'busy' && r.error !== 'open-failed') return null;
+      r = await once(line, timeoutMs);
+      if (r.line !== undefined) return r;
+      if (r.error !== 'not-found' && r.error !== 'busy' && r.error !== 'open-failed') return r;
       if (attempt < ATTEMPTS - 1) await sleep(RETRY_MS);
     }
-    return null;
+    return r;
   }
 
-  return { ask, once };
+  /** 同 request，只要回应的那一行；没装服务、核实不过、连不上、超时都返回 null */
+  async function ask(line, timeoutMs) {
+    const r = await request(line, timeoutMs);
+    return r.line !== undefined ? r.line : null;
+  }
+
+  return { ask, request, once };
 }
 
 module.exports = { createUnlockPipe, verifyServer, expectedServiceExe, firstLine, PIPE_NAME, SYSTEM_SID };

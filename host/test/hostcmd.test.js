@@ -32,6 +32,14 @@ test('电脑状态消息：锁屏、平铺，公钥还没好时不带 key', () =
   });
 });
 
+test('电脑状态消息：解锁服务核实不过（要重新安装）时 lock 带 untrusted，其余时候不带', () => {
+  const tile = { available: false, paused: false };
+  assert.deepEqual(stateMessage('v1', { locked: true, unlock: false, untrusted: true }, tile).lock, { locked: true, unlock: false, untrusted: true });
+  assert.deepEqual(stateMessage('v1', { locked: true, unlock: false, untrusted: false }, tile).lock, { locked: true, unlock: false });
+  // 能解锁时 untrusted 没有意义，不带
+  assert.deepEqual(stateMessage('v1', { locked: false, unlock: true, untrusted: true }, tile).lock, { locked: false, unlock: true });
+});
+
 test('平铺的四个操作交给主进程；没带 req 就不回执', async () => {
   for (const op of Object.keys(TILE_OPS)) {
     const b = fakeBridge();

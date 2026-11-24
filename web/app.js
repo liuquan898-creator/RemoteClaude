@@ -56,6 +56,7 @@
     // 解锁的结果（协议文档 4.6、2.9）
     'not-locked': '电脑没有锁屏',
     'no-service': '电脑上没装解锁服务',
+    'bad-service': '电脑上的解锁服务要重新安装（版本太旧或没通过核实）',
     'rate-limited': '失败次数太多，15 分钟后再试',
     'still-locked': '没解开，请检查密码或 PIN',
     'no-logon-screen': '没找到电脑的登录界面，没有输入密码',
@@ -533,7 +534,7 @@
       case 'host-state':
         if (typeof msg.host !== 'string') break;
         hostStates.set(msg.host, {
-          lock: { locked: !!(msg.lock && msg.lock.locked === true), unlock: !!(msg.lock && msg.lock.unlock === true) },
+          lock: lockFrom(msg.lock),
           key: typeof msg.key === 'string' && msg.key ? msg.key : null,
         });
         if (msg.host === hostId) hostTooOld = false;
@@ -605,7 +606,7 @@
         }
         // 锁屏状态和解锁回执（协议文档 4.6）
         if (ev.t === 'lock') {
-          peerLock = { locked: ev.locked === true, unlock: ev.unlock === true };
+          peerLock = lockFrom(ev);
           refreshStatus();
           return;
         }
@@ -1406,6 +1407,22 @@
     publishApprovals();
   }
 
+  /**
+   * 电脑报来的锁屏状态（host-state 的 lock、数据通道的 lock 消息）。untrusted：电脑上有解锁服务在跑，
+   * 但被控端核实不过它（多半是旧版服务，被控端自动升级了、服务没升级），这时 unlock 是 false
+   */
+  function lockFrom(m) {
+    const o = m && typeof m === 'object' ? m : {};
+    return { locked: o.locked === true, unlock: o.unlock === true, untrusted: o.unlock !== true && o.untrusted === true };
+  }
+
+  /** 锁着但不能从这里解锁时的说明 */
+  function noUnlockText(lock) {
+    return lock && lock.untrusted
+      ? '电脑上的解锁服务要重新安装（版本太旧或没通过核实），现在要回到电脑前解锁'
+      : '电脑上没装解锁服务，要回到电脑前解锁';
+  }
+
   /** 当前电脑的锁屏状态：连着画面时以数据通道上的为准，否则用 host-state 的；都没有时返回 null */
   function lockInfo() {
     if (isLive() && peerLock) return peerLock;
@@ -1425,7 +1442,7 @@
     else if (!ready) {
       note = hostTooOld ? `不打开会话窗口就锁定、解锁，要电脑上的被控端 ${HOST_CMD_MIN_VERSION} 或更新的版本；升级之前请先打开一个会话窗口`
         : '正在等电脑报告状态…';
-    } else if (lock.locked && !lock.unlock) note = '电脑上没装解锁服务，要回到电脑前解锁';
+    } else if (lock.locked && !lock.unlock) note = noUnlockText(lock);
     return { show: !!hostId, unlock: lock.locked, enabled: ready && (!lock.locked || lock.unlock) && !unlocking, note };
   }
 
@@ -1474,7 +1491,7 @@
     const box = document.createElement('div');
     box.className = 'banner bad';
     const text = span('banner-text', '');
-    text.append(span('strong', '电脑已锁屏'), span('muted', lock.unlock ? '解锁后才能操作' : '电脑上没装解锁服务，要回到电脑前解锁'));
+    text.append(span('strong', '电脑已锁屏'), span('muted', lock.unlock ? '解锁后才能操作' : noUnlockText(lock)));
     box.append(text);
     if (lock.unlock) {
       const b = document.createElement('button');
@@ -1558,7 +1575,9 @@
     const lock = lockInfo();
     el.lockDlgText.textContent = lock && lock.unlock
       ? '效果和在电脑上按 Win+L 一样。之后可以在这里输入 Windows 密码或 PIN 解锁。'
-      : '效果和在电脑上按 Win+L 一样。这台电脑没装解锁服务，锁定后只能回到电脑前解锁。';
+      : lock && lock.untrusted
+        ? '效果和在电脑上按 Win+L 一样。这台电脑上的解锁服务要重新安装（版本太旧或没通过核实），锁定后只能回到电脑前解锁。'
+        : '效果和在电脑上按 Win+L 一样。这台电脑没装解锁服务，锁定后只能回到电脑前解锁。';
     el.lockDlg.hidden = false;
     $('lockDlgCancel').focus();
   }

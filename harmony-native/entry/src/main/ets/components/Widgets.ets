@@ -72,7 +72,9 @@ export struct LockBanner {
     Row() {
       Column() {
         Text('电脑已锁屏').fontSize(15).fontWeight(FontWeight.Medium).fontColor(RcColors.Text)
-        Text(this.s.unlockAvailable ? '解锁后才能操作' : '电脑上没装解锁服务，要回到电脑前解锁')
+        Text(this.s.unlockAvailable ? '解锁后才能操作' :
+          this.s.unlockUntrusted ? '电脑上的解锁服务要重新安装（版本太旧或没通过核实），现在要回到电脑前解锁' :
+            '电脑上没装解锁服务，要回到电脑前解锁')
           .fontSize(12).fontColor(RcColors.Muted)
       }
       .alignItems(HorizontalAlign.Start)

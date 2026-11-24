@@ -190,6 +190,8 @@ data class AppState(
     val pcLocked: Boolean = false,
     /** 电脑上装了解锁服务，可以从手机解锁 */
     val unlockAvailable: Boolean = false,
+    /** 电脑上的解锁服务核实不过（多半是旧版，要在电脑上重新安装），和"没装"分开提示 */
+    val unlockUntrusted: Boolean = false,
     val unlocking: Boolean = false,
     /** 电脑上的窗口平铺在运行（协议文档 4.7） */
     val tileAvailable: Boolean = false,
@@ -210,6 +212,7 @@ data class AppState(
         hostTooOld = false,
         pcLocked = hs?.lock?.locked == true,
         unlockAvailable = hs?.lock?.unlockAvailable == true,
+        unlockUntrusted = hs?.lock?.unlockUntrusted == true,
         tileAvailable = hs?.tile?.available == true,
         tilePaused = hs?.tile?.paused == true,
     )
@@ -1283,7 +1286,9 @@ class RemoteController(private val app: Application) {
         }
 
         override fun onLockState(session: PeerSession, state: LockState) {
-            if (session === peer) update { it.copy(pcLocked = state.locked, unlockAvailable = state.unlockAvailable) }
+            if (session === peer) {
+                update { it.copy(pcLocked = state.locked, unlockAvailable = state.unlockAvailable, unlockUntrusted = state.unlockUntrusted) }
+            }
         }
 
         override fun onUnlockResult(session: PeerSession, result: UnlockResult) {
@@ -1813,6 +1818,7 @@ class RemoteController(private val app: Application) {
         "locked" -> "电脑锁屏了，解锁后才能操作"
         "not-locked" -> "电脑没有锁屏"
         "no-service" -> "电脑上没装解锁服务"
+        "bad-service" -> "电脑上的解锁服务要重新安装（版本太旧或没通过核实）"
         "rate-limited" -> "失败次数太多，15 分钟后再试"
         "still-locked" -> "没解开，请检查密码或 PIN"
         "no-logon-screen" -> "没找到电脑的登录界面，没有输入密码"

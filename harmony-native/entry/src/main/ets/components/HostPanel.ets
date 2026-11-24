@@ -72,7 +72,9 @@ export struct HostDialogsView {
         RcDialog({
           title: '锁定电脑？',
           message: this.s.unlockAvailable ? '效果和在电脑上按 Win+L 一样。之后可以在这里输入 Windows 密码或 PIN 解锁。' :
-            '效果和在电脑上按 Win+L 一样。这台电脑没装解锁服务，锁定后只能回到电脑前解锁。',
+            this.s.unlockUntrusted ?
+              '效果和在电脑上按 Win+L 一样。这台电脑上的解锁服务要重新安装（版本太旧或没通过核实），锁定后只能回到电脑前解锁。' :
+              '效果和在电脑上按 Win+L 一样。这台电脑没装解锁服务，锁定后只能回到电脑前解锁。',
           confirmText: '锁定',
           onConfirm: () => {
             this.dialogs.lockConfirm = false;

@@ -10,7 +10,10 @@
   /** 平铺操作，和数据通道上的 tile 消息（协议文档 4.7）是同一套 */
   const TILE_OPS = { arrange: '重排窗口', raise: '把所有会话提到最前', pause: '暂停自动平铺', resume: '恢复自动平铺' };
 
-  /** 推给控制端的电脑状态。key 是解锁密码用的公钥，还没生成好时不带 */
+  /**
+   * 推给控制端的电脑状态。key 是解锁密码用的公钥，还没生成好时不带。
+   * lock.untrusted 只在是 true 时带：电脑上有解锁服务，但被控端核实不过（多半是旧版，要重新安装）
+   */
   function stateMessage(to, lock, tile, key) {
     const msg = {
       type: 'host-state',
@@ -18,6 +21,7 @@
       lock: { locked: !!(lock && lock.locked), unlock: !!(lock && lock.unlock) },
       tile: { available: !!(tile && tile.available), paused: !!(tile && tile.paused) },
     };
+    if (lock && lock.untrusted && !lock.unlock) msg.lock.untrusted = true;
     if (key) msg.key = key;
     return msg;
   }

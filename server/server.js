@@ -36,6 +36,12 @@ app.listen(cfg.port, cfg.bind).then(() => {
     );
   }
   if (!cfg.registrationOpen) log('提示: 已关闭注册，只有现有账号能登录。');
+  const hw = cfg.push.huawei;
+  if (app.push.enabled) {
+    log(`华为推送已启用：类别 ${hw.category}${hw.testMessage ? '，测试消息（每个项目每天最多 1000 条）' : ''}`);
+  } else if (!hw) {
+    log('提示: 未配置华为推送，鸿蒙 App 没开着时收不到审批通知。');
+  }
   if (!cfg.turn || !cfg.turn.secret) log('提示: 未配置 TURN，只有双方能直连时才看得到画面（本机/局域网测试不受影响）。');
 });
 

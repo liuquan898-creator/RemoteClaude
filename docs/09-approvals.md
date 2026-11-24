@@ -18,7 +18,7 @@ Claude Code 会话 ◀── 钩子读到 done，输出决定 ──────
 |---|---|---|
 | Claude Code 插件 | `claude-plugin/remoteclaude/` | 审批钩子（PermissionRequest）、会话开头注入规则（SessionStart）、把桌面端自己画的、手机收不到的卡片（带提问的阻塞"下一步"框、"要在单独的会话中启动吗？"）改成 AskUserQuestion（PreToolUse，`scripts/redirect.js`）、"下一步"框里不阻塞的提问等这一轮结束后叫醒会话、改用 AskUserQuestion 再问（PostToolUse，后台运行，`scripts/nextstep.js`）、提问答了以后电脑上的"下一步"框还是旧的就提醒 Claude 换掉（Stop，`scripts/stalebox.js`） |
 | 被控端 | `host/approvals/` | 盯着审批目录，把等待中的审批推给手机，收到答案写回去 |
-| 服务器 | `server/lib/hub.js` | 白名单里放行 `approvals`、`approval-answer`、`approval-result` |
+| 服务器 | `server/lib/hub.js`、`server/lib/push.js` | 白名单里放行 `approvals`、`approval-answer`、`approval-result`；有新审批时给鸿蒙手机发华为推送（第 10 节） |
 | App | `android/.../approvals/` 等 | 审批列表、作答；后台常驻保持连接、系统通知 |
 
 插件和被控端之间只靠审批目录里的文件交接，谁先启动、谁重启都不要紧。被控端没在运行时（心跳文件超过 20 秒没更新），钩子什么都不做，Claude Code 照常在电脑上弹窗。
@@ -162,7 +162,7 @@ done 的内容：`{ "kind": "answer", "choice": "allow"|"deny", "text": "拒绝�
 | 控制端 → 被控端 | `approval-answer` | `{ "id", "req", "choice": "allow"|"deny", "text", "answers" }` |
 | 被控端 → 控制端 | `approval-result` | `{ "id", "req", "ok", "code" }`；`code` 为 `gone`（已经被别处答了或结束了）、`bad`（答案格式不对） |
 
-被控端把 `approvals` 推给账号下所有连着的控制端（不只是在看画面的）。一个账号多台电脑时，每台电脑推自己的。
+被控端把 `approvals` 推给账号下所有连着的控制端（不只是在看画面的）。一个账号多台电脑时，每台电脑推自己的。账号登记了推送令牌时，服务器让电脑以为多连着一个控制端 `push`，好在手机 App 关着时也收到 `approvals`、发推送（第 10 节、协议文档 2.10）。
 
 ## 6. App
 
@@ -208,3 +208,84 @@ node --test --test-timeout=20000 claude-plugin/remoteclaude/test/approval.test.j
 "下一步"提问的用例也在这个文件里：用一份假的会话记录喂 `nextstep.js`，往记录里追加结尾答复、用户输入来模拟会话往下走，看它的退出码和 stderr。`stalebox.js` 的用例同样：假的会话记录加一笔 `nextstep-<会话>.json`，看答了、没答、没问、用户又说了话、叫醒还没到这几种情况下的退出码，和这一笔删没删。
 
 被控端的审批目录监听在 `host/test/approvals.test.js`，其中一个用例直接跑插件的钩子脚本。手动联调时，把被控端和钩子的环境变量 `RC_APPROVALS_DIR` 指到同一个临时目录，用 stdin 给 `approval.js` 喂一份和 Claude Code 一样的输入（`session_id`、`cwd`、`tool_name`、`tool_input`），就能在 App 上看到这条审批，作答后钩子把决定打印到 stdout。
+
+## 10. 鸿蒙手机的系统推送（华为 Push Kit）
+
+鸿蒙 App（HarmonyOS NEXT，薄壳 ArkWeb，包名 `com.remoteclaude.harmony`）切到后台就会被冻结，保持不了信令连接，不能像 Android App 那样自己弹通知。所以由服务器在有新审批、提问时调华为推送服务（Push Kit）的服务端接口发一条系统通知，App 没开着也能收到；点通知打开 App 的审批面板。消息格式见协议文档 2.10。
+
+### 10.1 怎么工作
+
+```
+鸿蒙 App ──push-register（推送令牌）──▶ 服务器（存进 push_tokens 表）
+电脑被控端 ──approvals（发给虚拟控制端 push）──▶ 服务器 ──新审批──▶ 华为 Push Kit ──▶ 手机通知栏
+```
+
+1. App 每次连上信令都用 `pushService.getToken()` 拿到的令牌发 `push-register`。令牌挂在这次登录上：退出登录、重置密码、同一设备重新登录、登录过期时一起删。
+2. 被控端只把 `approvals` 发给连着的控制端。账号有推送令牌时，服务器对电脑报一个编号为 `push` 的虚拟控制端，电脑就会一直把审批列表发过来，被控端不用改。
+3. 服务器比对列表，对没推送过的审批，每条给账号下所有令牌发一条通知。推送过的记在数据库的 `push_notified` 表（留 8 天），电脑重连、重发、服务器重启都不会重推。
+4. 华为说令牌无效（全部无效 80300007；部分成功 80100000 里 `illegalTokens` 的 `tokenFormatError`、`noRight`）时删掉令牌。卸载 App 造成的失效在发送时不报错，只出现在消息回执里，现在没接回执，失效的令牌会留到那次登录作废为止。
+
+实现：`server/lib/push.js`（登记、比对、通知内容）、`server/lib/huawei-push.js`（签 JWT、调接口、解读结果），测试 `server/test/push.test.js`（本机假的华为接口）。
+
+### 10.2 配置
+
+`server/config.json`：
+
+```json
+"push": {
+  "huawei": {
+    "projectId": "AppGallery Connect 的项目 ID",
+    "serviceAccountFile": "/etc/remoteclaude/agc-push-key.json",
+    "category": "MARKETING",
+    "testMessage": true
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `projectId` | AGC「项目设置」里的项目 ID。不填就用密钥文件里的 `project_id`；两者不一致时启动日志里有警告（华为会回 80300002） |
+| `serviceAccountFile` | 服务账号密钥 JSON 的路径（相对配置文件所在目录）。**放在仓库外**，别提交。环境变量 `RC_PUSH_HUAWEI_KEY_FILE` 优先，`RC_PUSH_HUAWEI_PROJECT_ID` 同理（容器里把密钥文件只读挂进去用） |
+| `category` | 通知类别，默认 `MARKETING`。申请到自分类权益后改成批下来的类别，比如 `WORK` |
+| `testMessage` | 默认 `true`，发测试消息（见 10.3）。拿到自分类权益后改成 `false` |
+| `ttl` | 手机离线时华为保留多久，秒，默认 86400 |
+| `maxPerHour` | 每个账号每小时最多推几条，默认 60 |
+| `showDetail` | 默认 `true`。`false` 时通知正文只有会话名，命令、问题原文不经过华为服务器，也不显示在锁屏上 |
+| `enabled` | `false` 时不推送（`config.example.json` 里是 `false`） |
+
+没有 `push.huawei` 时不推送，`push-register` 回 `push-not-configured`。密钥文件读不出来时启动日志里有一行"华为推送没启用"，信令照常。
+
+鉴权：用密钥文件里的 `private_key` 签 JWT（`alg` 为 PS256，`kid` 为 `key_id`；`iss` 为 `sub_account`，`aud` 为 `https://oauth-login.cloud.huawei.com/oauth2/v3/token`，有效 3600 秒），直接当 `Authorization: Bearer` 用，不用换 OAuth 令牌（HarmonyOS 5 起不支持 OAuth）。JWT 缓存到过期前 5 分钟；华为说过期（80200005）时重签再试一次。日志里推送令牌只留前 6 位，不出现密钥和 JWT。
+
+### 10.3 限制（2026-11 查的官方文档）
+
+| 情况 | 能发多少 | 怎么显示 |
+|---|---|---|
+| 没有自分类权益，`category` 为 `MARKETING`，不是测试消息 | 每个应用每台设备每天 **2 条**，多的丢弃 | 静默：只进通知中心，没有横幅、铃声、振动 |
+| 测试消息（`testMessage: true`） | 每个项目每天 **1000 条**（所有设备合计，按成功的请求数算），不受分类频控；每次最多 10 个令牌（超了 80300030），太频繁回 80300029 | 官方没写；按分类规则推断 `MARKETING` 仍是静默的 |
+| 申请到自分类权益（比如 `WORK`、`IM`） | 没有固定条数上限，由系统按场景频控 | 锁屏、铃声、振动（以手机的通知设置为准） |
+
+所以现在用 `MARKETING` 加测试消息：自用每天几条到几十条够用，但大概率只进通知栏、不响。想要横幅和铃声，在 AGC 申请自分类权益（「开发与服务 → 项目 → 增长 → 推送服务 → 配置 → 自分类权益 → 申请」，选消息类型、给不含营销内容的示例，审核约 3 个工作日，通过后约 5 分钟生效），审批提醒最贴近 `WORK`（工作事项提醒），备选 `IM`；批下来后把 `category` 改成它、`testMessage` 改成 `false`。官方写"所有应用可申请"，个人开发者、未上架的应用能不能批下来没法确认。另外华为的通知内容规范要求不给最终用户推测试消息，自用可以接受。
+
+消息体不超过 4096 字节（通知正文截到 100 个字符，远够）。
+
+官方文档：
+
+- 基于服务账号生成鉴权令牌：https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-jwt-token
+- 请求结构、参数、响应和错误码：https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-scenariozed-api-request-struct 、…/push-scenariozed-api-request-param 、…/push-scenariozed-api-response
+- 发送通知消息：https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-send-alert
+- 申请推送场景化消息权益（分类、每天 2 条）：https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-apply-right
+- 测试消息每天 1000 条：https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-faq-5
+- 开通推送服务：https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-config-setting
+- 获取推送令牌：https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-get-token
+
+### 10.4 在 AppGallery Connect 里要做的
+
+1. 在 AGC 创建项目，项目下创建 HarmonyOS 应用，包名 `com.remoteclaude.harmony`。项目没设数据处理位置的先设（推送只支持中国境内）。
+2. 开通推送服务：「开发与服务 → 选项目 → 选应用 → 增长 → 推送服务 → 立即开通」。
+3. 签名：DevEco Studio「Project Structure → Signing」登录华为账号自动签名（能力里勾上 Push Kit），或手动申请调试证书和 Profile、注册调试设备。签名必须关联 AGC 里这个应用，否则 `getToken` 失败（1000900010）。HarmonyOS NEXT 不用再配公钥指纹和 Client ID。
+4. 下载服务账号密钥：在 API Console（AGC 的「项目设置 → 服务账号密钥」一类入口，新版界面的菜单名没核实）为这个项目创建"服务账号密钥"，下载 JSON。核对里面的 `project_id` 和项目设置里的项目 ID 一致。
+5. 把密钥文件放到服务器上仓库外的地方（权限只给运行服务器的用户读），在 `config.json` 填 `push.huawei`，或设 `RC_PUSH_HUAWEI_KEY_FILE`。重启服务器，日志里应有"华为推送已启用"。
+6. App 侧：`onWindowStageCreate` 里 `loadContent` 成功后调 `notificationManager.requestEnableNotification()` 请求通知权限；每次启动 `pushService.getToken()`，连上信令后 `push-register`。
+7. 想要横幅和铃声时申请自分类权益（10.3），批下来后改配置。
+8. （可选）在「推送服务 → 配置」里配消息回执，能知道卸载、令牌失效、被频控丢弃；服务器现在没有接收回执的接口。

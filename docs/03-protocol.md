@@ -179,6 +179,7 @@
 - `id` 是本次连接的控制端编号，每次连接都会变。
 - `hosts` 是这个账号下所有登录过的电脑，含当前不在线的；电脑在被控端上退出登录后就从列表里消失。
 - `iceServers` 直接作为 WebRTC 的 ICE 服务器配置。其中 TURN 凭据是临时的（默认 24 小时），每次 `auth-ok` 都会重新签发，建立新的连接时用最近一次收到的。
+- 被控端收到的 `viewers` 里可能有一个 `"push"`：账号登记了推送令牌时服务器加上的虚拟控制端（2.10），被控端照常对待即可。
 
 ### 2.2 消息转发规则
 
@@ -187,15 +188,17 @@
 | 方向 | 允许的 `type` | 服务器的处理 |
 |---|---|---|
 | 控制端 → 被控端 | `list`、`select`、`answer`、`ice`、`stop`、`list-sessions`、`open-session`、`new-session`、`close-window`、`host-update`、`approval-answer`、`host-cmd` | 必须带 `host: <hostId>`。转发给该账号下这台电脑，并加上 `from: <控制端 id>`。电脑不在线时回 `{"type":"error","code":"host-offline","host":"..."}` |
-| 被控端 → 控制端 | `windows`、`offer`、`ice`、`selected`、`error`、`window-closed`、`sessions`、`session-opened`、`session-failed`、`close-window-result`、`host-update-state`、`approvals`、`approval-result`、`host-state`、`host-cmd-result` | 必须带 `to: <控制端 id>`，且该控制端属于同一账号。服务器去掉 `to`、加上 `host: <hostId>` 后转发 |
+| 被控端 → 控制端 | `windows`、`offer`、`ice`、`selected`、`error`、`window-closed`、`sessions`、`session-opened`、`session-failed`、`close-window-result`、`host-update-state`、`approvals`、`approval-result`、`host-state`、`host-cmd-result` | 必须带 `to: <控制端 id>`，且该控制端属于同一账号。服务器去掉 `to`、加上 `host: <hostId>` 后转发。`approvals` 另外交给推送（2.10）；发给虚拟控制端 `push` 的消息不转发 |
+| 控制端 → 服务器 | `push-register`、`push-unregister` | 不带 `host`，服务器自己处理，不转发（2.10） |
 
 服务器自己发出的消息：
 
 | 发给 | 消息 | 时机 |
 |---|---|---|
 | 控制端 | `{ "type": "hosts", "hosts": [ ... ] }`，格式同 `auth-ok` 里的 `hosts` | 本账号有电脑上线、下线、登录、退出登录 |
-| 被控端 | `{ "type": "viewer-join", "id": "…" }` | 本账号有控制端连上 |
-| 被控端 | `{ "type": "viewer-leave", "id": "…" }` | 本账号有控制端断开 |
+| 被控端 | `{ "type": "viewer-join", "id": "…" }` | 本账号有控制端连上；`id` 为 `push` 时是账号有了推送令牌（2.10） |
+| 被控端 | `{ "type": "viewer-leave", "id": "…" }` | 本账号有控制端断开；`id` 为 `push` 时是账号的推送令牌没了 |
+| 控制端 | `{ "type": "push-register-result", "ok": true }` | 回 `push-register`（2.10） |
 | 被控端 | `{ "type": "replaced" }` 后以 4002 关闭 | 同一台电脑（同一 `hostId`）又连上了一次，旧连接被顶替 |
 | 任意 | `{ "type": "auth-fail", "reason": "revoked" }` 后以 4003 关闭 | 令牌被注销 |
 
@@ -576,6 +579,77 @@
 
 控制端的建议做法：连着画面、数据通道能用时照旧走数据通道（旧版被控端只认这条路）；没连画面时，对推过 `host-state` 的电脑走 `host-cmd`。
 
+### 2.10 厂商推送（鸿蒙手机的系统通知）
+
+鸿蒙 App（HarmonyOS NEXT，包名 `com.remoteclaude.harmony`）在后台保持不了信令连接。服务器在有新审批时通过华为推送服务（Push Kit）发系统通知，App 没开着也能收到（说明见 [09](09-approvals.md) 第 10 节）。服务器没配置推送时，下面的消息只回 `push-not-configured`，其余行为不变。
+
+**控制端登记推送令牌**。每次鉴权成功后（含重连）都发一次，令牌变了也发：
+
+```json
+{ "type": "push-register", "platform": "harmony", "token": "<pushService.getToken() 拿到的令牌>" }
+```
+
+服务器回：
+
+```json
+{ "type": "push-register-result", "ok": true }
+{ "type": "push-register-result", "ok": false, "error": "push-not-configured" }
+```
+
+| `error` | 含义 |
+|---|---|
+| `push-not-configured` | 服务器没配置推送 |
+| `bad-platform` | `platform` 不认识（现在只有 `harmony`） |
+| `bad-token` | 令牌为空、超过 512 个字符，或含空白、非 ASCII 字符 |
+| `rate-limited` | 同一账号一分钟内登记超过 30 次 |
+| `failed` | 服务器存令牌失败 |
+
+规则：
+
+- 同一个推送令牌只属于一个账号，谁最后登记归谁（同一台手机换了账号登录）。一个账号最多留 10 个令牌，多出的删最久没登记的。
+- 推送令牌挂在登记它的那个登录上：这个控制端的登录令牌作废（退出登录、重置密码、同一设备重新登录、30 天没用过期）时，推送令牌一起删，已经退出的手机不会再收到推送。重新登录后 App 要再登记一次（按上面"每次鉴权成功后都发"就行）。
+- 服务器说推送令牌无效时（应用卸载、令牌格式错误等）也会删掉，App 下次连上时重新登记即可。
+
+**控制端注销推送令牌**（退出登录前、关掉通知时）。只删本账号的，没有回复：
+
+```json
+{ "type": "push-unregister", "token": "<令牌>" }
+```
+
+**虚拟控制端 `push`**。被控端只把 `approvals` 发给连着的控制端，手机 App 关着时服务器就看不到新审批。所以账号有推送令牌时，服务器对这个账号在线的电脑说有一个编号为 `push` 的控制端连着：电脑上线时放进 `auth-ok` 的 `viewers`，之后有了令牌发 `viewer-join`、令牌都没了发 `viewer-leave`。电脑像对真的控制端一样把 `approvals`（还有 `host-state`）发给它，服务器收下、不转发。被控端不用改，旧版本也能用。真的控制端编号是 12 位十六进制，不会和它撞。
+
+**什么时候推**。服务器收到电脑发来的 `approvals`（发给谁都算），找出这个账号、这台电脑没推送过的审批，每条给账号下所有鸿蒙推送令牌发一条通知。推送过的记在数据库里（留 8 天），所以电脑重连、重发列表、对每个控制端各发一份、服务器重启，都不会重推；没有推送令牌时看到的审批也记下，之后登记的手机不会收到一串旧通知。推送因网络、超时、对方服务器出错没发出去的，撤掉记录，电脑下次发列表时再推。每个账号每小时最多推 60 条（可配置）。推送失败只记日志，不影响信令。
+
+**通知内容**：
+
+| 审批 | 标题 | 正文 |
+|---|---|---|
+| `kind` 为 `permission`，`tool` 为 `ExitPlanMode` 或 `计划` | `Claude 要你审批计划` | 会话名：说明 |
+| `kind` 为 `permission`，其余工具 | `Claude 要你审批：<tool>` | 会话名：说明（没有说明时用第一个参数） |
+| `kind` 为 `ask` | `Claude 有问题要问你` | 会话名：第一个问题 |
+
+正文合并空白，截到 100 个字符。配置 `showDetail: false` 时正文只有会话名。
+
+发给华为的请求（`POST https://push-api.cloud.huawei.com/v3/<projectId>/messages:send`，头 `Authorization: Bearer <JWT>`、`push-type: 0`）：
+
+```json
+{
+  "payload": { "notification": {
+    "category": "MARKETING",
+    "title": "Claude 要你审批：Bash",
+    "body": "修登录页：构建并清理旧产物",
+    "clickAction": { "actionType": 0, "data": { "approvalId": "1f0c9a2b3c4d5e6f", "hostId": "k3J9...", "kind": "permission" } },
+    "notifyId": 1234567890
+  } },
+  "target": { "token": ["<账号下的推送令牌，最多 10 个>"] },
+  "pushOptions": { "testMessage": true, "ttl": 86400 }
+}
+```
+
+- 点通知打开 App 首页（`actionType: 0`），`clickAction.data` 的字段出现在 Want 的 `parameters` 里：冷启动在 `onCreate(want)`，热启动在 `onNewWant(want)`（UIAbility 要是 singleton）。App 拿 `approvalId` 和 `hostId` 打开审批面板。`actionType: 0` 要求入口 Ability 的 skills 里有 `entity.system.home` 和 `ohos.want.action.home`，而且不能配 `uris`，否则收不到。
+- `notifyId` 由审批编号算出（SHA-256 前 4 字节，取 0～2147483647），同一条审批再推会覆盖旧通知，不会叠两条。
+- `category` 和 `testMessage` 取自配置，没申请到自分类权益前只能用 `MARKETING` 加测试消息（09 第 10 节）。
+
 ## 3. WebRTC
 
 | 项 | 约定 |
@@ -875,6 +949,8 @@
 | 剪贴板回传 | 一段最多 100000 个字符，每块不超过 4000 个字符；每 300 毫秒看一次剪贴板序号（4.9） |
 | 解锁失败上限 | 15 分钟内 3 次 |
 | 不连画面解锁的密钥 | RSA 3072 位，每次启动新生成；RSA-OAEP（SHA-256，MGF1 也是 SHA-256），密码最长 318 字节（2.9） |
+| 推送令牌 | 最长 512 个字符；每个账号最多 10 个；每个账号每分钟最多登记 30 次（2.10） |
+| 推送 | 每条审批推一次，记录留 8 天；每个账号每小时最多 60 条（可配置）；通知正文最多 100 个字符（2.10） |
 
 ## 7. 协议后续演进
 

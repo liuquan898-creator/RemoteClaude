@@ -10,6 +10,14 @@ const PROTO = 2;
 const AUTH_TIMEOUT_MS = 10 * 1000;
 const VIEWER_MSG_LIMIT = 64 * 1024;
 const VIEWER_TYPES = new Set(['list', 'select', 'answer', 'ice', 'stop', 'list-sessions', 'open-session', 'new-session', 'close-window', 'host-update', 'approval-answer', 'host-cmd']);
+/** 控制端发给服务器自己的消息（不转发），协议 2.10 */
+const PUSH_TYPES = new Set(['push-register', 'push-unregister']);
+/**
+ * 虚拟控制端的编号。账号登记了推送令牌时，服务器对电脑说有这么一个控制端连着（viewer-join），
+ * 电脑就会像对真的控制端一样把 approvals 发给它，手机 App 没开着时服务器也能看到新审批、发推送。
+ * 发给它的消息服务器收下、不转发。真的控制端编号是 12 位十六进制，不会和它撞。
+ */
+const PUSH_VIEWER_ID = 'push';
 const HOST_TYPES = new Set(['windows', 'offer', 'ice', 'selected', 'error', 'window-closed', 'sessions', 'session-opened', 'session-failed', 'close-window-result', 'host-update-state', 'approvals', 'approval-result', 'host-state', 'host-cmd-result']);
 
 function send(ws, obj) {
@@ -21,20 +29,22 @@ class Hub {
    * @param {object} opts
    * @param {import('./auth').AuthService} opts.auth
    * @param {() => object[]} opts.iceServers 每次鉴权成功时调用，签发新的 TURN 临时凭据
+   * @param {import('./push').PushService} [opts.push] 厂商推送；不给或没配置时不推送
    */
-  constructor({ auth, iceServers, limits, log, now = Date.now }) {
+  constructor({ auth, iceServers, limits, log, push = null, now = Date.now }) {
     this.auth = auth;
+    this.push = push && push.enabled ? push : null;
     this.iceServers = iceServers;
     this.log = log || (() => {});
     this.authFails = new WindowCounter(limits.wsAuthFailPerIp, 15 * 60 * 1000, now);
-    /** userId -> { hosts: Map<hostId, ws>, viewers: Map<viewerId, ws> } */
+    /** userId -> { hosts: Map<hostId, ws>, viewers: Map<viewerId, ws>, pushViewer: boolean } */
     this.accounts = new Map();
   }
 
   account(userId) {
     let a = this.accounts.get(userId);
     if (!a) {
-      a = { hosts: new Map(), viewers: new Map() };
+      a = { hosts: new Map(), viewers: new Map(), pushViewer: false };
       this.accounts.set(userId, a);
     }
     return a;
@@ -99,6 +109,8 @@ class Hub {
         old.close(4002, 'replaced');
       }
       ws.ctx = { role, userId: session.userId, tokenId: session.tokenId, hostId, email: session.email };
+      // 先对已经在线的电脑同步虚拟控制端，再把这台加进去：这台从 auth-ok 的 viewers 里得知
+      const pushViewer = this.syncPushViewer(session.userId);
       acc.hosts.set(hostId, ws);
       this.log(`[host] ${session.email} 的电脑「${session.deviceName}」已上线 ${ip} ${client}`);
       send(ws, {
@@ -107,7 +119,7 @@ class Hub {
         hostId,
         email: session.email,
         iceServers: this.iceServers(),
-        viewers: [...acc.viewers.keys()],
+        viewers: [...acc.viewers.keys(), ...(pushViewer ? [PUSH_VIEWER_ID] : [])],
       });
       this.broadcastHosts(session.userId);
       return;
@@ -129,6 +141,7 @@ class Hub {
   }
 
   fromViewer(ws, msg) {
+    if (PUSH_TYPES.has(msg.type)) return this.pushMessage(ws, msg);
     if (!VIEWER_TYPES.has(msg.type)) return;
     const acc = this.accounts.get(ws.ctx.userId);
     const hostId = typeof msg.host === 'string' ? msg.host : '';
@@ -140,8 +153,47 @@ class Hub {
     send(host, { ...msg, from: ws.ctx.id });
   }
 
+  /** push-register、push-unregister：服务器自己处理 */
+  pushMessage(ws, msg) {
+    const { userId, tokenId } = ws.ctx;
+    if (msg.type === 'push-unregister') {
+      if (this.push && this.push.unregister(userId, msg.token)) this.syncPushViewer(userId);
+      return;
+    }
+    const platform = typeof msg.platform === 'string' ? msg.platform : '';
+    const r = this.push ? this.push.register(userId, tokenId, platform, msg.token) : { ok: false, error: 'push-not-configured' };
+    send(ws, r.ok ? { type: 'push-register-result', ok: true } : { type: 'push-register-result', ok: false, error: r.error });
+    if (!r.ok) return;
+    if (r.previousUserId && r.previousUserId !== userId) this.syncPushViewer(r.previousUserId);
+    this.syncPushViewer(userId);
+  }
+
+  /**
+   * 账号有没有推送令牌变了时，对在线的电脑报虚拟控制端上线或下线。返回现在该不该有它。
+   * 电脑收到 viewer-join 会立即发一份 approvals 过来。登记令牌的那个控制端连上时电脑已经给它发过同一份，
+   * 里面的审批那时就记为推送过了，所以这份一般不会引出旧审批的通知（例外是列表恰好在这之间变了，最多多一条）。
+   */
+  syncPushViewer(userId) {
+    const want = !!this.push && this.push.hasTokens(userId);
+    const acc = this.accounts.get(userId);
+    if (!acc) return want;
+    if (acc.pushViewer !== want) {
+      acc.pushViewer = want;
+      for (const h of acc.hosts.values()) send(h, { type: want ? 'viewer-join' : 'viewer-leave', id: PUSH_VIEWER_ID });
+    }
+    return want;
+  }
+
   fromHost(ws, msg) {
     if (!HOST_TYPES.has(msg.type) || typeof msg.to !== 'string') return;
+    // 电脑对每个控制端（含虚拟的）各发一份同样的列表；推过的不会再推，所以每份都交过去也没关系
+    if (msg.type === 'approvals' && this.push) {
+      try {
+        this.push.onApprovals(ws.ctx.userId, ws.ctx.hostId, msg.list).catch(() => {});
+      } catch (err) {
+        this.log(`[push] 处理审批列表出错: ${err && err.message}`);
+      }
+    }
     const acc = this.accounts.get(ws.ctx.userId);
     const viewer = acc && acc.viewers.get(msg.to);
     if (!viewer) return;
@@ -201,6 +253,14 @@ class Hub {
       }
     }
     this.broadcastHosts(userId);
+    // 推送令牌挂在登录令牌上，跟着删了
+    this.syncPushViewer(userId);
+  }
+
+  /** 登录令牌过期被清理时，挂在上面的推送令牌也跟着删了：对在线的账号重新同步虚拟控制端 */
+  syncAllPushViewers() {
+    if (!this.push) return;
+    for (const userId of [...this.accounts.keys()]) this.syncPushViewer(userId);
   }
 
   /** 心跳：清掉断网后没有正常关闭的连接 */
@@ -217,4 +277,4 @@ class Hub {
   }
 }
 
-module.exports = { Hub, PROTO };
+module.exports = { Hub, PROTO, PUSH_VIEWER_ID };

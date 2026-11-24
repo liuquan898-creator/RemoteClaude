@@ -2,14 +2,14 @@
 
 把安卓控制端（`android/`，[04](04-android-client.md)）原生移植到 HarmonyOS NEXT：ArkTS + ArkUI，Stage 模型。功能对齐安卓 App，协议、服务器、被控端都不用改（推送除外，见第 6 节）。代码在 `harmony-native/`。
 
-仓库外还有一个 `harmony/`（不入库）：早先装在手机上的 ArkWeb 壳，加载网页控制端。原生版装上以后它就用不到了。
+早先还试过一个加载网页控制端的 ArkWeb 壳，原生版取代了它，没有收进仓库。
 
 ## 1. 技术栈
 
 | 项 | 选择 | 说明 |
 |---|---|---|
 | 语言与界面 | ArkTS + ArkUI，状态管理 V2（`@ObservedV2`/`@Trace`、`@ComponentV2`） | 单页面，按状态切账号页、会话列表、画面页 |
-| 系统版本 | `compatibleSdkVersion` 5.0.3(15)，用 SDK API 26 编译 | WebRTC 库要求 API 15 起。用户手机是 HED-AL00，HarmonyOS 7.0（API 26） |
+| 系统版本 | `compatibleSdkVersion` 5.0.3(15)，用 SDK API 26 编译 | WebRTC 库要求 API 15 起。验收用的真机是 HarmonyOS 7.0（API 26） |
 | WebRTC | ohpm 的 `@ohos/webrtc` 1.0.5（OpenHarmony 三方库，仓库 gitcode.com/CPF-ApplicationTPC/ohos_webrtc，基于 WebRTC m120） | 自带预编译的 arm64 `.so`，接口照 W3C：`RTCPeerConnection`、`RTCDataChannel`、`getStats`。选型过程见第 3 节 |
 | 视频渲染 | 库里的 `VideoRenderController`（XComponent） | XComponent 的大小设成视频原始像素，再用 `scale` 缩放、`position` 平移，放大后小字不糊（对应安卓自写的 `VideoTextureView`） |
 | 信令、账号接口 | `@kit.NetworkKit` 的 `webSocket`、`http` | 服务器的 WebSocket ping 系统自动回 pong |
@@ -35,7 +35,7 @@
 
 协议解析、纯逻辑放在 `.ts` 里而不是 `.ets`：ArkTS 不许用 `any`，解析动态 JSON 很别扭；`.ts` 还能在电脑上用 node 直接跑单元测试。`.ets` 能导入 `.ts`，反过来不行。
 
-单元测试在 `harmony-native/test/`（90 个，对照 `android/app/src/test` 移植，另补了滚动合并的），`bash harmony-native/scripts/test.sh` 运行（Node 24 原生跑 TypeScript，`test/loader.mjs` 给不带扩展名的导入补 `.ts`）。
+单元测试在 `harmony-native/test/`（92 个，对照 `android/app/src/test` 移植，另补了滚动合并的），`bash harmony-native/scripts/test.sh` 运行（Node 24 原生跑 TypeScript，`test/loader.mjs` 给不带扩展名的导入补 `.ts`）。
 
 ## 3. WebRTC 选型
 
@@ -45,7 +45,7 @@
 | 自己用 NDK 编 libwebrtc | 上游不支持 OHOS，要把上面那个库的补丁再做一遍，几周起步 |
 | 隐藏的 ArkWeb 跑 WebRTC、原生界面显示 | ArkWeb 收到的视频交不出来给原生界面（同层渲染只支持 `<embed>`/`<object>`），画面只能画在网页的 `<video>` 里，等于原来的壳 |
 
-这个库只有 H264/H265 走硬件解码，被控端默认的 VP9 是软件解码（libvpx）。真机实测（2026-11-24，HED-AL00，局域网）：1280×2088 的 Claude 窗口 VP9 软解 30 fps、不丢帧，App 占 CPU 约 9.5%；从点窗口到画面连通约 0.2 秒。所以没有改编码。以后真遇到卡顿，可以在 `PeerSession` 里对视频收发器 `setCodecPreferences` 把 H264 排前面（被控端不用改），注意这个库的 H264 硬解只报 level 3.1。
+这个库只有 H264/H265 走硬件解码，被控端默认的 VP9 是软件解码（libvpx）。真机实测（2026-11-24，局域网）：1280×2088 的 Claude 窗口 VP9 软解 30 fps、不丢帧，App 占 CPU 约 9.5%；从点窗口到画面连通约 0.2 秒。所以没有改编码。以后真遇到卡顿，可以在 `PeerSession` 里对视频收发器 `setCodecPreferences` 把 H264 排前面（被控端不用改），注意这个库的 H264 硬解只报 level 3.1。
 
 几个接入要点：
 
@@ -73,8 +73,8 @@
   - 第一次签名：DevEco 打开 `harmony-native`，File > Project Structure > Signing Configs，登录华为账号，勾自动签名，关联 AppGallery Connect 里的应用（包名 `com.remoteclaude.mobile`），"开通开放能力"里勾 Push Kit；然后 `node harmony-native/scripts/take-signing.js` 把签名存进 `signing.local.json5`。
   - 自动签名的证书、Profile 存在 `%USERPROFILE%\.ohos\config\`，按华为账号命名，同一个账号签的几个工程共用这几个文件，后签的会覆盖先签的。Profile 绑定包名，换包名要重签。
 - **服务器地址不写进安装包**（和被控端、安卓 App 一样，见 [08](08-release-and-update.md) 第 1 节）。登录页总是显示"服务器地址"框，预填上次用的；登录成功时存在手机上，设置里能"更换服务器"（先退出旧服务器上的登录、注销推送，再回登录页用新服务器上的账号登录）。早先把地址写进安装包的 0.2.0 登录时已经把地址存在了手机上，升级后照样用它，不用重新填（`restoreServerAddress`）。正式版只认 `https`/`wss`，调试版还允许 `ws://` 明文。
-- 构建：`pwsh -File harmony-native\scripts\install.ps1`（构建正式版并装到手机），或 Git Bash 里 `bash harmony-native/scripts/build.sh [debug|release]`（只构建）。
-- 包名 `com.remoteclaude.mobile`：和 AppGallery Connect 里注册的应用（ClaudeRemote）一致，推送靠它认应用（AppGallery Connect 不允许包名里带 harmony）。早先的 ArkWeb 壳和最初的测试版用的是 `com.remoteclaude.harmony`，和新包名并存、不再覆盖。
+- 构建：`pwsh -File harmony-native\scripts\install.ps1`（构建正式版并装到手机），或 Git Bash 里 `bash harmony-native/scripts/build.sh [release|debug]`（只构建，默认也是正式版）。
+- 包名 `com.remoteclaude.mobile`：和 AppGallery Connect 里注册的应用一致，推送靠它认应用（AppGallery Connect 不允许包名里带 harmony）。最初的测试版用的是 `com.remoteclaude.harmony`，和新包名并存、不再覆盖。
 
 ## 6. 推送（审批提醒）
 
@@ -105,7 +105,7 @@
 
 ## 9. 验收记录
 
-2026-11-24 在用户手机（HED-AL00，HarmonyOS 7.0）上，连阿里云的正式服务器、局域网直连，用 `tools/input-test-window.ps1` 的测试窗口做输入类验证。编号同 [04](04-android-client.md) 的验收表。
+2026-11-24 在鸿蒙真机（HarmonyOS 7.0）上，连正式服务器、局域网直连，用 `tools/input-test-window.ps1` 的测试窗口做输入类验证。编号同 [04](04-android-client.md) 的验收表。
 
 | 编号 | 结果 |
 |---|---|

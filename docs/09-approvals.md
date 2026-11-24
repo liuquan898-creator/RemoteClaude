@@ -211,7 +211,7 @@ node --test --test-timeout=20000 claude-plugin/remoteclaude/test/approval.test.j
 
 ## 10. 鸿蒙手机的系统推送（华为 Push Kit）
 
-鸿蒙 App（HarmonyOS NEXT 原生版，包名 `com.remoteclaude.mobile`；早先的 ArkWeb 壳 `harmony/` 包名是 `com.remoteclaude.harmony`，已不再使用）切到后台就会被冻结，保持不了信令连接，不能像 Android App 那样自己弹通知。所以由服务器在有新审批、提问时调华为推送服务（Push Kit）的服务端接口发一条系统通知，App 没开着也能收到；点通知打开 App 的审批面板。消息格式见协议文档 2.10。
+鸿蒙 App（HarmonyOS NEXT 原生版 `harmony-native/`，包名 `com.remoteclaude.mobile`）切到后台就会被冻结，保持不了信令连接，不能像 Android App 那样自己弹通知。所以由服务器在有新审批、提问时调华为推送服务（Push Kit）的服务端接口发一条系统通知，App 没开着也能收到；点通知打开 App 的审批面板。消息格式见协议文档 2.10。
 
 ### 10.1 怎么工作
 

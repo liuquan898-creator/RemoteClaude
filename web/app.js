@@ -20,13 +20,14 @@
     code: $('code'), sendCode: $('sendCode'), password: $('password'), authSubmit: $('authSubmit'),
     authError: $('authError'), authInfo: $('authInfo'), toLogin: $('toLogin'), toRegister: $('toRegister'), toForgot: $('toForgot'),
     app: $('app'), dot: $('dot'), curTitle: $('curTitle'), stage: $('stage'), video: $('video'), hint: $('hint'),
-    tools: $('tools'), keys: $('keys'), composer: $('composer'), text: $('text'),
+    tools: $('tools'), keys: $('keys'), fontBar: $('fontBar'), composer: $('composer'), text: $('text'),
     btnImage: $('btnImage'), imageFile: $('imageFile'),
     picker: $('picker'), hostTabs: $('hostTabs'), list: $('list'), accountEmail: $('accountEmail'), toast: $('toast'),
+    btnMore: $('btnMore'), menu: $('menu'), menuItems: $('menuItems'), btnKeys: $('btnKeys'),
   };
 
   const PROTO = 2;
-  const CLIENT = 'web/0.3.0';
+  const CLIENT = 'web/0.4.0';
   const SPECIAL_KEYS = new Set([
     'Backspace', 'Tab', 'Enter', 'Escape', 'PageUp', 'PageDown', 'End', 'Home',
     'ArrowLeft', 'ArrowUp', 'ArrowRight', 'ArrowDown', 'Insert', 'Delete',
@@ -265,6 +266,8 @@
     windows = [];
     closePeer();
     closePicker();
+    el.menu.hidden = true;
+    el.fontBar.hidden = true;
     showAuth('login', error);
     return old;
   }
@@ -1054,17 +1057,22 @@
     if (file) sendImage(file);
   });
 
-  // ---------------------------------------------------------------- 按键栏与输入框（手机）
+  // ---------------------------------------------------------------- 按键栏、字体大小与输入框（手机）
 
-  // 点按键栏时不要抢走输入框的焦点，否则手机软键盘会收起
-  el.keys.addEventListener('pointerdown', (e) => {
-    if (e.target.closest('button')) e.preventDefault();
-  });
-  el.keys.addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-k]');
-    if (!btn) return;
-    if (!sendInput({ t: 'k', k: btn.dataset.k, m: Number(btn.dataset.m) || 0 })) toast('还没有连上画面');
-  });
+  // 按键栏和"字体大小"那一条上的按钮都是发一个按键事件（data-k 是键，data-m 是修饰键）。
+  // "字体大小"按的是 Claude 桌面端自己的缩放快捷键：Ctrl+= 放大、Ctrl+- 缩小、Ctrl+0 还原，
+  // 电脑上所有 Claude 窗口一起变，和安卓端的做法一样（docs/04-android-client.md 的"字体大小"）
+  for (const bar of [el.keys, el.fontBar]) {
+    // 点的时候不要抢走输入框的焦点，否则手机软键盘会收起
+    bar.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('button')) e.preventDefault();
+    });
+    bar.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-k]');
+      if (!btn) return;
+      if (!sendInput({ t: 'k', k: btn.dataset.k, m: Number(btn.dataset.m) || 0 })) toast('还没有连上画面');
+    });
+  }
 
   function autosize() {
     el.text.style.height = 'auto';
@@ -1095,8 +1103,42 @@
     sendText(true);
   });
   $('btnType').addEventListener('click', () => sendText(false));
-  $('btnKeys').addEventListener('click', () => {
-    el.tools.hidden = !el.tools.hidden;
+  // ---------------------------------------------------------------- "更多"菜单
+
+  // 顶栏右边的"⋮"：按键栏、字体大小、退出登录。手机上顶栏放不下这么多按钮，会话标题会被挤得只剩两三个字
+  function closeMenu() {
+    el.menu.hidden = true;
+  }
+  el.btnMore.addEventListener('click', () => {
+    el.btnKeys.textContent = el.keys.hidden ? '显示按键栏' : '隐藏按键栏';
+    // 菜单贴在"⋮"按钮下面、和它右边对齐
+    const r = el.btnMore.getBoundingClientRect();
+    el.menuItems.style.top = r.bottom + 4 + 'px';
+    el.menuItems.style.right = Math.max(8, el.app.clientWidth - r.right) + 'px';
+    el.menu.hidden = false;
+  });
+  el.menu.addEventListener('click', (e) => {
+    if (e.target === el.menu) closeMenu();
+  });
+  // 菜单的位置是打开时算的，窗口大小一变（转屏、拖窗口）就收起，免得留在不对的地方
+  window.addEventListener('resize', closeMenu);
+
+  // 按键栏默认收起（安卓端 0.9.2 起也不显示），从菜单里叫出来；开着还是收着记在本浏览器里
+  el.keys.hidden = store.get('rc.keys') !== '1';
+  el.btnKeys.addEventListener('click', () => {
+    closeMenu();
+    el.keys.hidden = !el.keys.hidden;
+    store.set('rc.keys', el.keys.hidden ? '0' : '1');
+    layout();
+  });
+  // "字体大小"那一条：从菜单里叫出来，调完点"完成"收起，不记
+  $('btnFont').addEventListener('click', () => {
+    closeMenu();
+    el.fontBar.hidden = false;
+    layout();
+  });
+  $('btnFontDone').addEventListener('click', () => {
+    el.fontBar.hidden = true;
     layout();
   });
 

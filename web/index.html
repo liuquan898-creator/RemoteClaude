@@ -39,8 +39,7 @@
       <span class="caret">▾</span>
     </button>
     <button id="btnFit" type="button" title="还原缩放">适应</button>
-    <button id="btnKeys" type="button" title="显示或隐藏按键和输入栏">键盘</button>
-    <button id="btnLogout" type="button" title="退出登录">退出</button>
+    <button id="btnMore" type="button" title="更多" aria-label="更多" aria-haspopup="menu">⋮</button>
   </header>
 
   <main id="stage">
@@ -49,7 +48,7 @@
   </main>
 
   <footer id="tools">
-    <div id="keys">
+    <div id="keys" hidden>
       <button type="button" data-k="Escape">Esc</button>
       <button type="button" data-k="Enter">回车</button>
       <button type="button" data-k="Enter" data-m="2">换行</button>
@@ -65,6 +64,13 @@
       <button type="button" data-k="c" data-m="1">复制</button>
       <button type="button" data-k="v" data-m="1">粘贴</button>
       <button type="button" data-k="z" data-m="1">撤销</button>
+    </div>
+    <div id="fontBar" hidden>
+      <span class="label">字体大小</span>
+      <button type="button" data-k="-" data-m="1" title="电脑上的 Claude 缩小一档（Ctrl+-）">缩小</button>
+      <button type="button" data-k="0" data-m="1" title="电脑上的 Claude 回到默认大小（Ctrl+0）">默认</button>
+      <button type="button" data-k="=" data-m="1" title="电脑上的 Claude 放大一档（Ctrl+=）">放大</button>
+      <button id="btnFontDone" type="button">完成</button>
     </div>
     <form id="composer">
       <button id="btnImage" type="button" title="选一张图片粘贴进远程窗口的输入框（也可以直接在这里粘贴图片）">图片</button>
@@ -85,6 +91,15 @@
       <div id="hostTabs"></div>
       <div id="list"></div>
       <div class="sheet-foot muted">账号 <span id="accountEmail"></span></div>
+    </div>
+  </div>
+
+  <!-- "更多"菜单：整块盖住界面，点菜单以外的地方只收起菜单，不会点到远程画面上 -->
+  <div id="menu" hidden>
+    <div id="menuItems" role="menu">
+      <button id="btnKeys" type="button" role="menuitem">显示按键栏</button>
+      <button id="btnFont" type="button" role="menuitem" title="调电脑上 Claude 的字体大小">字体大小</button>
+      <button id="btnLogout" type="button" role="menuitem">退出登录</button>
     </div>
   </div>
 

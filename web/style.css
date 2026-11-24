@@ -107,6 +107,23 @@ button.primary:active { filter: brightness(0.9); }
   text-align: left;
 }
 #curTitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#btnMore { flex: none; min-width: 40px; padding: 0; font-size: 18px; line-height: 1; }
+
+/* "更多"菜单：#menu 整块盖住界面接住菜单以外的点击，#menuItems 才是看得见的那一块，位置由脚本贴到"⋮"下面 */
+#menu { position: absolute; inset: 0; z-index: 15; }
+#menuItems {
+  position: absolute;
+  min-width: 156px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+#menuItems button { border: none; background: none; min-height: 42px; border-radius: 6px; text-align: left; }
+#menuItems button:active { background: var(--line); }
 .caret { color: var(--muted); }
 .dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--bad); }
 .dot.on { background: var(--ok); }
@@ -157,7 +174,14 @@ button.primary:active { filter: brightness(0.9); }
 #keys::-webkit-scrollbar { display: none; }
 #keys button { flex: none; min-width: 44px; }
 
-#composer { display: flex; align-items: flex-end; gap: 6px; padding: 0 8px 8px; }
+/* 调电脑上 Claude 字体大小的一条，从顶栏的"字体"叫出来 */
+#fontBar { display: flex; align-items: center; gap: 6px; padding: 6px 8px; }
+#fontBar .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+#fontBar button { flex: none; min-width: 52px; }
+
+/* 上面没有按键栏、也没有"字体大小"那一条时，输入栏上边留出和下边一样的空隙，不贴着画面 */
+#composer { display: flex; align-items: flex-end; gap: 6px; padding: 8px; }
+#keys:not([hidden]) ~ #composer, #fontBar:not([hidden]) ~ #composer { padding-top: 0; }
 #text {
   flex: 1;
   min-width: 0;

@@ -14,8 +14,9 @@ const WTS_DISCONNECTED = 4; // WTS_CONNECTSTATE_CLASS 里的 WTSDisconnected
 const SERVICE_CHECK_MS = 30000;
 const STATUS_TIMEOUT_MS = 1500;
 const UNLOCK_TIMEOUT_MS = 40000;
-// 接回：服务要核对密码、接回、等会话到控制台，接回后还锁着的话再输入密码
-const ATTACH_TIMEOUT_MS = 60000;
+// 接回：服务要核对密码（最多 15 秒）、接回并等会话到控制台（最多 5 + 10 秒）、等登录界面出现（5 秒），
+// 接回后还锁着的话再输入密码（最多约 30 秒）。最坏约 65 秒，再留些余量；比服务先超时会把它当成没装
+const ATTACH_TIMEOUT_MS = 75000;
 const MAX_PASSWORD = 256;
 
 /**
@@ -42,7 +43,8 @@ function parseStatus(reply) {
   if (typeof reply !== 'string') return null;
   const parts = reply.trim().split(/\s+/);
   if (parts[0] !== 'OK') return null;
-  const fields = {};
+  // 不带原型：回应里的字段名（比如 __proto__）只是普通的键，Object.prototype 上的东西也不会被当成字段读出来
+  const fields = Object.create(null);
   for (const p of parts.slice(1)) {
     const i = p.indexOf('=');
     if (i > 0) fields[p.slice(0, i)] = p.slice(i + 1);

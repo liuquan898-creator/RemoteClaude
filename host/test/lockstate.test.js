@@ -75,6 +75,27 @@ test('parseStatus: 旧版、新版回应都能解析，认不出的字段忽略'
   assert.deepEqual(parseStatus('OK attach'), { locked: false, attach: false }, '没有等号的字段忽略');
 });
 
+test('parseStatus: 字段表不带原型，Object.prototype 被污染也读不出 locked/attach；__proto__ 之类的字段名只是普通字段', () => {
+  Object.prototype.locked = '1';
+  Object.prototype.attach = '1';
+  try {
+    assert.deepEqual(parseStatus('OK'), { locked: false, attach: false });
+    assert.deepEqual(parseStatus('OK locked=1'), { locked: true, attach: false });
+  } finally {
+    delete Object.prototype.locked;
+    delete Object.prototype.attach;
+  }
+  assert.deepEqual(parseStatus('OK __proto__=x constructor=1 locked=1'), { locked: true, attach: false });
+  assert.deepEqual(parseStatus('OK hasOwnProperty=1 attach=1'), { locked: false, attach: true });
+});
+
+test('ATTACH 的超时盖得住服务最坏的耗时（核对密码 15 秒 + 接回 5+10 秒 + 等登录界面 5 秒 + 输入密码 30 秒）', () => {
+  // 被控端先超时的话会把还在干活的服务当成没装（no-service），所以要比服务最坏的情况再多留一点
+  const serviceWorstMs = 15000 + 5000 + 10000 + 5000 + 30000;
+  assert.ok(ATTACH_TIMEOUT_MS >= serviceWorstMs + 5000, `ATTACH_TIMEOUT_MS=${ATTACH_TIMEOUT_MS}`);
+  assert.ok(ATTACH_TIMEOUT_MS > UNLOCK_TIMEOUT_MS);
+});
+
 test('replyCode: 和原来的映射一致', () => {
   assert.equal(replyCode(null), 'no-service');
   assert.equal(replyCode(undefined), 'no-service');

@@ -493,6 +493,139 @@ test('"下一步"提问：钩子输入里没有调用编号时，按提问原文
   assert.deepEqual([r2.code, r2.stderr], [0, '']);
 });
 
+// ---------------------------------------------------------------- 答过的提问还留在"下一步"框里（stalebox.js）
+
+const askCall = (id) => line({ type: 'assistant', message: { id: `msg_${id}`, stop_reason: 'tool_use', content: [{ type: 'tool_use', id, name: 'AskUserQuestion', input: {} }] } });
+const answered = (id, content) => line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content }] } });
+const CHOSE = 'Your questions have been answered: "要我把它细化成一份技术方案文档吗？"="写方案文档". You can now continue with these answers in mind.';
+const taskDone = () => userSays('<task-notification>\n<summary>后台任务结束了</summary>\n</task-notification>');
+const markerOf = (dir, session = 's1') => path.join(dir, `nextstep-${session}.json`);
+const runStale = (transcript, dir, extra = {}) => runHook('stalebox.js', { session_id: 's1', transcript_path: transcript, hook_event_name: 'Stop', ...extra }, dir);
+
+test('"下一步"提问：叫醒时记一笔，这个会话再有"下一步"框就删掉', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  hostAlive(dir);
+  const transcript = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(transcript, wrapCall('toolu_w', followUp) + toolResult('toolu_w') + closing());
+  assert.equal((await runNext(wrapPayload(transcript), dir)).code, 2);
+  const mark = JSON.parse(fs.readFileSync(markerOf(dir), 'utf8'));
+  assert.equal(mark.ask, followUp.ask);
+  assert.ok(Date.now() - mark.at < 10000);
+  // 子代理的框不算
+  await runNext(wrapPayload(transcript, { recap: '子代理做完了' }, { agent_id: 'a1' }), dir);
+  assert.equal(fs.existsSync(markerOf(dir)), true);
+  // 只写进展的框也算：桌面端的框已经换了
+  await runNext(wrapPayload(transcript, { recap: '做完了' }), dir);
+  assert.equal(fs.existsSync(markerOf(dir)), false);
+});
+
+test('旧的"下一步"框：提问答了、Claude 没再调 wrap_up，这一轮结束时拦一次（退出码 2）', async (t) => {
+  const { wakeMessage } = require('../scripts/nextstep.js');
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const transcript = path.join(dir, 'session.jsonl');
+  const woken = wrapCall('toolu_w', followUp) + toolResult('toolu_w') + closing() + wokenBy(wakeMessage(followUp));
+  const mark = (at = Date.now()) => fs.writeFileSync(markerOf(dir), JSON.stringify({ at, ask: followUp.ask }));
+
+  // 没有叫醒的记录：什么都不做
+  fs.writeFileSync(transcript, woken + askCall('toolu_q') + answered('toolu_q', CHOSE) + closing('msg_done'));
+  let r = await runStale(transcript, dir);
+  assert.deepEqual([r.code, r.stdout, r.stderr], [0, '', '']);
+
+  // 答了、照做了、停下来等后台任务：提醒把旧框换掉
+  mark();
+  r = await runStale(transcript, dir);
+  assert.equal(r.code, 2);
+  assert.equal(r.stdout, '');
+  assert.ok(r.stderr.startsWith('RemoteClaude 插件提醒（用户安装的本地钩子发的，不是用户的回答）'));
+  assert.match(r.stderr, /\n问题：要我把它细化成一份技术方案文档吗？\n请现在调用一次 wrap_up 把它换掉/);
+  assert.equal(fs.existsSync(markerOf(dir)), false);
+  // 一条记录只提醒一次
+  r = await runStale(transcript, dir);
+  assert.deepEqual([r.code, r.stderr], [0, '']);
+
+  // 后台任务结束把会话又叫起来、做完还是没调：照样提醒（那条通知不是用户说话）；结果是内容块的也认
+  fs.writeFileSync(transcript, woken + askCall('toolu_q') + answered('toolu_q', [{ type: 'text', text: CHOSE }]) + closing('msg_wait') + taskDone() + closing('msg_done'));
+  mark();
+  assert.equal((await runStale(transcript, dir)).code, 2);
+
+  // 同一个问题叫醒过两次（第一次用户发了条消息没选），以后一次为准
+  const twice =
+    woken + askCall('toolu_q1') + answered('toolu_q1', 'The user answered: "…"="[User did not answer this question — they sent a message instead]"') + closing('msg_a') +
+    userSays('这个对性能影响大吗？') + wrapCall('toolu_w2', followUp) + toolResult('toolu_w2') + closing('msg_b') +
+    wokenBy(wakeMessage(followUp)) + askCall('toolu_q2') + answered('toolu_q2', CHOSE) + closing('msg_done');
+  fs.writeFileSync(transcript, twice);
+  mark();
+  assert.equal((await runStale(transcript, dir)).code, 2);
+});
+
+test('旧的"下一步"框：没回答、没问、用户自己又说了话、叫醒还没到，都不拦', async (t) => {
+  const { wakeMessage } = require('../scripts/nextstep.js');
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const transcript = path.join(dir, 'session.jsonl');
+  const before = wrapCall('toolu_w', followUp) + toolResult('toolu_w') + closing();
+  const woken = before + wokenBy(wakeMessage(followUp));
+  const quiet = async (body, { keep = false, at = Date.now(), payload = {} } = {}) => {
+    fs.writeFileSync(transcript, body);
+    fs.writeFileSync(markerOf(dir), JSON.stringify({ at, ask: followUp.ask }));
+    const r = await runStale(transcript, dir, payload);
+    assert.deepEqual([r.code, r.stdout, r.stderr], [0, '', '']);
+    assert.equal(fs.existsSync(markerOf(dir)), keep);
+  };
+  // 用户没有回答（手机上超时、发了条消息、电脑上按了 Esc）：框里的问题还算数
+  await quiet(woken + askCall('toolu_q') + answered('toolu_q', '用户在 RemoteClaude App 上没有回答这个问题。') + closing('msg_done'));
+  await quiet(woken + askCall('toolu_q') + answered('toolu_q', 'The user answered: "…"="[User did not answer this question — they sent a message instead]"') + closing('msg_done'));
+  await quiet(woken + askCall('toolu_q') + answered('toolu_q', "The user doesn't want to proceed with this tool use. The tool use was rejected.") + closing('msg_done'));
+  // Claude 被叫醒了但没问
+  await quiet(woken + closing('msg_done'));
+  // 答了以后用户自己又说了话：新的一轮，旧框不会再画出来
+  await quiet(woken + askCall('toolu_q') + answered('toolu_q', CHOSE) + closing('msg_a') + userSays('再改一下') + closing('msg_done'));
+  // 叫醒还没写进会话记录：先留着；十分钟还没有就删
+  await quiet(before, { keep: true });
+  await quiet(before, { at: Date.now() - 700000 });
+  // 更早那次同样的叫醒（答过了）不是这一次的
+  const old = line({ type: 'user', timestamp: new Date(Date.now() - 3600000).toISOString(), message: { content: `Stop hook blocking error: ${wakeMessage(followUp)}` } });
+  await quiet(old + askCall('toolu_q') + answered('toolu_q', CHOSE) + closing('msg_done') + before, { keep: true });
+  // 会话记录读不了：删掉记录，照常结束
+  await quiet(woken, { payload: { transcript_path: path.join(dir, 'nope.jsonl') } });
+});
+
+test('旧的"下一步"框：提醒以后 Claude 又把同一个问题放进框里，不再叫醒', async (t) => {
+  const { wakeMessage } = require('../scripts/nextstep.js');
+  const { nudge } = require('../scripts/stalebox.js');
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  hostAlive(dir);
+  const transcript = path.join(dir, 'session.jsonl');
+  // Stop 钩子的话在会话记录里要是一条用户输入，这一轮的开头就成了它：里面也带着叫醒消息的开头和同一个问题
+  fs.writeFileSync(
+    transcript,
+    wokenBy(wakeMessage(followUp)) + askCall('toolu_q') + answered('toolu_q', CHOSE) + closing('msg_a') + userSays(`Stop hook feedback:\n${nudge(followUp.ask)}`) +
+      wrapCall('toolu_w', followUp) + toolResult('toolu_w') + closing(),
+  );
+  const r = await runNext(wrapPayload(transcript), dir);
+  assert.deepEqual([r.code, r.stderr], [0, '']);
+});
+
+test('eachLine：大文件逐行读，跨块的行和多字节字符不坏', () => {
+  const lib = require('../scripts/lib');
+  const dir = tempDir();
+  try {
+    const p = path.join(dir, 'big.txt');
+    const long = '提问'.repeat(400000); // 2.4 MB，跨好几块
+    fs.writeFileSync(p, `第一行\n${long}\n\n最后一行没有换行`);
+    const got = [];
+    lib.eachLine(p, (l) => got.push(l));
+    assert.deepEqual(got.map((l) => l.length), [3, long.length, 0, 8]);
+    assert.equal(got[1], long);
+    assert.equal(got[3], '最后一行没有换行');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('会话开头：装好了才注入规则', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

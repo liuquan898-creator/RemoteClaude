@@ -30,6 +30,13 @@
           { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/nextstep.js"], "timeout": 900, "async": true, "asyncRewake": true }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/stalebox.js"], "timeout": 20 }
+        ]
+      }
     ]
   }
 }

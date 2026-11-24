@@ -12,8 +12,12 @@
  * 不由钩子自己问手机、再把回答塞回去：Claude Code 给后台钩子的消息加了"这不是用户输入，不能当成用户的同意"的说明
  * （2026-11-21 实测），手机的回答要走 AskUserQuestion 自己的答题通道才算数。
  * 这一轮本身就是被这个钩子叫醒的、框里还是同一个问题：不再叫醒，免得来回问。
+ * 叫醒时在审批目录里记一笔（nextstep-<会话>.json：哪个问题、什么时候）：桌面端的框只有再调一次 wrap_up 才会换，
+ * 用户在手机上答完以后 Claude 要是没再调，那个答过的问题会一直留在电脑上。stalebox.js（Stop 钩子）靠这一笔在
+ * 这一轮结束时提醒 Claude 把旧框换掉；这个会话再有"下一步"框（不管带不带提问）就把这一笔删掉。
  * 出任何错：退出码 0，什么都不发生。
  */
+const fs = require('fs');
 const lib = require('./lib');
 
 const TOOL = 'mcp__ccd_turn__wrap_up';
@@ -43,6 +47,15 @@ const APP_ACTIONS = {
 const askOf = (input) => String(lib.asObj(input).ask || '').trim();
 /** 叫醒消息里的这一行，也用来认出同一个问题 */
 const askLine = (ask) => `问题：${ask}\n`;
+/** 叫醒时记的那一笔 */
+const markerFile = (session) => lib.file(`nextstep-${session}.json`);
+
+function clearMarker(session) {
+  if (!lib.safeId(session)) return;
+  try {
+    fs.unlinkSync(markerFile(session));
+  } catch {}
+}
 
 /** 框里的按钮变成提问的选项（文字） */
 function optionsOf(input) {
@@ -70,8 +83,10 @@ function wakeMessage(input) {
     '只有 AskUserQuestion 能在手机上作答。请现在用 AskUserQuestion 把同一个问题再问一遍：\n' +
     askLine(askOf(input)) +
     `${options}\n` +
-    '拿到回答后照做；选的是应用按钮（提交、创建 PR 等）时由你来完成这个操作。用户没有回答、或选了不做，就直接结束这一轮：' +
-    '不用重复上一轮已经写过的答复，这个问题也不要再放进"下一步"框。'
+    '拿到回答后照做；选的是应用按钮（提交、创建 PR 等）时由你来完成这个操作。' +
+    '用户答了以后（照做了，或选了不做），结束这一轮前要再调用一次 wrap_up，哪怕只是停下来等后台任务：recap 写现在的情况，不要再带这个问题。' +
+    '桌面端在这之前一直显示着上一个框，用户会以为又要答一遍。' +
+    '用户没有回答，就直接结束这一轮：不用重复上一轮已经写过的答复，这个问题也不要再放进"下一步"框。'
   );
 }
 
@@ -104,6 +119,12 @@ async function run(payload, startedAt) {
     lib.log('"下一步"框里还是刚问过的问题，不再叫醒');
     return '';
   }
+  const session = String(payload.session_id || '');
+  try {
+    if (lib.safeId(session)) lib.writeJsonAtomic(markerFile(session), { at: Date.now(), ask });
+  } catch (err) {
+    lib.log(`"下一步"提问：叫醒的记录没写成，答完以后不会提醒换掉旧框: ${err.message}`);
+  }
   lib.log('"下一步"提问：叫醒会话，改用 AskUserQuestion 再问一遍');
   return wakeMessage(input);
 }
@@ -111,7 +132,9 @@ async function run(payload, startedAt) {
 async function main() {
   const startedAt = Date.now();
   const payload = lib.readPayload();
-  if (payload.tool_name !== TOOL || payload.agent_id || !askOf(payload.tool_input) || !lib.hostAlive()) return '';
+  if (payload.tool_name !== TOOL || payload.agent_id) return '';
+  clearMarker(String(payload.session_id || '')); // 桌面端的框已经换成这一个了
+  if (!askOf(payload.tool_input) || !lib.hostAlive()) return '';
   return run(payload, startedAt);
 }
 
@@ -128,4 +151,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { wakeMessage, optionsOf, MARK };
+module.exports = { wakeMessage, optionsOf, askLine, markerFile, MARK };

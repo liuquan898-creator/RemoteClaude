@@ -3,7 +3,7 @@
  * RemoteClaude 插件的公共部分（说明见仓库 docs/09-approvals.md）：
  *   - 审批目录和文件交接：pending 由钩子写、done 由先作答的一方写（硬链接发布，只有第一个生效）
  *   - 被控端心跳：被控端没在运行时钩子什么都不做
- *   - 读钩子输入、读会话记录（会话标题、某次工具调用有没有结果、"下一步"框之后会话走到哪了）
+ *   - 读钩子输入、读会话记录（会话标题、某次工具调用有没有结果、"下一步"框之后会话走到哪了、从头逐行读）
  * 钩子绝不能因为这里出错而挡住 Claude Code，调用方都要兜住异常。
  */
 const fs = require('fs');
@@ -157,6 +157,31 @@ function readTail(p, bytes = TAIL_BYTES) {
     return [];
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/** 从头逐行读一个文件，不整个读进内存（会话记录能有几十 MB，单行能上 MB）；读不了就抛异常 */
+function eachLine(p, fn) {
+  const fd = fs.openSync(p, 'r');
+  try {
+    const chunk = Buffer.alloc(1 << 20);
+    let parts = []; // 跨块的那一行已经读到的部分
+    for (;;) {
+      const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (n <= 0) break;
+      const view = chunk.subarray(0, n);
+      let start = 0;
+      for (let nl = view.indexOf(10); nl >= 0; nl = view.indexOf(10, start)) {
+        const piece = view.subarray(start, nl);
+        fn(parts.length ? Buffer.concat([...parts, piece]).toString('utf8') : piece.toString('utf8'));
+        parts = [];
+        start = nl + 1;
+      }
+      if (start < n) parts.push(Buffer.from(view.subarray(start)));
+    }
+    if (parts.length) fn(Buffer.concat(parts).toString('utf8'));
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
@@ -408,6 +433,7 @@ module.exports = {
   asObj,
   isObj,
   readTail,
+  eachLine,
   sessionTitle,
   ToolUseWatch,
   TurnWatch,

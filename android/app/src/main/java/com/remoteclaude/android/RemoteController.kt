@@ -190,6 +190,8 @@ data class AppState(
     val pcLocked: Boolean = false,
     /** 电脑上装了解锁服务，可以从手机解锁 */
     val unlockAvailable: Boolean = false,
+    /** 电脑上的解锁服务核实不过（多半是旧版，要在电脑上重新安装），和"没装"分开提示 */
+    val unlockUntrusted: Boolean = false,
     val unlocking: Boolean = false,
     /** 电脑上的窗口平铺在运行（协议文档 4.7） */
     val tileAvailable: Boolean = false,
@@ -210,6 +212,7 @@ data class AppState(
         hostTooOld = false,
         pcLocked = hs?.lock?.locked == true,
         unlockAvailable = hs?.lock?.unlockAvailable == true,
+        unlockUntrusted = hs?.lock?.unlockUntrusted == true,
         tileAvailable = hs?.tile?.available == true,
         tilePaused = hs?.tile?.paused == true,
     )
@@ -317,9 +320,9 @@ class RemoteController(private val app: Application) {
     init {
         scope.launch {
             val stored = store.load()
-            // 打包时写进了服务器地址的正式版只连那个地址；调试版和没写地址的正式版可以自己填，没填过时用写进去的那个（可能是空的）
-            val server = if (BuildConfig.SERVER_EDITABLE) stored.server.ifEmpty { BuildConfig.SERVER_ADDRESS } else BuildConfig.SERVER_ADDRESS
-            val parsed = ServerAddress.parse(server, BuildConfig.ALLOW_CLEARTEXT) as? ServerAddress.Result.Ok
+            // App 里不带服务器地址，只用手机上存的（登录成功时存下的那个，见 ServerAddress.restore）
+            val server = stored.server
+            val parsed = ServerAddress.restore(server, BuildConfig.ALLOW_CLEARTEXT)
             wsUrl = parsed?.url
             httpBase = parsed?.httpBase
             session = stored.session
@@ -332,6 +335,8 @@ class RemoteController(private val app: Application) {
                 it.copy(
                     screen = if (loggedIn) Screen.Sessions else Screen.Auth,
                     serverInput = server,
+                    // 登录过、却没存下能用的服务器地址：说明一下为什么又回到了登录页
+                    authError = if (session != null && wsUrl == null) "请填写服务器地址后重新登录" else null,
                     email = stored.email,
                     hostId = stored.lastHost.ifEmpty { null },
                     settings = stored.settings,
@@ -585,6 +590,25 @@ class RemoteController(private val app: Application) {
                 canLock = it.canLock,
             )
         }
+    }
+
+    /**
+     * 设置里更换服务器：先退出旧服务器上的登录（通知旧服务器作废令牌），再记下新地址，回到登录页用新服务器上的账号登录，
+     * 登录后连新服务器。地址和现在的一样时什么都不做。返回不合法的原因，换好了（或没变）返回 null
+     */
+    fun changeServer(serverInput: String): String? {
+        val input = serverInput.trim()
+        val server = when (val r = ServerAddress.parse(input, BuildConfig.ALLOW_CLEARTEXT)) {
+            is ServerAddress.Result.Ok -> r
+            is ServerAddress.Result.Invalid -> return r.reason
+        }
+        if (server.url == wsUrl) return null
+        logout()
+        wsUrl = server.url
+        httpBase = server.httpBase
+        scope.launch { store.saveServer(input) }
+        update { it.copy(serverInput = input, authError = null, authInfo = "已换到 $input，请用这个服务器上的账号登录") }
+        return null
     }
 
     /** 令牌被服务器拒绝（在别处退出、重置了密码、过期）：清掉登录状态，回到登录页 */
@@ -1262,7 +1286,9 @@ class RemoteController(private val app: Application) {
         }
 
         override fun onLockState(session: PeerSession, state: LockState) {
-            if (session === peer) update { it.copy(pcLocked = state.locked, unlockAvailable = state.unlockAvailable) }
+            if (session === peer) {
+                update { it.copy(pcLocked = state.locked, unlockAvailable = state.unlockAvailable, unlockUntrusted = state.unlockUntrusted) }
+            }
         }
 
         override fun onUnlockResult(session: PeerSession, result: UnlockResult) {
@@ -1792,6 +1818,7 @@ class RemoteController(private val app: Application) {
         "locked" -> "电脑锁屏了，解锁后才能操作"
         "not-locked" -> "电脑没有锁屏"
         "no-service" -> "电脑上没装解锁服务"
+        "bad-service" -> "电脑上的解锁服务要重新安装（版本太旧或没通过核实）"
         "rate-limited" -> "失败次数太多，15 分钟后再试"
         "still-locked" -> "没解开，请检查密码或 PIN"
         "no-logon-screen" -> "没找到电脑的登录界面，没有输入密码"

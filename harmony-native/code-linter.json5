@@ -1,0 +1,44 @@
+{
+  "files": [
+    "**/*.ets"
+  ],
+  "ignore": [
+    "**/src/ohosTest/**/*",
+    "**/src/test/**/*",
+    "**/src/mock/**/*",
+    "**/node_modules/**/*",
+    "**/oh_modules/**/*",
+    "**/build/**/*",
+    "**/.preview/**/*"
+  ],
+  "ruleSet": [
+    "plugin:@performance/recommended",
+    "plugin:@typescript-eslint/recommended"
+  ],
+  "rules": {
+    "@security/no-unsafe-aes": "error",
+    "@security/no-unsafe-hash": "error",
+    "@security/no-unsafe-mac": "warn",
+    "@security/no-unsafe-dh": "error",
+    "@security/no-unsafe-dsa": "error",
+    "@security/no-unsafe-ecdsa": "error",
+    "@security/no-unsafe-rsa-encrypt": "error",
+    "@security/no-unsafe-rsa-sign": "error",
+    "@security/no-unsafe-rsa-key": "error",
+    "@security/no-unsafe-dsa-key": "error",
+    "@security/no-unsafe-dh-key": "error",
+    "@security/no-unsafe-3des": "error",
+    "@hw-stylistic/file-naming-convention": [
+      // 告警级别：枚举类型，支持配置为error，warn，off
+      "error",
+      {
+        // selector属性可选，支持配置为code或者resources
+        // code表示检查代码文件的命名风格
+        // resources表示检查资源文件的命名风格
+        "selector": "class",
+        // format属性必选，配置期望的命名风格，支持枚举值，这里配置的PascalCase表示大驼峰风格
+        "format": ["PascalCase"]
+      }
+    ]
+  }
+}

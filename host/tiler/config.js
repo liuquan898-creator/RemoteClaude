@@ -22,7 +22,7 @@ const DEFAULTS = Object.freeze({
   keep_monitor: false,
   rearrange_on_close: true,
   include_main_window: false,
-  hide_main_window: true,
+  hide_main_window: false,
   raise_all: true,
   raise_restores_minimized: true,
   skip_maximized: false,

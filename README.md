@@ -42,6 +42,7 @@
 | `server/` | 信令服务器（Node.js）。账号、邮件验证码、按账号转发信令、签发中继的临时凭据、托管网页和安装包 |
 | `web/` | 控制端网页，纯静态文件，无需构建 |
 | `android/` | 安卓控制端（Kotlin + Compose），构建和联调方法见 [android/README.md](android/README.md) |
+| `harmony-native/` | 鸿蒙原生控制端（ArkTS + ArkUI，HarmonyOS NEXT），功能对齐安卓 App，见 [10](docs/10-harmony-client.md) |
 | `claude-plugin/` | Claude Code 插件：把审批和提问交给被控端转到手机（[09](docs/09-approvals.md)） |
 | `deploy/` | 服务器部署用的文件：Docker 编排、Caddy 和 coturn 配置示例、打包配置样例 |
 | `scripts/` | 生成配置（`init-config.js`、`init-prod-config.js`）、发版本（`release.js`）、Claude 升级后的自检（`claude-selfcheck.js`） |
@@ -89,18 +90,18 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 
 ## 正式使用：用自己的服务器
 
-仓库里不带任何人的服务器地址。正式使用要自己搭服务器，再把服务器地址写进**本机的打包配置**，打出自己的安装包：
+仓库和安装包里都不带任何人的服务器地址。正式使用要自己搭服务器，装好 App 和被控端后在登录页填上自己的服务器地址：
 
 1. **部署服务器**：照下面"[部署到服务器](#部署到服务器)"一节做，得到自己的地址，比如 `https://rc.example.com`。
-2. **写打包配置**：部署时运行的 `scripts/init-prod-config.js` 会生成 `deploy/prod/build.json`（`deploy/prod/` 整个目录不入库），里面的 `server` 就是你的域名。也可以照 [deploy/build.example.json](deploy/build.example.json) 手写一份。各项说明见 [08](docs/08-release-and-update.md) 第 1 节。
+2. **写打包配置**（只有要用 `release.js` 上传安装包时才需要）：部署时运行的 `scripts/init-prod-config.js` 会生成 `deploy/prod/build.json`（`deploy/prod/` 整个目录不入库），填上 `releaseSsh`（安装包传到哪台服务器）。也可以照 [deploy/build.example.json](deploy/build.example.json) 手写一份。各项说明见 [08](docs/08-release-and-update.md) 第 1 节。服务器地址不写在这里，也不会写进安装包。
 3. **打安装包**（先 `npm run setup` 装好依赖；打 App 还要 JDK 17、Android SDK 和签名，见 [android/README.md](android/README.md) 和 [08](docs/08-release-and-update.md) 第 4 节）：
    ```powershell
    node scripts/release.js 1.0.0 --no-upload
    ```
-   `dist/` 里得到 `RemoteClaude-Host-Setup-x.y.z.exe`（电脑）和 `RemoteClaude-x.y.z.apk`（手机），服务器地址已经写在里面。版本号要比仓库里现在的大；只打一边加 `--only host` 或 `--only android`。去掉 `--no-upload` 就同时传到服务器的发布目录，已经装着的 App 和被控端会自动升级。
+   `dist/` 里得到 `RemoteClaude-Host-Setup-x.y.z.exe`（电脑）和 `RemoteClaude-x.y.z.apk`（手机），里面不带服务器地址，谁装都可以连自己的服务器。版本号要比仓库里现在的大；只打一边加 `--only host` 或 `--only android`。去掉 `--no-upload` 就同时传到服务器的发布目录，已经装着的 App 和被控端会自动升级。
 4. **安装**：
-   - **电脑**：运行安装程序，装在当前用户目录、开机自启；注册一个账号并登录。之后有新版本时，在没人看画面的时候自己重启升级。
-   - **手机**：装 apk，用同一个账号登录。之后 App 提示"有新版本"时点"更新"。
+   - **电脑**：运行安装程序，装在当前用户目录、开机自启。窗口的登录页上填服务器地址（`rc.example.com` 这样的域名就行），注册一个账号并登录。之后有新版本时，在没人看画面的时候自己重启升级，填过的地址和登录状态都保留。
+   - **手机**：装 apk，登录页填同一个服务器地址，用同一个账号登录。之后 App 提示"有新版本"时点"更新"。
    - **手机审批**：电脑上装一次 Claude Code 插件（电脑上要有 Node.js），之后 Claude 要审批或提问时手机会收到通知（详见 [09](docs/09-approvals.md)）：
      ```powershell
      claude plugin marketplace add <仓库所在目录>\claude-plugin
@@ -113,7 +114,11 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
      powershell -ExecutionPolicy Bypass -File host\unlock-service\install.ps1
      ```
 
-没写打包配置也能打包：这样打出来的 App 在登录页多一个"服务器地址"框，自己填；被控端第一次启动会提示在 `%APPDATA%\remote-claude-host\config.json` 里写服务器地址。
+没写打包配置也能打包（只是不能用 `release.js` 上传）。
+
+**更换服务器**：电脑上在被控端窗口点"更换服务器"（登录后在账号下面），或者右键托盘图标选"更换服务器…"；手机上在设置里点"更换服务器"。换了会退出旧服务器上的账号，回到登录页，用新服务器上的账号登录后连新服务器。
+
+**从带服务器地址的旧版升级**：0.9.25 及以前的被控端、0.9.8 及以前的 App 是把服务器地址打进安装包的。升级到不带地址的版本后照样连原来的服务器，不用重新填、也不用重新登录：被控端第一次启动时从登录状态（`account.json` 里记着登录的是哪个服务器）找回地址写进 `config.json`；App 用登录时存在手机上的地址。没登录过的要在登录页填一次。
 
 ## 控制端怎么操作
 
@@ -147,11 +152,11 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 
 ## 配置
 
-**被控端**：从源码运行读 `host/config.json`；装好的正式版读 `%APPDATA%\remote-claude-host\config.json`（没有就全用默认值，只写要改的项）。
+**被控端**：从源码运行读 `host/config.json`；装好的正式版读 `%APPDATA%\remote-claude-host\config.json`（没有就全用默认值，只写要改的项）。服务器地址一般不用手写：在被控端窗口里填或更换时，会写进这个文件的 `server`（别的项原样保留）。
 
 | 字段 | 说明 |
 |---|---|
-| `server` | 信令服务器地址，本机测试是 `ws://127.0.0.1:8787/ws`，部署后是 `wss://你的域名/ws`。账号接口地址由它推出。正式版不写就用打包时写进去的地址 |
+| `server` | 信令服务器地址，写法和手机 App 登录页一样：部署后只写域名（`rc.example.com`），本机测试写 `http://127.0.0.1:8787`。以前的 `wss://你的域名/ws`、`ws://127.0.0.1:8787/ws` 写法也认。账号接口地址由它推出。没有时被控端窗口显示登录页，让你填 |
 | `targets` | 允许远控的进程名，默认只有 `claude.exe` |
 | `maxBitrateKbps` | 视频码率上限，默认 10000。只有画面大面积变化时才用得到；服务器或手机流量紧就调低 |
 | `maxFps` | 帧率上限，默认 30。调到 60 滑动稍顺一点，但滑动时流量最多翻倍 |
@@ -180,14 +185,14 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 | `turn` | coturn 的地址和共享密钥，服务器据此签发 24 小时有效的临时凭据 |
 | `limits` | 可选，覆盖限流参数，见 `server/lib/config.js` |
 
-**打包**：`deploy/prod/build.json`，自己的服务器地址、安装包传到哪里，见 [08](docs/08-release-and-update.md) 第 1 节。
+**打包**：`deploy/prod/build.json`，安装包传到哪里、被控端的应用标识，见 [08](docs/08-release-and-update.md) 第 1 节。服务器地址不写进安装包。
 
 ## 窗口平铺
 
 被控端自带 Claude 会话窗口的自动平铺（从 [claude-window-tiler](https://github.com/liuquan898-creator/claude-window-tiler) 插件并进来、用 JavaScript 重写的，在 `host/tiler/`）。
 
 - 每个会话窗口固定占屏幕宽度的 1/3，从最左边的屏开始，一个屏从左到右放满 3 个再放右边的下一个屏；新开的排在最后，关掉的马上补位；最大化的也排进去，最小化的不占位置。先往哪个屏放可以在托盘菜单的"屏幕顺序"里选：从左到右（默认）、从右到左、主屏优先；屏有 2～3 个时还列出按屏幕序号的所有排法（屏 1 → 2 → 3、屏 2 → 3 → 1 ……）。
-- 新开会话后把 Claude 主窗口收到托盘；从任务栏或 Alt+Tab 切到 Claude 时，把所有会话窗口一起提到最前。被控端为远程输入切前台时不会这样做。
+- 新开会话后不再自动收起 Claude 主窗口（想要以前的效果，在配置文件里把 `hide_main_window` 改成 `true`）；从任务栏或 Alt+Tab 切到 Claude 时，把所有会话窗口一起提到最前。被控端为远程输入切前台时不会这样做。
 - 托盘菜单：立即重排、把所有会话提到最前、暂停自动平铺、屏幕顺序、打开配置文件。快捷键 Ctrl+Alt+Shift+T 立即重排。手机 App 画面页的"更多"菜单里也有重排、提到最前、暂停。
 - 配置文件是 `%USERPROFILE%\.claude-window-tiler\config.toml`，各项说明见文件里的注释，改完保存下次重排就生效（快捷键要重启被控端）。
 - 如果还装着原来的 claude-window-tiler 插件：它在运行时内置平铺不启动，免得两个一起挪窗口；每 30 秒再看一次，旧的退出后自动接手。不再需要旧插件时：
@@ -226,7 +231,7 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 - **剪贴板只同步文字**：只在看着画面时、只同步新复制的文字，图片和文件不同步；网页控制端没有。手机发过去的长文字、图片、文件路径不会再同步回来。
 - **最小化的窗口**被选中时会自动还原。
 - **浏览、打开、新建会话认的是 Claude 界面上的文字**，目前认简体中文和英文（英文没实测过），Claude 桌面端升级后可能要改，见 [07](docs/07-claude-sessions.md) 第 5、6 节。
-- 被控端只支持 Windows，控制端 App 只有安卓。
+- 被控端只支持 Windows。控制端 App 有安卓和鸿蒙（HarmonyOS NEXT）两个；鸿蒙版不能后台常驻，审批提醒靠华为推送，见 [10](docs/10-harmony-client.md)。
 
 ## 部署到服务器
 
@@ -277,6 +282,7 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 | [02 架构设计](docs/02-architecture.md) | 组件与流程、被控端实现要点、安全模型、技术选型、踩过的坑 |
 | [03 通信协议](docs/03-protocol.md) | 账号接口、信令消息、WebRTC 约定、输入事件格式 |
 | [04 安卓控制端设计](docs/04-android-client.md) | 技术栈、页面、手势、接入要点、验收标准 |
+| [10 鸿蒙原生控制端](docs/10-harmony-client.md) | 鸿蒙版的技术选型、和安卓的不同、构建签名、推送、升级、验收记录 |
 | [05 开发记录](docs/05-handoff-tasks.md) | 开发过程中的工作日志：每项功能怎么验证的、哪些没验证、任务清单。很长，按需查 |
 | [06 解锁服务](docs/06-unlock-service.md) | 从手机解锁电脑用的 Windows 服务：原理、安全措施、安装 |
 | [07 浏览和打开 Claude 会话](docs/07-claude-sessions.md) | 手机上浏览全部会话、打开和新建会话窗口：被控端怎么做到的、Claude 升级后怎么修 |
@@ -293,7 +299,7 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 - `server/data/`：本机测试时的账号数据库。
 - `deploy/prod/`：自己这套服务器的东西，只存在本机和服务器上：
   - `server.config.json`、`turnserver.conf`、`host.config.json`：由 `scripts/init-prod-config.js` 生成，含发信密码和 TURN 密钥。丢了就重新生成并替换服务器上的配置。
-  - `build.json`：打包配置，自己的服务器地址（样例 `deploy/build.example.json`）。
+  - `build.json`：打包配置，安装包传到哪里（样例 `deploy/build.example.json`）。
   - `mail.json`：发信配置。
   - 安卓正式版的签名文件（见 [08](docs/08-release-and-update.md) 第 4 节）。**签名文件要另外备份**，丢了就发不出能直接升级的安装包。
 - `android/keystore.properties`、`android/local.properties`：签名配置和本机的 SDK 路径。
@@ -303,6 +309,6 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
 
 ## 许可
 
-[MIT](LICENSE)。用到的第三方库（Electron、koffi、electron-updater、ws、nodemailer、OkHttp、Jetpack Compose、stream-webrtc-android 等）各有自己的许可证。
+[MIT](LICENSE)。用到的第三方库（Electron、koffi、electron-updater、ws、nodemailer、OkHttp、Jetpack Compose、stream-webrtc-android、@ohos/webrtc 等）各有自己的许可证。
 
 远程控制软件能操作你的电脑，请只连自己搭的、信得过的服务器；作者不对使用造成的损失负责。

@@ -14,20 +14,21 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
-/** wss://rc.example.com/ws -> https://rc.example.com */
-function httpBaseOf(wsUrl) {
-  const u = new URL(wsUrl);
-  const protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
-  return `${protocol}//${u.host}${u.pathname.replace(/\/ws\/?$/, '')}`;
-}
+const { httpBaseOf } = require('./serveraddress');
+
+/** 登录状态文件的名字（在用户数据目录里）。里面的 server 记着登录的是哪个服务器，升级时用来找回地址 */
+const AUTH_FILE = 'account.json';
+/** 退出登录时通知服务器最多等多久 */
+const LOGOUT_TIMEOUT_MS = 5000;
 
 class Account {
+  /** @param {string} serverWsUrl 信令地址；还没设置服务器时是空字符串，这时不能登录 */
   constructor(serverWsUrl) {
     this.httpBase = httpBaseOf(serverWsUrl);
     const dir = app.getPath('userData');
     fs.mkdirSync(dir, { recursive: true });
     this.deviceFile = path.join(dir, 'device.json');
-    this.authFile = path.join(dir, 'account.json');
+    this.authFile = path.join(dir, AUTH_FILE);
     this.deviceId = this.loadDeviceId();
     // RC_HOST_DEVICE_NAME 仅供测试：在同一台电脑上模拟多台电脑时区分名字
     this.deviceName = (process.env.RC_HOST_DEVICE_NAME || os.hostname()).slice(0, 64) || '电脑';
@@ -47,6 +48,7 @@ class Account {
   }
 
   loadAuth() {
+    if (!this.httpBase) return null;
     try {
       const saved = JSON.parse(fs.readFileSync(this.authFile, 'utf8'));
       // 换了服务器地址，旧令牌就没用了
@@ -75,6 +77,7 @@ class Account {
   }
 
   async login(email, password) {
+    if (!this.httpBase) return { error: '还没有设置服务器地址' };
     let res;
     try {
       res = await net.fetch(`${this.httpBase}/api/auth/login`, {
@@ -110,11 +113,13 @@ class Account {
   async logout() {
     const s = this.state;
     this.clear();
-    if (!s) return;
+    if (!s || !this.httpBase) return;
     try {
+      // 换服务器时要等这一步，旧服务器连不上也别让人干等
       await net.fetch(`${this.httpBase}/api/auth/logout`, {
         method: 'POST',
         headers: { authorization: `Bearer ${s.token}` },
+        signal: AbortSignal.timeout(LOGOUT_TIMEOUT_MS),
       });
     } catch {
       /* 令牌会在服务器上自然过期 */
@@ -122,4 +127,4 @@ class Account {
   }
 }
 
-module.exports = { Account, httpBaseOf };
+module.exports = { Account, httpBaseOf, AUTH_FILE };

@@ -1,0 +1,3 @@
+# @ohos/webrtc 的原生接口靠名字绑定，不能混淆
+-keep
+./oh_modules/@ohos/webrtc

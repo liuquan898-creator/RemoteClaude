@@ -1,4 +1,3 @@
-import groovy.json.JsonSlurper
 import java.util.Properties
 
 plugins {
@@ -15,16 +14,7 @@ val releaseKeystore = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
-// 自己的服务器地址不写在仓库里，从本机的打包配置读：仓库根目录的 deploy/prod/build.json（不入库，
-// 环境变量 RC_BUILD_CONFIG 可以指到别的文件），样例见 deploy/build.example.json，和被控端打包读的是同一个文件。
-// 配了 server：地址写进 App，正式版登录页不显示地址框。没配：正式版登录页也显示"服务器地址"框，自己填
-val serverAddress: String = run {
-    val f = System.getenv("RC_BUILD_CONFIG")?.takeIf { it.isNotBlank() }?.let { file(it) }
-        ?: rootProject.file("../deploy/prod/build.json")
-    val json = if (f.exists()) JsonSlurper().parse(f) as? Map<*, *> else null
-    (json?.get("server") as? String).orEmpty().trim()
-}
-require(serverAddress.none { it == '"' || it == '\\' }) { "打包配置里的 server 不能带引号或反斜杠: $serverAddress" }
+// 服务器地址不写进 App：调试版和正式版的登录页都有"服务器地址"框，填过的地址存在手机上，设置里可以改（docs/08 第 1 节）
 
 android {
     namespace = "com.remoteclaude.android"
@@ -37,8 +27,6 @@ android {
         targetSdk = 36
         versionCode = 20
         versionName = "0.9.8"
-        // 打包配置里的服务器地址（见上面），没配是空字符串
-        buildConfigField("String", "SERVER_ADDRESS", "\"$serverAddress\"")
         // 只打包 64 位 ARM 和模拟器用的 x86_64，WebRTC 的原生库很大
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
@@ -56,15 +44,12 @@ android {
 
     buildTypes {
         debug {
-            // 调试版允许 ws:// 明文连接、允许改服务器地址，方便连局域网或模拟器里的本机服务器
+            // 调试版允许 ws:// 明文连接，方便连局域网或模拟器里的本机服务器
             buildConfigField("boolean", "ALLOW_CLEARTEXT", "true")
-            buildConfigField("boolean", "SERVER_EDITABLE", "true")
             applicationIdSuffix = ".debug"
         }
         release {
             buildConfigField("boolean", "ALLOW_CLEARTEXT", "false")
-            // 写进了服务器地址就不让改；没写就得让用户自己填
-            buildConfigField("boolean", "SERVER_EDITABLE", if (serverAddress.isEmpty()) "true" else "false")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")

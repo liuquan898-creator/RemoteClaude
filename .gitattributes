@@ -1,5 +1,7 @@
 # 仓库里统一存 LF，检出时按各平台习惯转换（服务器端代码要在 Linux 上跑）
 * text=auto
+# Git Bash 下运行的脚本：Windows 上检出成 CRLF 时 bash 会把 \r 当成命令的一部分
+*.sh text eol=lf
 *.png binary
 *.jpg binary
 *.ico binary

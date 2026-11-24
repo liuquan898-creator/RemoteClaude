@@ -10,6 +10,8 @@ import java.net.URISyntaxException
  *   https://rc.example.com     -> wss://rc.example.com/ws      https://rc.example.com
  *   ws://10.0.2.2:8787         -> ws://10.0.2.2:8787/ws        http://10.0.2.2:8787   （仅调试版允许明文）
  *   wss://rc.example.com/rc/ws -> wss://rc.example.com/rc/ws   https://rc.example.com/rc
+ *
+ * App 里不带任何服务器地址（docs/08 第 1 节）：登录页填，登录成功时存在手机上，设置里可以换。
  */
 object ServerAddress {
     sealed interface Result {
@@ -48,4 +50,10 @@ object ServerAddress {
         val basePath = path.removeSuffix("/").removeSuffix("/ws")
         return Result.Ok("$wsScheme://$host$port$path", "$httpScheme://$host$port$basePath")
     }
+
+    /**
+     * 启动时用手机上存的地址。以前的正式版把打包时写进去的地址填在登录页里，登录成功时连同令牌一起存了下来，
+     * 所以升级到不带地址的版本后照样能连；没存过（或存的不合法）返回 null，回登录页让用户填
+     */
+    fun restore(stored: String, allowCleartext: Boolean): Result.Ok? = parse(stored, allowCleartext) as? Result.Ok
 }

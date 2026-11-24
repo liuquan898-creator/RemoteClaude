@@ -11,6 +11,8 @@
     <h1>RemoteClaude 被控端</h1>
     <p class="muted">用和手机上同一个账号登录，手机就能看到并操作这台电脑上的 Claude 会话。</p>
     <form id="loginForm" class="card">
+      <label>服务器地址<input id="serverInput" type="text" placeholder="rc.example.com" autocomplete="url" spellcheck="false" required></label>
+      <p id="serverHint" class="muted small hint">填信令服务器的域名或地址，例如 rc.example.com、wss://rc.example.com/ws；本机测试填 ws://127.0.0.1:8787/ws。和手机上填的是同一个服务器。</p>
       <label>邮箱<input id="email" type="email" autocomplete="username" required></label>
       <label>密码<input id="password" type="password" autocomplete="current-password" required></label>
       <button id="loginBtn" type="submit" class="primary">登录</button>
@@ -22,7 +24,6 @@
       <a href="#" id="toForgot">忘记密码</a>
       <span class="muted">（在浏览器里打开）</span>
     </p>
-    <p class="muted small">服务器：<span id="loginServer"></span></p>
   </section>
 
   <section id="mainView" hidden>
@@ -39,6 +40,19 @@
       <span>账号 <strong id="accountEmail"></strong> · 本机名 <strong id="deviceName"></strong></span>
       <button id="logout">退出登录</button>
     </div>
+    <div class="account card">
+      <span>服务器 <strong id="serverName"></strong></span>
+      <button id="changeServer">更换服务器</button>
+    </div>
+    <form id="serverForm" class="card" hidden>
+      <label>新的服务器地址<input id="newServer" type="text" placeholder="rc.example.com" autocomplete="url" spellcheck="false" required></label>
+      <p class="muted small hint">换服务器会退出现在的账号，之后用新服务器上的账号重新登录。</p>
+      <p id="serverError" class="error" hidden></p>
+      <div class="row">
+        <button type="submit" class="primary">更换并重新登录</button>
+        <button type="button" id="cancelServer">取消</button>
+      </div>
+    </form>
 
     <h2>正在远程查看的设备</h2>
     <div id="viewers" class="card muted">暂无</div>

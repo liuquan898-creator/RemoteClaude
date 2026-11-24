@@ -16,14 +16,14 @@ const { createApp } = require('./lib/app');
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 let cfg;
+let app;
 try {
   cfg = loadConfig(process.env.RC_CONFIG || path.join(__dirname, 'config.json'));
+  app = createApp(cfg, { log }); // 推送密钥文件读不出来时也在这里报错退出
 } catch (err) {
   console.error(err.message);
   process.exit(1);
 }
-
-const app = createApp(cfg, { log });
 
 app.listen(cfg.port, cfg.bind).then(() => {
   log(`RemoteClaude 信令服务器已启动: http://${cfg.bind}:${cfg.port}  (网页目录 ${cfg.webDir}，数据目录 ${cfg.dataDir})`);
@@ -36,6 +36,12 @@ app.listen(cfg.port, cfg.bind).then(() => {
     );
   }
   if (!cfg.registrationOpen) log('提示: 已关闭注册，只有现有账号能登录。');
+  const hw = cfg.push.huawei;
+  if (app.push.enabled) {
+    log(`华为推送已启用：类别 ${hw.category}${hw.testMessage ? '，测试消息（每个项目每天最多 1000 条）' : ''}`);
+  } else {
+    log('提示: 未配置华为推送，鸿蒙 App 没开着时收不到审批通知。');
+  }
   if (!cfg.turn || !cfg.turn.secret) log('提示: 未配置 TURN，只有双方能直连时才看得到画面（本机/局域网测试不受影响）。');
 });
 

@@ -69,6 +69,7 @@ function normalizeConfig(raw, baseDir) {
     iceServers: Array.isArray(raw.iceServers) ? raw.iceServers : [],
     turn: raw.turn && typeof raw.turn === 'object' ? raw.turn : null,
     limits: { ...DEFAULT_LIMITS, ...(raw.limits && typeof raw.limits === 'object' ? raw.limits : {}) },
+    push: { huawei: normalizeHuaweiPush(raw.push, baseDir) },
   };
 
   const REQUIRED = {
@@ -83,6 +84,45 @@ function normalizeConfig(raw, baseDir) {
   const missing = REQUIRED[cfg.mail.mode].filter((k) => !cfg.mail[k]);
   if (missing.length) throw new Error(`mail.mode 为 ${cfg.mail.mode} 时要填 ${missing.join('、')}`);
   return cfg;
+}
+
+/**
+ * 华为推送（docs/09 第 10 节）。可选：没有 push.huawei、或 enabled 为 false 时不推送。
+ * 环境变量 RC_PUSH_HUAWEI_KEY_FILE、RC_PUSH_HUAWEI_PROJECT_ID 优先于配置文件（容器里把密钥文件挂进去用）。
+ * 密钥文件在启动时（app.js）读，读不出来服务器起不来。
+ * @returns {null | { projectId: string, serviceAccountFile: string, category: string, testMessage: boolean,
+ *                    showDetail: boolean, ttl: number, maxPerHour: number, apiBase: string, timeoutMs: number }}
+ */
+function normalizeHuaweiPush(push, baseDir) {
+  const hw = push && typeof push === 'object' && push.huawei && typeof push.huawei === 'object' ? push.huawei : null;
+  const envFile = process.env.RC_PUSH_HUAWEI_KEY_FILE || '';
+  const envProject = process.env.RC_PUSH_HUAWEI_PROJECT_ID || '';
+  if (hw && hw.enabled === false) return null;
+  if (!hw && !envFile) return null;
+  const src = hw || {};
+  const serviceAccountFile = envFile
+    ? path.resolve(envFile)
+    : src.serviceAccountFile
+      ? path.resolve(baseDir, String(src.serviceAccountFile))
+      : '';
+  if (!serviceAccountFile) throw new Error('push.huawei 要填 serviceAccountFile（AppGallery Connect 下载的服务账号密钥文件路径），或设环境变量 RC_PUSH_HUAWEI_KEY_FILE');
+  const category = String(src.category || 'MARKETING').toUpperCase();
+  if (!/^[A-Z_]+$/.test(category)) throw new Error(`push.huawei.category 不对: ${category}`);
+  const ttl = Number(src.ttl ?? 86400);
+  if (!Number.isInteger(ttl) || ttl < 1 || ttl > 1296000) throw new Error('push.huawei.ttl 是 1～1296000 的整数（秒）');
+  return {
+    // 不填时用密钥文件里的 project_id
+    projectId: envProject || (src.projectId ? String(src.projectId) : ''),
+    serviceAccountFile,
+    category,
+    testMessage: src.testMessage !== false,
+    // 默认 false：通知只说有一条审批。true 时带工具名、会话名和命令、问题原文，会经过华为服务器、显示在锁屏上
+    showDetail: src.showDetail === true,
+    ttl,
+    maxPerHour: Number(src.maxPerHour) > 0 ? Number(src.maxPerHour) : 60,
+    apiBase: src.apiBase ? String(src.apiBase) : 'https://push-api.cloud.huawei.com',
+    timeoutMs: Number(src.timeoutMs) > 0 ? Number(src.timeoutMs) : 10000,
+  };
 }
 
 module.exports = { loadConfig, normalizeConfig, DEFAULT_LIMITS };

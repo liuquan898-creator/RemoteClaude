@@ -33,7 +33,7 @@ writeIfMissing(serverCfg, {
 });
 
 writeIfMissing(hostCfg, {
-  server: 'ws://127.0.0.1:8787/ws',
+  server: 'http://127.0.0.1:8787',
   targets: ['claude.exe'],
   maxBitrateKbps: 4000,
   maxFps: 30,

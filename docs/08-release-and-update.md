@@ -6,11 +6,10 @@
 
 ### 打包配置
 
-自己的服务器地址、安装包传到哪里，这些因人而异，不写在仓库里，放在本机的 `deploy/prod/build.json`（`deploy/prod/` 整个目录不入库）。部署时运行的 `scripts/init-prod-config.js` 会生成一份，也可以照 `deploy/build.example.json` 手写：
+安装包传到哪里、被控端的应用标识，这些因人而异，不写在仓库里，放在本机的 `deploy/prod/build.json`（`deploy/prod/` 整个目录不入库）。部署时运行的 `scripts/init-prod-config.js` 会生成一份，也可以照 `deploy/build.example.json` 手写：
 
 ```json
 {
-  "server": "rc.example.com",
   "hostAppId": "com.example.remoteclaude.host",
   "releaseSsh": "my-server",
   "releaseDir": "/opt/remote-claude/releases",
@@ -22,15 +21,25 @@
 
 | 项 | 说明 |
 |---|---|
-| `server` | 自己的信令服务器，写域名或完整地址（`wss://rc.example.com/ws`）。打包时写进 App（`BuildConfig.SERVER_ADDRESS`）和被控端（装好的程序的 `package.json` 里的 `defaultServer`），装好就连它 |
 | `hostAppId` | 被控端安装程序的应用标识，不写用 `com.remoteclaude.host`。**定了就别再改**：安装程序靠它认出电脑上的旧版本，改了会装出两份 |
 | `releaseSsh` | `release.js` 把安装包传到哪台服务器：`ssh` 能直接连上的名字，比如 `~/.ssh/config` 里的别名，登录的用户要能免密 `sudo` |
 | `releaseDir` | 服务器上的发布目录，不写用 `/opt/remote-claude/releases` |
 | `env` | 打包时额外设的环境变量。从 GitHub 下载 Electron 和打包工具卡住时，在这里设镜像（`ELECTRON_MIRROR`、`ELECTRON_BUILDER_BINARIES_MIRROR`） |
 
-三处读这个文件：`scripts/release.js`、`host/electron-builder.config.js`（被控端打包）、`android/app/build.gradle.kts`（App 构建），前两处经 `scripts/build-config.js`。环境变量 `RC_BUILD_CONFIG` 可以指到别的文件。
+两处读这个文件，都经 `scripts/build-config.js`：`scripts/release.js`、`host/electron-builder.config.js`（被控端打包）。App 构建不读它。环境变量 `RC_BUILD_CONFIG` 可以指到别的文件。没有这个文件也能打包，只是 `release.js` 要加 `--no-upload`（不知道传到哪里）。
 
-没有这个文件、或者没写 `server` 也能打包（`release.js` 要加 `--no-upload`），打出来的安装包不带服务器地址：App 的登录页多一个"服务器地址"框；被控端要在 `%APPDATA%\remote-claude-host\config.json` 里写 `server`，没写的话启动时弹框提示。这样的安装包 `release.js` 不让上传：已经装着的 App 和被控端自动升级成它以后就不知道连哪里了。
+**服务器地址不写进任何安装包。** 以前的 `server` 项不再使用（`release.js` 读到了会提示可以删掉），App 和被控端打出来都一样，谁装都能连自己的服务器：
+
+- **App**：登录页一直有"服务器地址"框，登录成功时存在手机上，下次自动填上；设置里"更换服务器"可以换（退出旧服务器上的账号，回登录页）。
+- **被控端**：窗口的登录页有"服务器地址"框；登录后在窗口里点"更换服务器"、或者托盘菜单"更换服务器…"可以换（同样退出旧账号、回登录页）。填的地址写进用户自己的 `%APPDATA%\remote-claude-host\config.json` 的 `server`，别的设置不动。没设置时启动后显示登录页、地址框空着并提示要填，不再弹框退出。
+- 接受的写法两边一样：`rc.example.com`、`https://rc.example.com`、`wss://rc.example.com/ws`、`ws://127.0.0.1:8787/ws`（明文 `ws://` 只有被控端和调试版 App 认），都整理成信令地址 `wss://…/ws`（或 `ws://…/ws`）去连。被控端在主进程里整理和检查（`host/serveraddress.js`），只认 ws/wss；窗口里显示、`config.json` 里存的是和手机 App 一样的简写（`rc.example.com`，明文的是 `http://127.0.0.1:8787`）。
+
+**从带地址的旧版升级**（被控端 0.9.25 及以前、App 0.9.8 及以前是把 `server` 打进安装包的，用户的 `config.json` 里一般没有 `server`）。升级上来照样连原来的服务器，不用重新填、也不用重新登录：
+
+- 被控端：配置里没有 `server` 时，读登录状态 `account.json` 里记的服务器（`"server": "https://rc.example.com"`，登录时写的），换算成信令地址去连，第一次启动就以简写 `rc.example.com` 写进 `config.json`。之后哪怕退出登录也记得服务器。没登录过（没有 `account.json`）的要在登录页填一次。配置里写了 `server` 但写错了，不会拿登录状态里的顶上，登录页显示原因让用户改。
+- App：旧正式版虽然登录页不显示地址框，登录时也把打包写进去的地址和令牌一起存在了手机上（`SettingsStore` 的 `server`），新版启动时直接用它。万一没存（有令牌但没有地址），回登录页并提示"请填写服务器地址后重新登录"。
+
+所以发不带地址的新版本可以直接上传，`release.js` 不再要求打包配置里有 `server`。
 
 ### 一条命令
 
@@ -56,7 +65,7 @@ node scripts/release.js 0.7.1 --notes "这次改了什么"
 
 ```powershell
 git worktree add --detach $env:TEMP\rc-rel HEAD
-# 不入库的东西要补上：打包配置（没有它打出来的包不带服务器地址，脚本也不让上传），把 deploy\prod\build.json 拷过去，
+# 不入库的东西要补上：打包配置（没有它脚本不知道传到哪里，也不让上传；被控端的应用标识也在里面），把 deploy\prod\build.json 拷过去，
 # 或者设环境变量 RC_BUILD_CONFIG 指到原目录里那份；
 # android\local.properties；android\keystore.properties（storeFile 改成签名文件的绝对路径）；
 # host\node_modules 整个拷过去（robocopy /E），或者在副本里 npm ci
@@ -82,13 +91,16 @@ cd $env:TEMP\rc-rel; node scripts/release.js 0.9.6 --only host --notes "…"
 被控端现在做成了 Windows 安装程序（`RemoteClaude-Host-Setup-x.y.z.exe`），装在当前用户目录 `%LOCALAPPDATA%\Programs\remote-claude-host`，不需要管理员权限。
 
 - **第一次安装**：从 `dist/` 拿安装程序双击运行（没有代码签名，Windows 可能提示"已保护你的电脑"，点"更多信息"→"仍要运行"）。装好会自动启动，第一次运行时打开开机自启。
-- **配置**：装好的版本默认连打包时写进去的服务器（打包配置里的 `server`，见第 1 节）。要改服务器等设置，在 `%APPDATA%\remote-claude-host\config.json` 里写，格式同 `host/config.example.json`，只写要改的项。打包时没写服务器、这里也没写，启动时会弹框提示。
+- **服务器地址**：安装包里不带。第一次装好后在窗口的登录页填，之后从窗口的"更换服务器"或托盘菜单"更换服务器…"改；都写进 `%APPDATA%\remote-claude-host\config.json` 的 `server`。从带地址的旧版（0.9.25 及以前）升级上来的，第一次启动时从登录状态找回原来的服务器写进去，不用重新登录（见第 1 节）。
+- **其它配置**：在同一个 `config.json` 里写，格式同 `host/config.example.json`，只写要改的项。文件写坏了（不是合法的 JSON）启动时弹框说明，不会被覆盖。
 - **登录状态**：开发版（`npm start` 从源码运行）和安装版用同一个数据目录 `%APPDATA%\remote-claude-host`，换成安装版不用重新登录，服务器上还是同一台电脑。两个不能同时运行，后启动的会直接退出。
 - **自动升级**：启动 1 分钟后检查一次，之后每 4 小时一次，从服务器的 `/download/host/latest.yml` 查版本（带被控端的登录令牌）。有新版本就在后台下载完整安装包（约 110 MB），下好后等没人在看画面时静默安装、自动重新启动；有人在看就一直等到大家都退出画面。
 - **马上升级**：托盘菜单里显示当前版本和升级状态，有"检查更新""立即升级到 x.y.z"和"开机自动启动"；手机 App 的设置里显示电脑被控端的版本和状态，可以"检查更新"或"立即升级"（协议文档 2.6）。马上升级时正在看画面的连接会断开，被控端重启后手机自动重连。
 - 从源码运行的开发版不自动升级，手机设置里显示"从源码运行的开发版"。
 
 解锁服务（docs/06）是单独装的 Windows 服务，不随被控端升级；要改它时照旧用 `host/unlock-service/install.ps1` 重新安装。
+
+**升级顺序：先装新的解锁服务，再升被控端。** 被控端 0.9.25 起会核实解锁服务，之前装的旧服务过不了核实，手机就解不了锁；被控端又是自动升级的，人不在电脑前时发现不了。所以发布 0.9.25 及以后的被控端之前，先在每台要从手机解锁的电脑上重新运行 `install.ps1`（新服务兼容旧被控端）。顺序反了时，手机上会提示"电脑上的解锁服务要重新安装"（被控端 0.9.28 起），只能回到电脑前解锁、重装服务。已经自动升到 0.9.25～0.9.27、手机上显示"没装解锁服务"的电脑也是这种情况，同样要在电脑上重装服务。详见 [06](06-unlock-service.md) 的"升级"。
 
 **注意：别从 Claude 桌面端的会话里启动被控端。** Claude 桌面端是商店版（MSIX）应用，从它的 Claude Code 会话里启动的程序（包括 Claude 替你运行的命令）写 `%APPDATA%` 时会被系统悄悄转到 `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\` 下。这样启动的被控端把登录状态存在那里，正常启动（开机自启、安装程序、双击快捷方式）的被控端看不到，就会显示登录页、换一个设备编号。2026-11-19 切换到安装版时就遇到了：之前 Claude 替用户启动的开发版把登录状态存在了转向的目录里，切换时把其中的 `account.json`、`device.json`、`Local State` 复制到了真正的 `%APPDATA%\remote-claude-host`。以后要由 Claude 重启被控端，用不经过 Claude 的方式启动，比如 `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '"<安装目录>\RemoteClaude Host.exe"' }`（WMI 起的进程不在 Claude 的容器里）。
 

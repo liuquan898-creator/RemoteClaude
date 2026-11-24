@@ -39,3 +39,10 @@ Thumbs.db
 
 # 安卓正式版签名配置（指向 deploy/prod 里的签名文件）
 android/keystore.properties
+
+# 鸿蒙签名用的证书、密钥库、证书请求，以及 AppGallery Connect 的应用配置（DevEco 自动签名生成在本机，不入库）
+*.p12
+*.cer
+*.p7b
+*.csr
+agconnect-services.json

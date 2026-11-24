@@ -1,5 +1,5 @@
 {
-  "server": "ws://127.0.0.1:8787/ws",
+  "server": "http://127.0.0.1:8787",
   "targets": ["claude.exe"],
   "maxBitrateKbps": 10000,
   "maxFps": 30,

@@ -23,10 +23,10 @@ const {
   dialog,
 } = require('electron');
 const fs = require('fs');
-const net = require('net');
 const path = require('path');
 const win32 = require('./win32');
-const { Account } = require('./account');
+const { Account, AUTH_FILE } = require('./account');
+const serverAddress = require('./serveraddress');
 const files = require('./files');
 const { isClosable } = require('./sessions');
 const { sortByPosition } = require('./winorder');
@@ -34,12 +34,6 @@ const { createLogFile, teeConsole } = require('./logfile');
 const { createClipWatch } = require('./clipwatch');
 
 const MAX_TEXT = 20000;
-/**
- * 装好的正式版默认连的服务器；用户数据目录里的 config.json 可以改。
- * 地址不写在源码里：打包时从本机的打包配置写进 package.json 的 defaultServer（见 electron-builder.config.js），
- * 没配就是空的，装好后要在 config.json 里写 server
- */
-const DEFAULT_SERVER = String(require('./package.json').defaultServer || '');
 
 // 用户数据目录（登录状态、设备编号）固定为 %APPDATA%\remote-claude-host，开发版和装好的正式版共用，
 // 换成安装版不用重新登录，也还是同一台电脑。两个同时启动时，后启动的会因为单实例锁退出。
@@ -54,25 +48,25 @@ app.setPath(
 teeConsole(createLogFile(path.join(app.getPath('userData'), 'logs', 'host.log')));
 console.log(`被控端 ${app.getVersion()} 启动（进程 ${process.pid}）`);
 
-/** 配置文件：开发版是 host/config.json；装好的正式版在用户数据目录里，没有就全用默认值 */
+/**
+ * 配置文件：开发版是 host/config.json；装好的正式版在用户数据目录里，没有就全用默认值。
+ * 服务器地址（server）也在这里：在窗口里填或改了会写回这个文件（只改 server，别的设置不动）
+ */
 const CONFIG_PATH =
   process.env.RC_HOST_CONFIG || (app.isPackaged ? path.join(app.getPath('userData'), 'config.json') : path.join(__dirname, 'config.json'));
 
 function loadConfig() {
   let raw;
   try {
-    raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    raw = serverAddress.readConfig(CONFIG_PATH);
   } catch (err) {
-    if (app.isPackaged && err.code === 'ENOENT') {
-      raw = {};
-    } else {
-      console.error(`读取配置失败: ${CONFIG_PATH}\n${err.message}\n先在项目根目录运行 "node scripts/init-config.js" 生成配置。`);
-      process.exit(1);
-    }
+    const msg = `读取配置失败: ${CONFIG_PATH}\n${err.message}\n改好或删掉这个文件后重新打开。`;
+    console.error(msg);
+    // 装好的正式版没有控制台，不弹个框的话双击了什么反应都没有
+    if (app.isPackaged) dialog.showErrorBox('RemoteClaude 被控端', msg);
+    process.exit(1);
   }
-  if (app.isPackaged && !raw.server) raw.server = DEFAULT_SERVER;
   const cfg = {
-    server: String(raw.server || ''),
     targets: (Array.isArray(raw.targets) && raw.targets.length ? raw.targets : ['claude.exe']).map((s) => String(s).toLowerCase()),
     // 默认值见 docs/05 的 2.14：满屏文字滚动时 VP8 一帧要 90KB 上下，VP9 同样带宽下能稳定 30 帧
     maxBitrateKbps: Number(raw.maxBitrateKbps) || 10000,
@@ -91,20 +85,28 @@ function loadConfig() {
     // Claude 桌面端的日志文件，不写就自己找
     claudeLogFile: raw.claudeLogFile ? path.resolve(String(raw.claudeLogFile)) : '',
   };
-  if (!/^wss?:\/\//.test(cfg.server)) {
-    const msg = cfg.server
-      ? `配置不完整: server 必须是 ws:// 或 wss:// 地址。\n${CONFIG_PATH}`
-      : `还没有设置服务器地址。\n\n在下面这个文件里写上你的信令服务器地址，然后重新打开：\n${CONFIG_PATH}\n\n内容形如：\n{ "server": "wss://rc.example.com/ws" }`;
-    console.error(msg);
-    // 装好的正式版没有控制台，不弹个框的话双击了什么反应都没有
-    if (app.isPackaged) dialog.showErrorBox('RemoteClaude 被控端', msg);
-    process.exit(1);
-  }
   if (raw.hostToken) console.warn('提示: hostToken 已不再使用，被控端改为用账号登录，可以从配置里删掉。');
-  return cfg;
+  return { cfg, configuredServer: raw.server };
 }
 
-const cfg = loadConfig();
+const loaded = loadConfig();
+const cfg = loaded.cfg;
+/**
+ * 现在连的服务器。安装包里不带地址（docs/08 第 1 节）：配置文件里没写 server 时，从上次的登录状态找回
+ * （旧版安装包升级上来的情况，见 serveraddress.js 的 resolveServer），都没有就空着，窗口里显示登录页让用户填。
+ *   url     整理好的 ws:// 或 wss:// 地址，没设置时为空
+ *   input   登录页地址框里预填的内容
+ *   notice  给用户看的问题说明（比如配置文件里的地址写错了）
+ *   migrate 地址是从登录状态找回的，启动后要写进配置文件
+ */
+const serverState = (() => {
+  const r = serverAddress.resolveServer({
+    configured: loaded.configuredServer,
+    accountServer: serverAddress.readAccountServer(path.join(app.getPath('userData'), AUTH_FILE)),
+  });
+  if (r.error) console.error(`${r.error}（${CONFIG_PATH}）`);
+  return { url: r.server, input: r.input, notice: r.error, migrate: r.source === 'account' };
+})();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 被控端窗口经常在后台或被挡住，不能让 Chromium 因此降频，否则画面会卡
@@ -199,6 +201,7 @@ function trayMenu() {
   }
   return Menu.buildFromTemplate([
     { label: '显示窗口', click: showWindow },
+    { label: '更换服务器…', click: editServer },
     { type: 'separator' },
     ...tileItems,
     ...updateMenuItems(),
@@ -210,6 +213,15 @@ function trayMenu() {
       },
     },
   ]);
+}
+
+/** 托盘菜单"更换服务器…"：打开窗口，让页面显示改地址的输入框（没登录时就是登录页的地址框） */
+function editServer() {
+  showWindow();
+  const wc = mainWindow && mainWindow.webContents;
+  if (!wc) return;
+  if (wc.isLoading()) wc.once('did-finish-load', () => wc.send('rc:edit-server'));
+  else wc.send('rc:edit-server');
 }
 
 function refreshTrayMenu() {
@@ -267,7 +279,8 @@ function createWindow() {
 
 app.whenReady().then(() => {
   if (!gotLock) return;
-  account = new Account(cfg.server);
+  persistMigratedServer();
+  account = new Account(serverState.url);
   setupAutoStart();
   createUpdater();
   approvals.start();
@@ -313,6 +326,21 @@ app.on('window-all-closed', () => {
   if (quitting) app.quit();
 });
 
+/**
+ * 从旧版升级上来、配置文件里没有 server 时，把从登录状态找回的地址写进配置文件，以后启动就不再依赖登录状态。
+ * 写不进去也照样用这个地址连，下次启动再试
+ */
+function persistMigratedServer() {
+  if (!serverState.migrate) return;
+  try {
+    serverAddress.saveServer(CONFIG_PATH, serverState.url);
+    serverState.migrate = false;
+    console.log(`配置里没有服务器地址，按上次登录的服务器补上: ${serverAddress.displayOf(serverState.url)}（${CONFIG_PATH}）`);
+  } catch (err) {
+    console.error(`把服务器地址写进配置文件失败（这次照样连 ${serverState.url}）: ${err.message}`);
+  }
+}
+
 // 页面把连接状态告诉主进程，用来更新托盘图标和提示文字
 ipcMain.on('rc:status', (e, kind, text) => {
   if (!mainWindow || e.sender !== mainWindow.webContents) return;
@@ -324,7 +352,11 @@ ipcMain.on('rc:status', (e, kind, text) => {
 // ---------------------------------------------------------------- 窗口列表与采集准备
 
 ipcMain.handle('rc:config', () => ({
-  server: cfg.server,
+  server: serverState.url,
+  // 界面上显示和预填的是简写（rc.example.com），和手机 App 填的一样
+  serverDisplay: serverAddress.displayOf(serverState.url),
+  serverInput: serverState.url ? serverAddress.displayOf(serverState.url) : serverState.input,
+  serverNotice: serverState.notice,
   targets: cfg.targets,
   maxBitrateKbps: cfg.maxBitrateKbps,
   maxFps: cfg.maxFps,
@@ -348,6 +380,40 @@ ipcMain.handle('rc:account', (e) => {
   };
 });
 
+/**
+ * 设置或更换服务器（登录页的地址框、登录后的"更换服务器"）。地址在主进程里整理和检查，只接受 ws:// 和 wss://；
+ * 写进配置文件后退出旧服务器上的登录（通知旧服务器作废令牌），换成新服务器，页面接着显示登录页。
+ * 返回 { server, changed } 或 { error }
+ */
+async function setServer(input) {
+  let url;
+  try {
+    url = serverAddress.wsUrlOf(input);
+  } catch (err) {
+    return { error: err.message };
+  }
+  if (!url) return { error: '请填写服务器地址' };
+  if (!/^wss?:\/\/[^\s]+$/.test(url)) return { error: '服务器地址必须是 ws:// 或 wss:// 地址' };
+  if (url === serverState.url) return { server: url, changed: false };
+  try {
+    serverAddress.saveServer(CONFIG_PATH, url);
+  } catch (err) {
+    return { error: `服务器地址没保存上：${err.message}` };
+  }
+  // logout() 先同步清掉本地登录状态、再去通知旧服务器，所以下面新建的 Account 读不到旧令牌
+  const loggingOut = account.logout();
+  account = new Account(url);
+  Object.assign(serverState, { url, input: url, notice: '', migrate: false });
+  console.log(`服务器地址改为 ${serverAddress.displayOf(url)}（已写进 ${CONFIG_PATH}）`);
+  await loggingOut;
+  return { server: url, changed: true };
+}
+
+ipcMain.handle('rc:set-server', (e, input) => {
+  if (!fromOwnWindow(e) || typeof input !== 'string' || input.length > serverAddress.MAX_LENGTH) return { error: '参数不对' };
+  return setServer(input);
+});
+
 ipcMain.handle('rc:token', (e) => (fromOwnWindow(e) && account.state ? account.state.token : null));
 
 ipcMain.handle('rc:login', async (e, email, password) => {
@@ -366,7 +432,7 @@ ipcMain.handle('rc:session-invalid', (e) => {
 
 // 注册和找回密码在网页上完成，用系统浏览器打开
 ipcMain.handle('rc:open-account-page', (e, which) => {
-  if (!fromOwnWindow(e) || !['register', 'forgot'].includes(which)) return;
+  if (!fromOwnWindow(e) || !['register', 'forgot'].includes(which) || !account.httpBase) return;
   shell.openExternal(`${account.httpBase}/#${which}`);
 });
 
@@ -1016,56 +1082,33 @@ const dialogWatch = dialogWatchLib.createDialogWatch({
 
 // ---------------------------------------------------------------- 锁定与解锁（协议文档 4.6，解锁服务见 docs/06）
 
-const UNLOCK_PIPE = String.raw`\\.\pipe\RemoteClaudeUnlock`;
 const LOCK_POLL_MS = 2000;
 const SERVICE_CHECK_MS = 30000;
-let lockState = { locked: false, unlock: false };
+// untrusted：管道那头有服务，但核实不过（多半是被控端自动升级了、解锁服务还是旧版），要在电脑上重新安装服务
+let lockState = { locked: false, unlock: false, untrusted: false };
 let serviceCheckedAt = 0;
 let unlocking = false;
 
-/** 给解锁服务发一条命令，返回它回的一行；连不上或超时返回 null。服务一次只接一个连接，忙时稍等重试 */
-async function askUnlockService(line, timeoutMs) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const reply = await new Promise((resolve) => {
-      let buf = '';
-      let done = false;
-      const sock = net.connect(UNLOCK_PIPE);
-      const finish = (v) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        sock.destroy();
-        resolve(v);
-      };
-      const timer = setTimeout(() => finish({ timeout: true }), timeoutMs);
-      sock.setEncoding('utf8');
-      sock.on('connect', () => sock.write(line + '\n'));
-      sock.on('data', (d) => {
-        buf += d;
-        const i = buf.indexOf('\n');
-        if (i >= 0) finish({ line: buf.slice(0, i).trim() });
-      });
-      sock.on('error', (err) => finish({ error: err.code }));
-      sock.on('close', () => finish(buf.trim() ? { line: buf.trim() } : { error: 'closed' }));
-    });
-    if (reply.line) return reply.line;
-    if (reply.timeout || (reply.error !== 'ENOENT' && reply.error !== 'EBUSY')) return null;
-    await sleep(400);
-  }
-  return null;
+// 连上管道后先核实对面确实是装在 Program Files 里、以 SYSTEM 运行的解锁服务，才发命令（docs/06 的"管道防冒充"）
+const unlockPipe = require('./unlockpipe').createUnlockPipe({ log: (msg) => console.log('[解锁] ' + msg) });
+
+/** 给解锁服务发一条命令，返回 { line } 或 { error }（'untrusted' 是核实不过，其余是没装、连不上、超时等） */
+function askUnlockService(line, timeoutMs) {
+  return unlockPipe.request(line, timeoutMs);
 }
 
 /** 定时看电脑是否锁屏、解锁服务在不在，有变化就告诉页面，页面再告诉所有控制端 */
 async function pollLock() {
   const locked = win32.isLocked();
-  let unlock = lockState.unlock;
+  let { unlock, untrusted } = lockState;
   if (locked !== lockState.locked || Date.now() - serviceCheckedAt > SERVICE_CHECK_MS) {
     serviceCheckedAt = Date.now();
-    const reply = await askUnlockService('STATUS', 1500);
-    unlock = !!reply && reply.startsWith('OK');
+    const r = await askUnlockService('STATUS', 1500);
+    unlock = r.line !== undefined && r.line.startsWith('OK');
+    untrusted = r.error === 'untrusted';
   }
-  if (locked === lockState.locked && unlock === lockState.unlock) return;
-  lockState = { locked, unlock };
+  if (locked === lockState.locked && unlock === lockState.unlock && untrusted === lockState.untrusted) return;
+  lockState = { locked, unlock, untrusted };
   if (mainWindow) mainWindow.webContents.send('rc:lock-state', lockState);
 }
 
@@ -1092,8 +1135,9 @@ async function unlockWith(password) {
   if (!win32.isLocked()) return 'not-locked';
   unlocking = true;
   try {
-    const reply = await askUnlockService('UNLOCK ' + Buffer.from(password, 'utf8').toString('base64'), 40000);
-    if (reply === null) return 'no-service';
+    const r = await askUnlockService('UNLOCK ' + Buffer.from(password, 'utf8').toString('base64'), 40000);
+    if (r.line === undefined) return r.error === 'untrusted' ? 'bad-service' : 'no-service';
+    const reply = r.line;
     if (reply === 'OK') return null;
     return reply.startsWith('ERR ') ? reply.slice(4).trim() || 'failed' : 'failed';
   } finally {

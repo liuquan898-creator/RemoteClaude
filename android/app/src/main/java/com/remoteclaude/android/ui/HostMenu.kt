@@ -117,8 +117,12 @@ fun HostDialogsHost(state: AppState, controller: RemoteController, dialogs: Host
             title = { Text("锁定电脑？") },
             text = {
                 Text(
-                    if (state.unlockAvailable) "效果和在电脑上按 Win+L 一样。之后可以在这里输入 Windows 密码或 PIN 解锁。"
-                    else "效果和在电脑上按 Win+L 一样。这台电脑没装解锁服务，锁定后只能回到电脑前解锁。",
+                    when {
+                        state.unlockAvailable -> "效果和在电脑上按 Win+L 一样。之后可以在这里输入 Windows 密码或 PIN 解锁。"
+                        state.unlockUntrusted ->
+                            "效果和在电脑上按 Win+L 一样。这台电脑上的解锁服务要重新安装（版本太旧或没通过核实），锁定后只能回到电脑前解锁。"
+                        else -> "效果和在电脑上按 Win+L 一样。这台电脑没装解锁服务，锁定后只能回到电脑前解锁。"
+                    },
                 )
             },
             confirmButton = {
@@ -142,7 +146,11 @@ fun LockBanner(state: AppState, onUnlock: () -> Unit) {
         Column(Modifier.weight(1f)) {
             Text("电脑已锁屏", fontWeight = FontWeight.SemiBold)
             Text(
-                if (state.unlockAvailable) "解锁后才能操作" else "电脑上没装解锁服务，要回到电脑前解锁",
+                when {
+                    state.unlockAvailable -> "解锁后才能操作"
+                    state.unlockUntrusted -> "电脑上的解锁服务要重新安装（版本太旧或没通过核实），现在要回到电脑前解锁"
+                    else -> "电脑上没装解锁服务，要回到电脑前解锁"
+                },
                 color = RcColors.Muted,
                 fontSize = 12.sp,
             )

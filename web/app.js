@@ -5,6 +5,8 @@
  * 账号（注册、登录、找回密码）走 HTTP 接口 api/auth/...；
  * 信令（列窗口、选窗口、WebRTC 协商）走 WebSocket，发给电脑的消息都带上 host（要操作哪台电脑）；
  * 画面走 WebRTC 视频轨道，鼠标键盘事件走 WebRTC 数据通道。协议见 docs/03-protocol.md。
+ * 审批和提问（2.7，界面在 approvals.js）、电脑锁屏状态和不连画面的锁定解锁（2.9、4.6，加密在 unlock.js）
+ * 走信令通道，停在会话列表、没看画面时也能用。
  *
  * 发给被控端的输入事件：
  *   {t:'m', x, y}            移动指针，x/y 是窗口内 0~1 的相对位置
@@ -23,11 +25,16 @@
     tools: $('tools'), keys: $('keys'), fontBar: $('fontBar'), composer: $('composer'), text: $('text'),
     btnImage: $('btnImage'), imageFile: $('imageFile'),
     picker: $('picker'), hostTabs: $('hostTabs'), list: $('list'), accountEmail: $('accountEmail'), toast: $('toast'),
-    btnMore: $('btnMore'), menu: $('menu'), menuItems: $('menuItems'), btnKeys: $('btnKeys'),
+    btnKeys: $('btnKeys'),
+    banners: $('banners'), pickerBanners: $('pickerBanners'), btnAppr: $('btnAppr'), apprCount: $('apprCount'),
+    approvals: $('approvals'), apprTitle: $('apprTitle'), apprList: $('apprList'), apprEmpty: $('apprEmpty'),
+    menuLayer: $('menuLayer'), menu: $('menu'), menuHost: $('menuHost'), menuLock: $('menuLock'), menuLockNote: $('menuLockNote'),
+    menuEmail: $('menuEmail'), lockDlg: $('lockDlg'), lockDlgText: $('lockDlgText'),
+    unlockDlg: $('unlockDlg'), unlockForm: $('unlockForm'), unlockPw: $('unlockPw'),
   };
 
   const PROTO = 2;
-  const CLIENT = 'web/0.4.0';
+  const CLIENT = 'web/0.5.0';
   const SPECIAL_KEYS = new Set([
     'Backspace', 'Tab', 'Enter', 'Escape', 'PageUp', 'PageDown', 'End', 'Home',
     'ArrowLeft', 'ArrowUp', 'ArrowRight', 'ArrowDown', 'Insert', 'Delete',
@@ -46,7 +53,20 @@
     'image-bad': '图片数据有误，没能粘贴',
     'image-timeout': '图片传输中断了',
     'closed': '画面连接断开了，图片没有发出去',
+    // 解锁的结果（协议文档 4.6、2.9）
+    'not-locked': '电脑没有锁屏',
+    'no-service': '电脑上没装解锁服务',
+    'bad-service': '电脑上的解锁服务要重新安装（版本太旧或没通过核实）',
+    'rate-limited': '失败次数太多，15 分钟后再试',
+    'still-locked': '没解开，请检查密码或 PIN',
+    'no-logon-screen': '没找到电脑的登录界面，没有输入密码',
+    'busy': '正在解锁，请稍候',
+    'failed': '解锁失败',
+    'bad-op': '电脑上的被控端不认这个命令，请升级被控端',
   };
+  /** 不打开会话窗口就锁定、解锁，要被控端从这个版本起（协议文档 2.9） */
+  const HOST_CMD_MIN_VERSION = '0.9.6';
+  const UNLOCK_REPLY_TIMEOUT_MS = 30000;
   /** 图片 id -> 收到回执时调用，参数是错误码，成功时是 'ok'（协议文档 4.5） */
   const imageWaiters = new Map();
   const WHEEL_PER_PIXEL = 1.2; // 浏览器滚轮一格约 100 像素，对应 Windows 的 120
@@ -93,6 +113,17 @@
   let windows = [];
   let wantHwnd = Number(store.get('rc.hwnd')) || 0; // 上次看的窗口，重连后自动选回去
   let reselectTimer = null;
+
+  /** 电脑 id -> 被控端推来的状态 { lock: {locked, unlock}, key }（协议文档 2.9）；电脑下线、断开服务器时作废 */
+  const hostStates = new Map();
+  /** 数据通道上收到的锁屏状态（协议文档 4.6），只对正在看的这台电脑、这条画面连接有效 */
+  let peerLock = null;
+  /** 当前电脑回了窗口列表却没推过 host-state：被控端是 0.9.6 以前的版本，不认不连画面的命令 */
+  let hostTooOld = false;
+  /** 解锁请求的编号 -> 收到回执时调用（参数是错误码，成功时是 'ok'），via 是 peer 或 server */
+  const cmdWaiters = new Map();
+  let cmdSeq = 0;
+  let unlocking = false;
 
   const currentHost = () => hosts.find((h) => h.id === hostId) || null;
   const hostOnline = () => {
@@ -266,7 +297,8 @@
     windows = [];
     closePeer();
     closePicker();
-    el.menu.hidden = true;
+    forgetHostData();
+    closeOverlays();
     el.fontBar.hidden = true;
     showAuth('login', error);
     return old;
@@ -324,6 +356,7 @@
       setDot('wait');
       setHint('正在连接画面…');
     }
+    renderHostUi();
   }
 
   // ---------------------------------------------------------------- 信令
@@ -362,8 +395,10 @@
     sock.onclose = () => {
       if (ws !== sock) return;
       authed = false;
-      // 服务器会通知电脑这个控制端已离开，画面连接随之作废
+      // 服务器会通知电脑这个控制端已离开，画面连接随之作废；电脑的状态也作废，重连后电脑会再推。
+      // 审批卡片先留着（正在填的说明、选项不丢），重连后电脑推来的新列表会整份替换
       closePeer();
+      forgetHostData({ keepApprovals: true });
       refreshStatus();
       if (!token) return;
       retryTimer = setTimeout(connect, retry);
@@ -387,22 +422,28 @@
     current = null;
     windows = [];
     hostId = id;
+    hostTooOld = false;
     if (id) store.set('rc.host', id);
     else store.del('rc.host');
     wantHwnd = 0;
     store.del('rc.hwnd');
   }
 
+  /** 不管是不是当前所选的电脑都要处理的消息：审批推给所有控制端，状态按电脑分别记 */
+  const ANY_HOST_TYPES = new Set(['error', 'approvals', 'approval-result', 'host-state', 'host-cmd-result']);
+
   async function onMessage(msg) {
-    // 电脑发来的消息只处理当前所选的那台
-    if (typeof msg.host === 'string' && msg.type !== 'error' && msg.host !== hostId) return;
+    // 电脑发来的其它消息只处理当前所选的那台
+    if (typeof msg.host === 'string' && !ANY_HOST_TYPES.has(msg.type) && msg.host !== hostId) return;
 
     switch (msg.type) {
       case 'auth-ok':
         authed = true;
+        authedAt = Date.now();
         retry = 1000;
         iceServers = Array.isArray(msg.iceServers) ? msg.iceServers : [];
         hosts = Array.isArray(msg.hosts) ? msg.hosts : [];
+        pruneOfflineHosts();
         if (msg.email) {
           email = msg.email;
           store.set('rc.email', email);
@@ -414,6 +455,7 @@
         refreshStatus();
         if (hostOnline()) sendHost({ type: 'list' });
         else if (hosts.length) openPicker();
+        syncPush();
         break;
 
       case 'auth-fail':
@@ -430,6 +472,7 @@
       case 'hosts': {
         const wasOnline = hostOnline();
         hosts = Array.isArray(msg.hosts) ? msg.hosts : [];
+        pruneOfflineHosts();
         if (hostId && !hosts.some((h) => h.id === hostId)) setHost(null);
         chooseHost();
         renderHostTabs();
@@ -442,6 +485,8 @@
 
       case 'windows':
         windows = Array.isArray(msg.list) ? msg.list : [];
+        // host-state 总比这个控制端的第一份 windows 先到；回了列表还没有，就是旧版被控端（协议文档 2.9）
+        hostTooOld = !hostStates.has(hostId);
         renderList();
         if (!isLive()) {
           // 还没有画面：优先回到上次看的窗口，否则让用户选
@@ -476,6 +521,37 @@
         openPicker();
         break;
 
+      case 'approvals':
+        if (typeof msg.host !== 'string') break;
+        approvalsByHost.set(msg.host, (Array.isArray(msg.list) ? msg.list : []).map(RcApprovals.normalize).filter(Boolean));
+        publishApprovals();
+        break;
+
+      case 'approval-result':
+        onApprovalResult(msg);
+        break;
+
+      case 'host-state':
+        if (typeof msg.host !== 'string') break;
+        hostStates.set(msg.host, {
+          lock: lockFrom(msg.lock),
+          key: typeof msg.key === 'string' && msg.key ? msg.key : null,
+        });
+        if (msg.host === hostId) hostTooOld = false;
+        refreshStatus();
+        break;
+
+      case 'host-cmd-result':
+        if (typeof msg.req === 'string' && cmdWaiters.has(msg.req)) {
+          cmdWaiters.get(msg.req).done(msg.ok === true ? 'ok' : (typeof msg.code === 'string' && msg.code) || 'failed');
+        }
+        break;
+
+      case 'push-register-result':
+        // 推送注册的结果只记一下，不打扰用户（服务器可能还不认 push-register）
+        console.info('push-register-result', msg.ok === true ? 'ok' : msg.code || msg.error || '');
+        break;
+
       case 'error':
         if (msg.host !== hostId) break;
         toast(ERROR_TEXT[msg.code] || '操作失败');
@@ -493,6 +569,8 @@
     clearTimeout(reselectTimer);
     pendingIce = [];
     for (const done of [...imageWaiters.values()]) done('closed');
+    for (const w of [...cmdWaiters.values()]) if (w.via === 'peer') w.done('closed');
+    peerLock = null;
     if (dc) { dc.onclose = null; dc = null; }
     if (pc) {
       pc.onconnectionstatechange = null;
@@ -524,6 +602,17 @@
         // 带 id 的是图片回执（协议文档 4.5）
         if ((ev.t === 'img-ok' || ev.t === 'err') && typeof ev.id === 'string' && imageWaiters.has(ev.id)) {
           imageWaiters.get(ev.id)(ev.t === 'img-ok' ? 'ok' : ev.code || 'unknown');
+          return;
+        }
+        // 锁屏状态和解锁回执（协议文档 4.6）
+        if (ev.t === 'lock') {
+          peerLock = lockFrom(ev);
+          refreshStatus();
+          return;
+        }
+        if (ev.t === 'unlock-result') {
+          const w = typeof ev.id === 'string' && cmdWaiters.get(ev.id);
+          if (w) w.done(ev.ok === true ? 'ok' : (typeof ev.code === 'string' && ev.code) || 'failed');
           return;
         }
         if (ev.t === 'err') toast(ERROR_TEXT[ev.code] || '操作失败');
@@ -904,11 +993,17 @@
   const inEditable = (target) => !!target && (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT');
 
   document.addEventListener('keydown', (e) => {
-    if (el.app.hidden || inEditable(e.target)) return;
-    if (!el.picker.hidden) {
-      if (e.key === 'Escape') closePicker();
+    if (el.app.hidden) return;
+    // 弹出层（面板、菜单、对话框）打开时按键不发给电脑，Esc 关掉最上面那一层
+    const top = topOverlay();
+    if (top) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        top();
+      }
       return;
     }
+    if (inEditable(e.target)) return;
     if (!isLive() || e.isComposing || IGNORED_KEYS.has(e.key) || BROWSER_KEYS.has(e.key)) return;
 
     const ctrl = e.ctrlKey || e.metaKey;
@@ -931,13 +1026,14 @@
 
   document.addEventListener('paste', (e) => {
     // 剪贴板里有图片（比如截图）：在页面任何地方粘贴，包括输入框里，都发到远程窗口
-    const file = !el.app.hidden && clipboardImage(e);
+    const file = !el.app.hidden && !topOverlay() && clipboardImage(e);
     if (file) {
       e.preventDefault();
       sendImage(file);
       return;
     }
-    if (el.app.hidden || inEditable(e.target) || !isLive()) return;
+    // 弹出层（面板、菜单、对话框）开着时文字也不发给电脑，和按键一样
+    if (el.app.hidden || topOverlay() || inEditable(e.target) || !isLive()) return;
     const s = e.clipboardData ? e.clipboardData.getData('text') : '';
     if (!s) return;
     e.preventDefault();
@@ -1103,26 +1199,6 @@
     sendText(true);
   });
   $('btnType').addEventListener('click', () => sendText(false));
-  // ---------------------------------------------------------------- "更多"菜单
-
-  // 顶栏右边的"⋮"：按键栏、字体大小、退出登录。手机上顶栏放不下这么多按钮，会话标题会被挤得只剩两三个字
-  function closeMenu() {
-    el.menu.hidden = true;
-  }
-  el.btnMore.addEventListener('click', () => {
-    el.btnKeys.textContent = el.keys.hidden ? '显示按键栏' : '隐藏按键栏';
-    // 菜单贴在"⋮"按钮下面、和它右边对齐
-    const r = el.btnMore.getBoundingClientRect();
-    el.menuItems.style.top = r.bottom + 4 + 'px';
-    el.menuItems.style.right = Math.max(8, el.app.clientWidth - r.right) + 'px';
-    el.menu.hidden = false;
-  });
-  el.menu.addEventListener('click', (e) => {
-    if (e.target === el.menu) closeMenu();
-  });
-  // 菜单的位置是打开时算的，窗口大小一变（转屏、拖窗口）就收起，免得留在不对的地方
-  window.addEventListener('resize', closeMenu);
-
   // 按键栏默认收起（安卓端 0.9.2 起也不显示），从菜单里叫出来；开着还是收着记在本浏览器里
   el.keys.hidden = store.get('rc.keys') !== '1';
   el.btnKeys.addEventListener('click', () => {
@@ -1141,6 +1217,566 @@
     el.fontBar.hidden = true;
     layout();
   });
+
+  // ---------------------------------------------------------------- 审批和提问（协议文档 2.7，docs/09）
+
+  /** 电脑 id -> 这台电脑上全部等待中的审批（已整理，见 approvals.js 的 normalize） */
+  const approvalsByHost = new Map();
+  /** 已提交、等电脑回执的审批 id */
+  const answering = new Set();
+  let approvalSeq = 0;
+  /** 审批 id -> 等回执的定时器 */
+  const answerTimers = new Map();
+  const ANSWER_REPLY_TIMEOUT_MS = 20000;
+  /** 从通知打开时要找的那一条：{ id, timer, deadline }，可能还没连上服务器、审批列表还没推过来 */
+  let pendingFocus = null;
+  const PENDING_FOCUS_MS = 10000;
+  /** 还没登录、没连上时，从通知带来的那一条最多留这么久 */
+  const PENDING_FOCUS_MAX_MS = 60000;
+  /** 连上服务器以后至少等这么久，电脑的审批列表才算推过来了 */
+  const APPROVALS_SETTLE_MS = 5000;
+  let authedAt = 0;
+
+  const approvalPanel = RcApprovals.createPanel({ list: el.apprList, onAnswer: answerApproval, copy: copyText });
+
+  /** 所有在线电脑的审批合在一起，按出现时间排 */
+  function approvalEntries() {
+    const out = [];
+    for (const [hid, items] of approvalsByHost) {
+      const h = hosts.find((x) => x.id === hid);
+      const name = h ? h.name : '电脑';
+      for (const item of items) out.push({ hostId: hid, hostName: name, item });
+    }
+    return out.sort((a, b) => a.item.createdAt - b.item.createdAt);
+  }
+
+  function publishApprovals() {
+    const entries = approvalEntries();
+    const ids = new Set(entries.map((e) => e.item.id));
+    for (const id of [...answering]) if (!ids.has(id)) answering.delete(id);
+    const manyHosts = new Set(entries.map((e) => e.hostId)).size > 1;
+    approvalPanel.update(entries, { manyHosts, answering });
+    const n = entries.length;
+    el.apprTitle.textContent = n ? `等你处理（${n}）` : '等你处理';
+    el.apprEmpty.hidden = n > 0;
+    el.btnAppr.hidden = n === 0;
+    el.apprCount.textContent = String(n);
+    document.title = n ? `(${n}) RemoteClaude` : 'RemoteClaude';
+    // 都处理完了就收起面板
+    if (!n && !el.approvals.hidden && !pendingFocus) closeApprovals();
+    tryPendingFocus(false);
+    renderHostUi();
+  }
+
+  function openApprovals() {
+    closeMenu();
+    publishApprovals();
+    el.approvals.hidden = false;
+  }
+
+  function closeApprovals() {
+    el.approvals.hidden = true;
+  }
+
+  /**
+   * 回答一条审批：choice 是 allow 或 deny，拒绝时 text 是说明；回答提问时 answers 是
+   * 问题原文 -> 选项或自己填的文字（多选给数组）。格式和安卓端 Protocol.approvalAnswer 一样
+   */
+  function answerApproval(hid, id, choice, text, answers) {
+    if (!authed || !ws || ws.readyState !== WebSocket.OPEN) {
+      toast('与服务器的连接断开了，等重连后再答');
+      return;
+    }
+    const msg = { type: 'approval-answer', host: hid, id, req: `a${++approvalSeq}`, choice, text: text || '' };
+    if (answers) msg.answers = answers;
+    send(msg);
+    answering.add(id);
+    clearTimeout(answerTimers.get(id));
+    // 电脑一直不回执（旧版被控端、消息丢了）：按钮回来，让用户能再答一次
+    answerTimers.set(id, setTimeout(() => {
+      answerTimers.delete(id);
+      if (!answering.delete(id)) return;
+      publishApprovals();
+      toast('没收到电脑的确认，可以再答一次');
+    }, ANSWER_REPLY_TIMEOUT_MS));
+    publishApprovals();
+  }
+
+  /** 下线、退出登录的电脑：它推过的审批和状态作废 */
+  function pruneOfflineHosts() {
+    for (const id of [...approvalsByHost.keys(), ...hostStates.keys()]) {
+      if (!hosts.some((h) => h.id === id && h.online)) {
+        approvalsByHost.delete(id);
+        hostStates.delete(id);
+      }
+    }
+    publishApprovals();
+  }
+
+  function onApprovalResult(msg) {
+    if (typeof msg.id !== 'string') return;
+    answering.delete(msg.id);
+    clearTimeout(answerTimers.get(msg.id));
+    answerTimers.delete(msg.id);
+    publishApprovals();
+    if (msg.ok === true) return; // 电脑随后推来的新列表里就没有这一条了
+    toast(msg.code === 'gone' ? '这个审批已经在别处答了或已经结束'
+      : msg.code === 'bad' ? '答案不完整，请每个问题都选一下'
+        : `没能提交（${msg.code || '未知错误'}）`);
+  }
+
+  /** 从通知打开：等这一条出现就打开面板并滚到它；一直没出现就如实提示 */
+  function focusApprovalWhenReady(id) {
+    if (pendingFocus) clearTimeout(pendingFocus.timer);
+    pendingFocus = { id, timer: setTimeout(() => tryPendingFocus(true), PENDING_FOCUS_MS), deadline: Date.now() + PENDING_FOCUS_MAX_MS };
+    tryPendingFocus(false);
+  }
+
+  function tryPendingFocus(final) {
+    if (!pendingFocus) return;
+    const { id, timer, deadline } = pendingFocus;
+    // 还没登录、没连上服务器，或刚连上电脑还没推列表：再等等，不要说"已经结束"
+    const settled = token && authed && Date.now() - authedAt >= APPROVALS_SETTLE_MS;
+    if (final && !settled) {
+      if (Date.now() < deadline) {
+        pendingFocus.timer = setTimeout(() => tryPendingFocus(true), PENDING_FOCUS_MS / 2);
+        return;
+      }
+      pendingFocus = null;
+      if (token) toast('还没连上服务器，审批列表等连上后在"审批"里看');
+      return;
+    }
+    if (!token) return;
+    const entries = approvalEntries();
+    if (entries.some((e) => e.item.id === id)) {
+      clearTimeout(timer);
+      pendingFocus = null;
+      closePicker();
+      openApprovals();
+      approvalPanel.focus(id);
+      return;
+    }
+    if (!final) return;
+    pendingFocus = null;
+    if (entries.length) {
+      openApprovals();
+      toast('这条已经处理过了，下面是其它等你处理的');
+    } else {
+      toast('这条审批已经在别处答了或已经结束');
+    }
+  }
+
+  /** 复制到手机剪贴板。页面不是 https 打开时没有 navigator.clipboard，退回到老办法 */
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('已复制');
+      return;
+    } catch { /* 退回到下面 */ }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.className = 'offscreen';
+    document.body.append(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { /* ignore */ }
+    ta.remove();
+    toast(ok ? '已复制' : '没能复制，请长按文字手动复制');
+  }
+
+  el.btnAppr.addEventListener('click', openApprovals);
+  $('apprClose').addEventListener('click', closeApprovals);
+  el.approvals.addEventListener('click', (e) => {
+    if (e.target === el.approvals) closeApprovals();
+  });
+  // 卡片上的时间（"5 分钟前"）每分钟更新一次
+  setInterval(() => { if (!el.approvals.hidden) publishApprovals(); }, 60000);
+
+  // ---------------------------------------------------------------- 电脑锁屏、锁定与解锁（协议文档 4.6、2.9）
+
+  /** 退出登录、和服务器断开时：电脑推过的状态作废；审批在断开时先留着（keepApprovals） */
+  function forgetHostData({ keepApprovals = false } = {}) {
+    if (!keepApprovals) approvalsByHost.clear();
+    hostStates.clear();
+    answering.clear();
+    for (const t of answerTimers.values()) clearTimeout(t);
+    answerTimers.clear();
+    hostTooOld = false;
+    for (const w of [...cmdWaiters.values()]) w.done('closed');
+    publishApprovals();
+  }
+
+  /**
+   * 电脑报来的锁屏状态（host-state 的 lock、数据通道的 lock 消息）。untrusted：电脑上有解锁服务在跑，
+   * 但被控端核实不过它（多半是旧版服务，被控端自动升级了、服务没升级），这时 unlock 是 false
+   */
+  function lockFrom(m) {
+    const o = m && typeof m === 'object' ? m : {};
+    return { locked: o.locked === true, unlock: o.unlock === true, untrusted: o.unlock !== true && o.untrusted === true };
+  }
+
+  /** 锁着但不能从这里解锁时的说明 */
+  function noUnlockText(lock) {
+    return lock && lock.untrusted
+      ? '电脑上的解锁服务要重新安装（版本太旧或没通过核实），现在要回到电脑前解锁'
+      : '电脑上没装解锁服务，要回到电脑前解锁';
+  }
+
+  /** 当前电脑的锁屏状态：连着画面时以数据通道上的为准，否则用 host-state 的；都没有时返回 null */
+  function lockInfo() {
+    if (isLive() && peerLock) return peerLock;
+    const st = hostId && hostStates.get(hostId);
+    return st ? st.lock : null;
+  }
+
+  /** 右上角菜单里锁定那一项（同安卓 windows/HostCommands.kt 的 menu） */
+  function lockMenu() {
+    const online = authed && hostOnline();
+    const commands = !!hostId && hostStates.has(hostId);
+    const ready = online && (commands || isLive());
+    const lock = lockInfo() || { locked: false, unlock: false };
+    let note = '';
+    if (!hostId) note = '还没有选电脑';
+    else if (!online) note = '这台电脑不在线';
+    else if (!ready) {
+      note = hostTooOld ? `不打开会话窗口就锁定、解锁，要电脑上的被控端 ${HOST_CMD_MIN_VERSION} 或更新的版本；升级之前请先打开一个会话窗口`
+        : '正在等电脑报告状态…';
+    } else if (lock.locked && !lock.unlock) note = noUnlockText(lock);
+    return { show: !!hostId, unlock: lock.locked, enabled: ready && (!lock.locked || lock.unlock) && !unlocking, note };
+  }
+
+  let bannerSig = '';
+
+  /** 顶栏下面（和会话选择面板里）的提示条：有审批在等、电脑锁屏了；顺带更新菜单 */
+  function renderHostUi() {
+    const entries = approvalEntries();
+    const lock = authed && hostOnline() ? lockInfo() : null;
+    const sig = JSON.stringify([entries.map((e) => [e.item.id, e.item.title, e.item.tool, e.item.kind]), lock, unlocking]);
+    if (sig !== bannerSig) {
+      bannerSig = sig;
+      for (const box of [el.banners, el.pickerBanners]) {
+        box.textContent = '';
+        if (entries.length) box.append(approvalBanner(entries));
+        if (lock && lock.locked) box.append(lockBanner(lock));
+      }
+    }
+    if (!el.menuLayer.hidden) renderMenu();
+  }
+
+  function span(cls, text) {
+    const s = document.createElement(cls === 'strong' ? 'strong' : 'span');
+    if (cls !== 'strong') s.className = cls;
+    s.textContent = text;
+    return s;
+  }
+
+  function approvalBanner(entries) {
+    const first = entries[0].item;
+    const n = entries.length;
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'banner warn';
+    const text = span('banner-text', '');
+    text.append(
+      span('strong', n > 1 ? `有 ${n} 个审批等你处理` : first.kind === 'ask' ? 'Claude 在问你' : `Claude 要审批 ${first.tool || '工具'}`),
+      span('muted', first.title),
+    );
+    b.append(text, span('banner-act', '处理'));
+    b.addEventListener('click', openApprovals);
+    return b;
+  }
+
+  function lockBanner(lock) {
+    const box = document.createElement('div');
+    box.className = 'banner bad';
+    const text = span('banner-text', '');
+    text.append(span('strong', '电脑已锁屏'), span('muted', lock.unlock ? '解锁后才能操作' : noUnlockText(lock)));
+    box.append(text);
+    if (lock.unlock) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'primary';
+      b.textContent = unlocking ? '解锁中…' : '解锁';
+      b.disabled = unlocking;
+      b.addEventListener('click', openUnlock);
+      box.append(b);
+    }
+    return box;
+  }
+
+  function renderMenu() {
+    const m = lockMenu();
+    const h = currentHost();
+    el.menuHost.textContent = h ? `电脑：${h.name}${h.online ? '' : '（离线）'}` : '';
+    el.menuHost.hidden = !h;
+    el.menuLock.hidden = !m.show;
+    el.menuLock.textContent = m.unlock ? (unlocking ? '正在解锁电脑…' : '解锁电脑') : '锁定电脑';
+    el.menuLock.disabled = !m.enabled;
+    el.menuLockNote.textContent = m.note;
+    el.menuLockNote.hidden = !m.show || !m.note;
+    el.menuEmail.textContent = email;
+    el.btnKeys.textContent = el.keys.hidden ? '显示按键栏' : '隐藏按键栏';
+  }
+
+  /** 菜单挂在点开它的那个"更多"按钮下面（顶栏上的，或会话选择面板里的） */
+  function openMenu(e) {
+    renderMenu();
+    const r = e && e.currentTarget && e.currentTarget.getBoundingClientRect();
+    if (r && r.width) {
+      const box = el.app.getBoundingClientRect();
+      el.menu.style.top = `${Math.round(r.bottom - box.top + 6)}px`;
+      el.menu.style.right = `${Math.max(8, Math.round(box.right - r.right))}px`;
+    }
+    el.menuLayer.hidden = false;
+  }
+
+  function closeMenu() {
+    el.menuLayer.hidden = true;
+  }
+
+  $('btnMore').addEventListener('click', openMenu);
+  $('btnMore2').addEventListener('click', openMenu);
+  el.menuLayer.addEventListener('click', (e) => {
+    if (e.target === el.menuLayer) closeMenu();
+  });
+  // 菜单的位置是打开时算的，窗口大小一变（转屏、拖窗口）就收起，免得留在不对的地方
+  window.addEventListener('resize', closeMenu);
+  el.menuLock.addEventListener('click', () => {
+    closeMenu();
+    const m = lockMenu();
+    if (!m.enabled) return;
+    if (m.unlock) openUnlock();
+    else openLockConfirm();
+  });
+
+  /**
+   * 给电脑发一条和具体窗口无关的命令。连着画面时走数据通道（旧版被控端只认这条路）；
+   * 没连画面时走信令通道的 host-cmd（被控端 0.9.6 起）。发不出去时提示原因，返回 false
+   */
+  function sendHostCommand(op, peerEvent) {
+    if (sendInput(peerEvent)) return true;
+    const host = hostCommandTarget();
+    if (!host) return false;
+    send({ type: 'host-cmd', host, op });
+    return true;
+  }
+
+  /** 能经信令通道收命令的那台电脑；不行时提示原因，返回 null */
+  function hostCommandTarget() {
+    if (!hostId || !authed || !hostOnline()) toast('这台电脑不在线');
+    else if (hostStates.has(hostId)) return hostId;
+    else if (hostTooOld) toast(`电脑上的被控端版本太旧，升级到 ${HOST_CMD_MIN_VERSION} 以后才能在这里操作`);
+    else toast('还没收到电脑的状态，稍等再试');
+    return null;
+  }
+
+  function openLockConfirm() {
+    const lock = lockInfo();
+    el.lockDlgText.textContent = lock && lock.unlock
+      ? '效果和在电脑上按 Win+L 一样。之后可以在这里输入 Windows 密码或 PIN 解锁。'
+      : lock && lock.untrusted
+        ? '效果和在电脑上按 Win+L 一样。这台电脑上的解锁服务要重新安装（版本太旧或没通过核实），锁定后只能回到电脑前解锁。'
+        : '效果和在电脑上按 Win+L 一样。这台电脑没装解锁服务，锁定后只能回到电脑前解锁。';
+    el.lockDlg.hidden = false;
+    $('lockDlgCancel').focus();
+  }
+
+  $('lockDlgCancel').addEventListener('click', () => { el.lockDlg.hidden = true; });
+  el.lockDlg.addEventListener('click', (e) => {
+    if (e.target === el.lockDlg) el.lockDlg.hidden = true;
+  });
+  $('lockDlgOk').addEventListener('click', () => {
+    el.lockDlg.hidden = true;
+    // 只在用户明确点了才锁；断开连接、退出登录都不会锁定
+    if (sendHostCommand('lock', { t: 'lock-now' })) toast('已发送锁定命令');
+  });
+
+  function openUnlock() {
+    if (unlocking) return;
+    el.unlockPw.value = '';
+    el.unlockDlg.hidden = false;
+    el.unlockPw.focus();
+  }
+
+  function closeUnlock() {
+    el.unlockPw.value = '';
+    el.unlockDlg.hidden = true;
+  }
+
+  $('unlockCancel').addEventListener('click', closeUnlock);
+  $('unlockOk').addEventListener('click', submitUnlock);
+  el.unlockPw.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.isComposing) {
+      e.preventDefault();
+      submitUnlock();
+    }
+  });
+  function submitUnlock() {
+    const pw = el.unlockPw.value;
+    if (!pw) {
+      el.unlockPw.focus();
+      return;
+    }
+    closeUnlock(); // 密码只在这里经过一下，不保存、不写日志
+    unlockPc(pw);
+  }
+
+  /** 登记一条等回执的解锁请求，返回收到回执时完成的 Promise */
+  function waitCmd(id, via) {
+    return new Promise((resolve) => {
+      cmdWaiters.set(id, { via, done: resolve });
+    });
+  }
+
+  function setUnlocking(on) {
+    unlocking = on;
+    refreshStatus();
+  }
+
+  /** 把用户这次输入的 Windows 密码或 PIN 发给电脑解锁 */
+  async function unlockPc(password) {
+    if (!password || unlocking) return;
+    const id = `u${Date.now().toString(36)}${++cmdSeq}`;
+    let reply;
+    if (isLive()) {
+      // 连着画面：密码走数据通道，端到端加密（协议文档 4.6）
+      reply = waitCmd(id, 'peer');
+      sendInput({ t: 'unlock', id, p: password });
+    } else {
+      // 没连画面：用电脑给的公钥加密后经服务器转发（协议文档 2.9）
+      const host = hostCommandTarget();
+      if (!host) return;
+      const key = hostStates.get(host).key;
+      if (!key) {
+        toast('电脑上的被控端刚启动，还没准备好，过几秒再试');
+        return;
+      }
+      setUnlocking(true);
+      const r = await RcUnlock.encrypt(key, password);
+      if (!r.enc) {
+        setUnlocking(false);
+        toast(r.code === 'too-long' ? '密码太长，在这里发不了。请打开一个会话窗口，在画面里解锁'
+          : r.code === 'no-crypto' ? '浏览器不让在这个页面里加密（要用 https 打开）。请打开一个会话窗口，在画面里解锁'
+            : '没能加密密码。请打开一个会话窗口，在画面里解锁');
+        return;
+      }
+      if (!authed || hostId !== host || !hostOnline()) {
+        setUnlocking(false);
+        toast('这台电脑不在线');
+        return;
+      }
+      reply = waitCmd(id, 'server');
+      send({ type: 'host-cmd', host, op: 'unlock', req: id, enc: r.enc });
+    }
+    setUnlocking(true);
+    let timer;
+    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(null), UNLOCK_REPLY_TIMEOUT_MS); });
+    const code = await Promise.race([reply, timeout]);
+    clearTimeout(timer);
+    cmdWaiters.delete(id);
+    setUnlocking(false);
+    if (token) toast(unlockText(code)); // 退出登录了就不提示
+  }
+
+  /** 解锁回执对应的提示；code 为 null 表示没等到回执（同安卓 HostCommands.unlockText） */
+  function unlockText(code) {
+    if (code === null) return '电脑没有回应，电脑上的被控端可能需要更新';
+    if (code === 'ok') return '电脑已解锁';
+    if (code === 'closed') return '连接断开了，不知道电脑解锁了没有';
+    // 被控端重启后换了密钥，这里手里的还是旧的；新的随后会推过来
+    if (code === 'bad-key' || code === 'replayed') return '电脑上的被控端刚重启过，请再试一次';
+    return ERROR_TEXT[code] || `解锁失败（${code}）`;
+  }
+
+  // ---------------------------------------------------------------- 手机壳的接口（鸿蒙 App 注入 window.RemoteClaudeNative）
+  // getPushToken() -> 推送令牌，还没拿到时是空串；consumeLaunchIntent() -> 空串，或点通知打开时的 {"approvalId":"…"}。
+  // 普通浏览器里没有这个对象，下面的都不做。
+
+  const PUSH_POLL_MS = 3000;
+  let pushToken = '';
+  /** 在哪条信令连接上用哪个令牌注册过：每次重连都要再注册一次 */
+  let pushSent = { sock: null, token: '' };
+  let pushPollTimer = null;
+
+  function nativeShell() {
+    try {
+      const n = window.RemoteClaudeNative;
+      return n && (typeof n === 'object' || typeof n === 'function') ? n : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 调手机壳的一个方法，返回字符串；没有这个方法、出错时返回空串。同步、异步返回都认 */
+  async function callNative(name) {
+    const n = nativeShell();
+    if (!n || typeof n[name] !== 'function') return '';
+    try {
+      const v = await n[name]();
+      return typeof v === 'string' ? v.trim() : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /** 拿到推送令牌、连着服务器、这条连接上还没注册过这个令牌时，发 push-register */
+  async function syncPush() {
+    if (!nativeShell()) return;
+    const t = await callNative('getPushToken');
+    if (t) pushToken = t;
+    if (!pushToken || !authed || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (pushSent.sock === ws && pushSent.token === pushToken) return;
+    send({ type: 'push-register', platform: 'harmony', token: pushToken });
+    pushSent = { sock: ws, token: pushToken };
+  }
+
+  /** 令牌可能过一会儿才到：没拿到之前每几秒问一次 */
+  function startPushPoll() {
+    clearInterval(pushPollTimer);
+    if (!nativeShell()) return;
+    pushPollTimer = setInterval(async () => {
+      await syncPush();
+      if (pushToken) {
+        clearInterval(pushPollTimer);
+        pushPollTimer = null;
+      }
+    }, PUSH_POLL_MS);
+  }
+
+  /** 退出登录前告诉服务器别再往这台手机推 */
+  function unregisterPush() {
+    if (pushToken && authed) send({ type: 'push-unregister', token: pushToken });
+    pushSent = { sock: null, token: '' };
+  }
+
+  /** 点通知打开 App 时，打开审批面板并找到那一条 */
+  async function checkLaunchIntent() {
+    const raw = await callNative('consumeLaunchIntent');
+    if (!raw) return;
+    let intent = null;
+    try { intent = JSON.parse(raw); } catch { return; }
+    if (intent && typeof intent.approvalId === 'string' && intent.approvalId) focusApprovalWhenReady(intent.approvalId);
+  }
+
+  // ---------------------------------------------------------------- 弹出层
+
+  /** 最上面那一层弹出的东西的关闭函数；没有时返回 null */
+  function topOverlay() {
+    if (!el.unlockDlg.hidden) return closeUnlock;
+    if (!el.lockDlg.hidden) return () => { el.lockDlg.hidden = true; };
+    if (!el.menuLayer.hidden) return closeMenu;
+    if (!el.approvals.hidden) return closeApprovals;
+    if (!el.picker.hidden) return closePicker;
+    return null;
+  }
+
+  function closeOverlays() {
+    closeUnlock();
+    el.lockDlg.hidden = true;
+    closeMenu();
+    closeApprovals();
+  }
 
   // ---------------------------------------------------------------- 杂项
 
@@ -1167,10 +1803,15 @@
     } catch { /* 省电模式下会被拒绝，无妨 */ }
   }
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && isLive()) keepAwake();
+    if (document.visibilityState !== 'visible') return;
+    if (isLive()) keepAwake();
+    checkLaunchIntent();
+    syncPush();
   });
 
-  $('btnLogout').addEventListener('click', () => {
+  $('menuLogout').addEventListener('click', () => {
+    closeMenu();
+    unregisterPush();
     const old = signOut('');
     if (old) api('logout', {}, old).catch(() => {});
   });
@@ -1185,4 +1826,6 @@
   } else {
     showAuth(hashMode || 'login');
   }
+  startPushPoll();
+  checkLaunchIntent();
 })();

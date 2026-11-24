@@ -4,7 +4,11 @@ const WebSocket = require('ws');
 const { normalizeConfig } = require('../lib/config');
 const { createApp } = require('../lib/app');
 
-async function startServer(overrides = {}) {
+/**
+ * @param {object} [overrides] 配置项
+ * @param {{ log?: Function, now?: () => number, fetch?: typeof fetch }} [appOpts] 交给 createApp
+ */
+async function startServer(overrides = {}, appOpts = {}) {
   const { limits, ...rest } = overrides;
   const cfg = normalizeConfig(
     {
@@ -18,7 +22,7 @@ async function startServer(overrides = {}) {
     },
     __dirname
   );
-  const app = createApp(cfg, { log: () => {} });
+  const app = createApp(cfg, { log: () => {}, ...appOpts });
   const { port } = await app.listen(0, '127.0.0.1');
   const base = `http://127.0.0.1:${port}`;
 

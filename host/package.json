@@ -1,6 +1,6 @@
 {
   "name": "remote-claude-host",
-  "version": "0.9.27",
+  "version": "0.9.28",
   "private": true,
   "description": "RemoteClaude 被控端：采集并操作本机的 Claude 会话窗口",
   "license": "MIT",

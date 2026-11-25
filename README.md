@@ -109,7 +109,7 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"; node host/node
      ```powershell
      claude plugin install remoteclaude@remoteclaude-local
      ```
-   - **从手机解锁电脑**（可选）：装解锁服务，会弹管理员确认，见 [06](docs/06-unlock-service.md)：
+   - **从手机解锁电脑**（可选）：在被控端窗口的"从手机解锁"那一栏点"安装"，确认一次管理员权限就装好了，见 [06](docs/06-unlock-service.md)。被控端打不开时也可以手动运行安装脚本：
      ```powershell
      powershell -ExecutionPolicy Bypass -File host\unlock-service\install.ps1
      ```

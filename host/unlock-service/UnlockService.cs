@@ -1,6 +1,7 @@
 // RemoteClaude 解锁服务：电脑锁屏时，替控制端把 Windows 密码或 PIN 输进登录界面。
 // 设计和安全措施见 docs/06-unlock-service.md。
 // 用 .NET Framework 自带的 csc.exe 编译（只支持 C# 5 语法），安装见 install.ps1。
+// UNLOCK_SERVICE_VERSION 2：改了这个文件就把数字加 1，被控端据此提示"解锁服务有新版本"（host/unlockinstall.js）
 //
 // 运行方式：
 //   RemoteClaudeUnlock.exe            作为 Windows 服务运行（由服务管理器启动，SYSTEM 身份）

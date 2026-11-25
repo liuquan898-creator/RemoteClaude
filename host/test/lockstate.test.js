@@ -170,6 +170,21 @@ test('poll: 没变化时 30 秒才再问一次服务，不重复通知', async (
   assert.equal(env.changes.length, 1, '结果一样就不通知');
 });
 
+test('recheck: 不等 30 秒马上重新问服务，结果变了就通知（被控端窗口里装好服务后用）', async () => {
+  let installed = false;
+  const { env, lock } = setup({ reply: () => (installed ? 'OK locked=0' : null) });
+  assert.equal((await lock.poll()).unlock, false);
+  installed = true;
+  await lock.poll();
+  assert.equal(env.asked.length, 1, '30 秒内普通的 poll 不再问');
+  assert.deepEqual(await lock.recheck(), { locked: false, unlock: true, untrusted: false, detached: false });
+  assert.equal(env.asked.length, 2);
+  // 第一次问到"没装"和初始状态一样，不通知；只有 recheck 问到"装好了"这一次通知
+  assert.deepEqual(env.changes, [{ locked: false, unlock: true, untrusted: false, detached: false }]);
+  await lock.poll();
+  assert.equal(env.asked.length, 2, '重新问过以后照常隔 30 秒');
+});
+
 test('poll: 查不到会话信息时按没断开处理，同一个错误只记一次', async () => {
   const { env, lock } = setup({ session: new Error('koffi 加载失败'), screen: true, reply: () => 'OK locked=1' });
   assert.deepEqual(await lock.poll(), { locked: true, unlock: true, untrusted: false, detached: false });

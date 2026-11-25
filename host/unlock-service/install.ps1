@@ -7,7 +7,13 @@
 # 服务以 SYSTEM 身份运行，所以程序直接以管理员身份编译进 Program Files，
 # 不经过普通用户能改的目录。日志目录 C:\ProgramData\RemoteClaude 也由这里建好并锁住权限。
 # -ExpectSha256 <哈希>：提权后核对要编译的源码，一致才装；不给就把哈希打出来等你输入 y
-param([switch]$Uninstall, [string]$ExpectSha256 = '')
+#
+# 被控端窗口里的"安装解锁服务"按钮（host/unlockinstall.js）从隐藏的窗口里这样调用：
+#   install.ps1 -FromHost -ExpectSha256 <被控端自带源码的哈希>
+# -FromHost：不管现在是不是管理员，都在新窗口里以管理员身份重新打开自己（不然出错时没人看得到），
+#   等它结束，用它的退出码退出：0 装好了，1 失败，2 没能以管理员身份打开（多半是在确认框里点了"否"）。
+# -NoPause：装好了就直接关窗口，不等回车；出错时照样等你看完按回车。-FromHost 重新打开自己时带上它
+param([switch]$Uninstall, [string]$ExpectSha256 = '', [switch]$FromHost, [switch]$NoPause)
 
 $ErrorActionPreference = 'Stop'
 $name = 'RemoteClaudeUnlock'
@@ -33,14 +39,27 @@ $sidUsers = 'S-1-5-32-545'
 # PowerShell 7 建不出建立时就带权限的目录，32 位的拿到的 Program Files 是 (x86)
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin -or $PSVersionTable.PSEdition -ne 'Desktop' -or -not [Environment]::Is64BitProcess) {
+if ($FromHost -or -not $isAdmin -or $PSVersionTable.PSEdition -ne 'Desktop' -or -not [Environment]::Is64BitProcess) {
     $ps = Join-Path $env:WINDIR 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'   # 32 位进程看到的 64 位 System32
     if (-not (Test-Path $ps)) { $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe' }
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
     if ($Uninstall) { $argList += '-Uninstall' }
     if ($ExpectSha256) { $argList += @('-ExpectSha256', $ExpectSha256) }
-    Start-Process -FilePath $ps -ArgumentList $argList -Verb RunAs
-    return
+    if ($FromHost -or $NoPause) { $argList += '-NoPause' }
+    if (-not $FromHost) {
+        Start-Process -FilePath $ps -ArgumentList $argList -Verb RunAs
+        return
+    }
+    try {
+        $proc = Start-Process -FilePath $ps -ArgumentList $argList -Verb RunAs -PassThru
+    } catch {
+        Write-Host "没能以管理员身份运行：$($_.Exception.Message)"
+        exit 2
+    }
+    # 先取一下句柄，进程退出后才读得到退出码
+    $null = $proc.Handle
+    $proc.WaitForExit()
+    exit $proc.ExitCode
 }
 
 function Remove-UnlockService {
@@ -208,6 +227,7 @@ function Repair-AfterFailure {
 $replacing = $false
 $hadService = $false
 $exeReplaced = $false
+$failed = $false
 try {
     if ($Uninstall) {
         Remove-UnlockService
@@ -256,6 +276,7 @@ try {
         Write-Host '被控端 30 秒内会发现它，不用重启。日志在 C:\ProgramData\RemoteClaude\unlock.log（不含密码）。'
     }
 } catch {
+    $failed = $true
     Write-Host "出错：$_" -ForegroundColor Red
     if (-not $Uninstall) {
         if ($replacing) {
@@ -269,4 +290,7 @@ try {
         try { Remove-TempFiles } catch { Write-Host "$_。下次安装时会再清。" -ForegroundColor Yellow }
     }
 }
-Read-Host '按回车关闭'
+if ($failed -or -not $NoPause) { Read-Host '按回车关闭' | Out-Null }
+# 被控端靠退出码知道装没装好（-FromHost）
+if ($failed) { exit 1 }
+exit 0

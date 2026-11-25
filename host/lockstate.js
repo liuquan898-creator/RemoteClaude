@@ -151,7 +151,16 @@ function createLockState(opts) {
     }
   }
 
-  return { poll, unlock, lockedNow, current: () => state };
+  /**
+   * 不等 30 秒，马上重新问一次解锁服务（被控端窗口里装好、重装完服务时用，见 unlockinstall.js）。
+   * 正好有一次在问时，这次直接返回，下一次定时调用（2 秒内）会重新问
+   */
+  function recheck() {
+    serviceCheckedAt = -Infinity;
+    return poll();
+  }
+
+  return { poll, recheck, unlock, lockedNow, current: () => state };
 }
 
 module.exports = {

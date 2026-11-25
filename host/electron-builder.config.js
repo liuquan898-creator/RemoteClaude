@@ -33,6 +33,7 @@ module.exports = {
     'unlockpipe-native.js',
     'lockstate.js',
     'sessioninfo.js',
+    'unlockinstall.js',
     'files.js',
     'account.js',
     'serveraddress.js',
@@ -48,6 +49,9 @@ module.exports = {
     'assets/**',
   ],
   asarUnpack: ['sessions/*.ps1', 'node_modules/koffi/**'],
+  // 解锁服务的源码和安装脚本（docs/06），被控端窗口里点"安装"时用。放在 resources\unlock-service，
+  // 不进 asar：PowerShell 和 C# 编译器要读真的文件
+  extraResources: [{ from: 'unlock-service', to: 'unlock-service', filter: ['UnlockService.cs', 'install.ps1'] }],
   win: {
     target: ['nsis'],
     icon: 'assets/icon.png',

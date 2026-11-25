@@ -1155,6 +1155,23 @@ ipcMain.handle('rc:unlock-enc', async (e, enc) => {
   return r.password ? unlockWith(r.password) : r.code;
 });
 
+// 被控端窗口里安装、更新解锁服务（docs/06）。源码和安装脚本跟着安装包走，在 resources\unlock-service 里
+const unlockInstaller = require('./unlockinstall').createUnlockInstaller({
+  dir: app.isPackaged ? path.join(process.resourcesPath, 'unlock-service') : path.join(__dirname, 'unlock-service'),
+  ask: askUnlockService,
+  log: (msg) => console.log('[解锁服务] ' + msg),
+});
+
+ipcMain.handle('rc:unlock-service', (e) => (isOwnSender(e) ? unlockInstaller.state() : null));
+
+ipcMain.handle('rc:unlock-service-install', async (e) => {
+  if (!isOwnSender(e)) return null;
+  const r = await unlockInstaller.install();
+  // 马上重新问一次服务，页面和控制端看到的"能不能解锁"跟着变；问完再回页面，页面拿到结果时状态已经是新的
+  await lock.recheck().catch((err) => console.error('查锁屏状态出错:', err));
+  return r;
+});
+
 ipcMain.on('rc:release', (e, viewerId) => {
   if (!isOwnSender(e) || typeof viewerId !== 'string') return;
   chain = chain.then(() => releaseHeld(viewerId)).catch(() => {});

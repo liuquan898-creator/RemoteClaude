@@ -45,6 +45,9 @@ contextBridge.exposeInMainWorld('rc', {
   getHostKey: () => ipcRenderer.invoke('rc:host-key'),
   onHostKey: (cb) => ipcRenderer.on('rc:host-key', (_e, key) => cb(key)),
   unlockEnc: (enc) => ipcRenderer.invoke('rc:unlock-enc', enc),
+  // 解锁服务装没装、是不是新版本：{ source, installing }；install 弹管理员确认后安装，返回 { result, exitCode? }
+  getUnlockService: () => ipcRenderer.invoke('rc:unlock-service'),
+  installUnlockService: () => ipcRenderer.invoke('rc:unlock-service-install'),
   setActive: (count) => ipcRenderer.send('rc:active', count),
   setStatus: (kind, text) => ipcRenderer.send('rc:status', kind, text),
   onInputError: (cb) => ipcRenderer.on('rc:input-error', (_e, viewerId, code) => cb(viewerId, code)),

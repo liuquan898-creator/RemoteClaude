@@ -661,23 +661,109 @@ function lockMessage() {
 bridge.getLockState().then((s) => {
   if (s) lockState = s;
   broadcastHostState();
+  // "从手机解锁"那一栏要看服务在不在，拿到锁屏状态以后再显示，免得刚打开时闪一下"没装"
+  refreshUnlockService();
 });
 
 bridge.onLockState((s) => {
   const wasLocked = lockState.locked;
   const wasUntrusted = lockState.untrusted;
+  const wasDetached = !!lockState.detached;
   lockState = s;
-  if (s.untrusted && !wasUntrusted) log('解锁服务要重新安装：管道那头的服务核实不过（多半是旧版），手机上解不了锁，见 docs/06');
-  if (s.locked !== wasLocked) {
-    const how = s.unlock ? '（可以从控制端解锁）' : s.untrusted ? '（解锁服务要重新安装）' : '（没装解锁服务）';
-    log(s.locked ? '电脑已锁屏' + how : '电脑已解锁');
+  if (s.untrusted && !wasUntrusted) log('解锁服务要重新安装：管道那头的服务核实不过（多半是旧版），手机上解不了锁。在上面"从手机解锁"那一栏点"重新安装"');
+  if (s.detached !== wasDetached || s.locked !== wasLocked) {
+    if (s.detached) {
+      log('远程桌面已断开，没有画面' + (s.unlock ? '（可以从控制端接回电脑的显示器）' : s.untrusted ? '（解锁服务要重新安装）' : '（解锁服务不能接回）'));
+    } else {
+      const how = s.unlock ? '（可以从控制端解锁）' : s.untrusted ? '（解锁服务要重新安装）' : '（没装解锁服务）';
+      log(s.locked ? '电脑已锁屏' + how : '电脑已解锁');
+    }
   }
   const msg = lockMessage();
   for (const p of peers.values()) sendToViewer(p, msg);
   broadcastHostState();
+  // 远程桌面断开期间的画面不一定会报"停了"（可能只是不再更新），分辨率也换了：接回后一律重新采集
+  if (wasDetached && !s.detached) {
+    for (const p of peers.values()) p.videoLost = true;
+  }
   // 解锁了：锁屏期间停掉的画面重新采集
   if (wasLocked && !s.locked) {
     for (const [id, p] of peers) restartVideo(id, p);
+  }
+  refreshUnlockService();
+});
+
+// ---------------------------------------------------------------- 安装、更新解锁服务（docs/06）
+
+/** 主进程给的 { source, installing }，source 见 unlockinstall.js 的 sourceState，还没问到时为 null */
+let unlockService = null;
+let newVersionLogged = false;
+
+/** 那一栏显示什么：[状态, 鼠标停留时的说明, 按钮上的字] */
+function unlockServiceView() {
+  const s = unlockService;
+  if (s.installing) return ['正在安装…', '请在弹出的确认框里允许管理员权限；出错时 PowerShell 窗口会停着，看完原因按回车关掉', '安装中…'];
+  if (lockState.untrusted) return ['要重新安装', '电脑上的解锁服务没通过核实（多半是旧版），手机上解不了锁', '重新安装'];
+  if (lockState.unlock) {
+    if (s.source === 'outdated') return ['有新版本', '被控端带了新版的解锁服务，更新后才用得上', '更新'];
+    return ['已装好', '电脑锁屏时可以从手机输入 Windows 密码或 PIN 解锁', '重新安装'];
+  }
+  if (s.source === 'missing') return ['没装', '装好后电脑锁屏时可以从手机输入 Windows 密码或 PIN 解锁', '安装'];
+  return ['没有响应', '解锁服务好像装过，但没在运行，重新安装试试', '重新安装'];
+}
+
+function renderUnlockService() {
+  const card = $('unlockCard');
+  // 被控端里没有自带的安装文件（不该出现），就不显示这一栏
+  card.hidden = !unlockService || unlockService.source === 'no-bundle';
+  if (card.hidden) return;
+  const [status, hint, action] = unlockServiceView();
+  $('unlockStatus').textContent = status;
+  $('unlockInfo').title = hint;
+  $('installUnlock').textContent = action;
+  $('installUnlock').disabled = unlockService.installing;
+}
+
+async function refreshUnlockService() {
+  const s = await bridge.getUnlockService();
+  if (!s) return;
+  unlockService = s;
+  if (s.source === 'outdated' && lockState.unlock && !newVersionLogged) {
+    newVersionLogged = true;
+    log('被控端带了新版的解锁服务，在上面"从手机解锁"那一栏点"更新"');
+  }
+  renderUnlockService();
+}
+
+const UNLOCK_INSTALL_RESULT = {
+  ok: '解锁服务装好了，电脑锁屏时可以从手机解锁',
+  canceled: '没有安装解锁服务：没能以管理员身份运行（多半是在确认框里点了"否"）',
+  untrusted: '安装脚本说装好了，但解锁服务没通过核实，原因见被控端日志 host.log',
+  'no-response': '安装脚本说装好了，但解锁服务没有回应，看看 C:\\ProgramData\\RemoteClaude\\unlock.log',
+  busy: '已经在安装解锁服务了',
+  'no-bundle': '被控端里缺少解锁服务的安装文件，没法安装',
+};
+
+function unlockInstallMessage(r) {
+  if (UNLOCK_INSTALL_RESULT[r.result]) return UNLOCK_INSTALL_RESULT[r.result];
+  // 'failed'：有退出码是脚本自己报错，窗口里写着原因；没有是连 PowerShell 都没启动起来
+  if (r.exitCode === undefined) return '启动不了解锁服务的安装脚本，原因见被控端日志 host.log';
+  return `解锁服务没装好（安装脚本退出码 ${r.exitCode}），原因见弹出的窗口`;
+}
+
+$('installUnlock').addEventListener('click', async () => {
+  if (!unlockService || unlockService.installing) return;
+  unlockService = { ...unlockService, installing: true };
+  renderUnlockService();
+  log('正在安装解锁服务，请在弹出的窗口里确认管理员权限');
+  try {
+    const r = await bridge.installUnlockService();
+    if (r) {
+      log(unlockInstallMessage(r));
+      if (r.result === 'ok') newVersionLogged = false;
+    }
+  } finally {
+    await refreshUnlockService();
   }
 });
 

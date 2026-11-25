@@ -2,15 +2,19 @@
 /**
  * 华为推送服务（Push Kit）服务端接口 v3，给 HarmonyOS NEXT（5.0 及以上）的手机发通知消息。
  *
- *   请求  POST https://push-api.cloud.huawei.com/v3/{projectId}/messages:send
+ *   推送  POST https://push-api.cloud.huawei.com/v3/{projectId}/messages:send
+ *   撤回  POST https://push-api.cloud.huawei.com/v1/{clientId}/messages:revoke   请求体 { notifyId, token: [...] }
+ *         注意是 v1、路径里是应用的 Client ID（不是项目 ID），和推送不一样
  *   头    Authorization: Bearer <JWT>、push-type: 0（通知消息）、Content-Type: application/json
- *   鉴权  用 AppGallery Connect 下载的服务账号密钥自己签 JWT（PS256），直接当 Bearer 令牌用，不用换 OAuth 令牌
+ *   鉴权  用 AppGallery Connect 下载的服务账号密钥自己签 JWT（PS256），直接当 Bearer 令牌用，不用换 OAuth 令牌；撤回用同一个
  *
  * 官方文档：
  *   https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-jwt-token            基于服务账号生成鉴权令牌
  *   https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-scenariozed-api-request-struct  请求结构
  *   https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-scenariozed-api-request-param   请求参数
  *   https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-scenariozed-api-response        响应和错误码
+ *   https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-revoke-alert          撤回通知消息
+ *   https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-msg-revoke        消息撤回接口和错误码
  *
  * 日志里只出现推送令牌的前几位，不出现密钥和 JWT。
  */
@@ -103,14 +107,17 @@ function deadTokensFromPartial(msg) {
 /**
  * @param {object} opts
  * @param {string} opts.projectId
+ * @param {string} [opts.clientId] 应用的 Client ID，撤回通知要用；不填就不能撤回（返回的 revoke 为 null）
  * @param {ReturnType<typeof loadServiceAccount>} opts.account
  * @param {string} [opts.apiBase] 测试时指到假的服务
  * @param {number} [opts.timeoutMs]
  * @param {() => number} [opts.now] 毫秒
  * @param {typeof fetch} [opts.fetch]
  */
-function createHuaweiPushClient({ projectId, account, apiBase = DEFAULT_API_BASE, timeoutMs = DEFAULT_TIMEOUT_MS, now = Date.now, fetch: fetchImpl = fetch }) {
-  const url = `${String(apiBase).replace(/\/+$/, '')}/v3/${encodeURIComponent(projectId)}/messages:send`;
+function createHuaweiPushClient({ projectId, clientId = '', account, apiBase = DEFAULT_API_BASE, timeoutMs = DEFAULT_TIMEOUT_MS, now = Date.now, fetch: fetchImpl = fetch }) {
+  const base = String(apiBase).replace(/\/+$/, '');
+  const url = `${base}/v3/${encodeURIComponent(projectId)}/messages:send`;
+  const revokeUrl = clientId ? `${base}/v1/${encodeURIComponent(clientId)}/messages:revoke` : '';
   let jwt = '';
   let jwtExp = 0;
   let lastSuccessAt = null; // 最近一次有令牌推成功（80000000、80100000）的时间，毫秒
@@ -124,8 +131,8 @@ function createHuaweiPushClient({ projectId, account, apiBase = DEFAULT_API_BASE
     return jwt;
   }
 
-  async function post(body) {
-    const res = await fetchImpl(url, {
+  async function post(target, body) {
+    const res = await fetchImpl(target, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer()}`, 'push-type': '0' },
       body: JSON.stringify(body),
@@ -145,8 +152,17 @@ function createHuaweiPushClient({ projectId, account, apiBase = DEFAULT_API_BASE
     };
   }
 
+  /** 发请求；华为说 JWT 过期（本机时钟偏了之类）时换一个再试一次 */
+  async function postFresh(target, body) {
+    const r = await post(target, body);
+    if (r.code !== CODE_JWT_EXPIRED && !(r.status === 401 && !r.code)) return r;
+    jwt = '';
+    return post(target, body);
+  }
+
   return {
     url,
+    revokeUrl,
     /** 测试用：现在缓存着的 JWT 的过期时间（秒） */
     get jwtExpiresAt() {
       return jwtExp;
@@ -161,13 +177,7 @@ function createHuaweiPushClient({ projectId, account, apiBase = DEFAULT_API_BASE
      *                     configSuspect: boolean }>} configSuspect：回了 80300007 但不能确定是令牌失效，多半是配置不对，没删令牌
      */
     async send(tokens, notification, pushOptions) {
-      const body = { payload: { notification }, target: { token: tokens }, pushOptions };
-      let r = await post(body);
-      if (r.code === CODE_JWT_EXPIRED || (r.status === 401 && !r.code)) {
-        // JWT 被认为过期（本机时钟偏了之类）：换一个再试一次
-        jwt = '';
-        r = await post(body);
-      }
+      const r = await postFresh(url, { payload: { notification }, target: { token: tokens }, pushOptions });
       const ok = r.code === CODE_OK || r.code === CODE_PARTIAL;
       if (ok) lastSuccessAt = now();
       let deadTokens = [];
@@ -180,6 +190,19 @@ function createHuaweiPushClient({ projectId, account, apiBase = DEFAULT_API_BASE
       }
       return { ok, ...r, deadTokens, configSuspect };
     },
+
+    /**
+     * 撤回推过的通知：按推送时的 notifyId 和推给的令牌（一次最多 1000 个）。只撤得掉还没送到手机的、
+     * 和已经显示在通知栏但没被点过的。不抛业务错误、不删令牌：网络错误、超时会抛出，交给调用方记日志。
+     * 没配 clientId 时为 null。
+     * @type {null | ((tokens: string[], notifyId: number) => Promise<{ ok: boolean, status: number, code: string, msg: string, requestId: string }>)}
+     */
+    revoke: revokeUrl
+      ? async (tokens, notifyId) => {
+          const r = await postFresh(revokeUrl, { notifyId, token: tokens });
+          return { ok: r.code === CODE_OK, ...r };
+        }
+      : null,
   };
 }
 

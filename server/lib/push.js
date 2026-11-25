@@ -7,7 +7,10 @@
  *   - 被控端推 approvals 时，hub 把列表交给 onApprovals：没推送过的审批，每条给账号下所有令牌发一条通知。
  *     推送过哪些记在 push_notified 表里，所以电脑重连、重发列表、服务器重启都不会再推一遍。
  *   - 对方服务器出错、流控、网络不通时，服务器自己隔一阵再推（retryLater）。
- *   - 推送失败只记日志，不影响信令。
+ *   - 推成了的审批记下推给了哪些令牌（只在内存里），之后它从这台电脑的列表里消失了（在电脑上处理了、手机上批了、
+ *     会话结束了），就把手机通知栏里那条撤回（revokeGone）。电脑下线时列表没了不算处理掉，不撤；重连以后照着
+ *     电脑发来的列表撤，但要等这次连上以后收到过非空的列表（被控端刚启动时会先发一份空列表）。
+ *   - 推送、撤回失败只记日志，不影响信令。
  */
 const crypto = require('crypto');
 const { WindowCounter } = require('./ratelimit');
@@ -33,6 +36,8 @@ const MAX_LISTS_PER_MIN = 60;
 const RETRY_DELAYS_MS = [30 * 1000, 2 * 60 * 1000, 10 * 60 * 1000];
 /** 电脑最近一份列表留多久不动就忘掉：重推时要看审批还在不在列表里，重推最多拖十几分钟 */
 const LIST_KEEP_MS = 3600 * 1000;
+/** 电脑下线多久以后忘掉它推成过的审批（不再撤回）：盖住一晚上的睡眠、被控端重启升级 */
+const SHOWN_KEEP_MS = 24 * 3600 * 1000;
 /**
  * 审批出现多久还没处理才推送（docs/09 第 10 节）：电脑前的人多半马上就在电脑上处理了，不用再响手机。
  * 配置 push.huawei.alertDelaySec 可以改，0 是一出现就推
@@ -171,6 +176,8 @@ class PushService {
     const delaySec = Number(options.alertDelaySec ?? DEFAULT_ALERT_DELAY_SEC);
     this.delayMs = Number.isFinite(delaySec) && delaySec > 0 ? delaySec * 1000 : 0;
     this.perHour = new WindowCounter(Number(options.maxPerHour) || 60, 3600 * 1000, now);
+    // 撤回单独算：每条推成的审批最多撤一次，正常不会比推送多；只防万一
+    this.revokeRate = new WindowCounter(this.perHour.limit, 3600 * 1000, now);
     this.registerRate = new WindowCounter(30, 60 * 1000, now); // 每个账号每分钟登记次数
     this.listRate = new WindowCounter(MAX_LISTS_PER_MIN, 60 * 1000, now); // 每个账号每分钟处理的列表份数
     this.closed = false;
@@ -179,11 +186,12 @@ class PushService {
     /** 正在发的推送，测试和关闭时用 */
     this.inflight = new Set();
     /**
-     * 每台电脑最近一份列表：hostKey -> { ids, items, firstSeen, done, cappedUntil, at }。ids 是里面的审批编号（重推前看审批还在不在）；
+     * 每台电脑最近一份列表：hostKey -> { ids, items, firstSeen, done, cappedUntil, at, trusted }。ids 是里面的审批编号（重推前看审批还在不在）；
      * items 是校验过的审批，firstSeen 是每条第一次出现在这台电脑的列表里的时间（满 delayMs 才推）；
      * done 表示这份已经处理完，同样的副本可以直接跳过；cappedUntil 不为 0 时，这份里有因为每小时上限没推的，
      * 到这个时间（上限的窗口过了）以后同样的副本要再处理一遍。
-     * @type {Map<string, { ids: Set<string>, items: object[], firstSeen: Map<string, number>, done: boolean, cappedUntil: number, at: number }>}
+     * trusted 为 false 时不照着这份撤回：超过 100 条被截过（看不出后面的还在不在），或者是重连后还没发过非空列表时的空列表。
+     * @type {Map<string, { ids: Set<string>, items: object[], firstSeen: Map<string, number>, done: boolean, cappedUntil: number, at: number, trusted: boolean }>}
      */
     this.lists = new Map();
     /** 等着审批满 delayMs 再处理的定时器：hostKey -> timer，每台电脑最多一个（定到最早到点的那条） */
@@ -193,6 +201,17 @@ class PushService {
      * @type {Map<string, { timer: any, userId: number, hostId: string, item: ReturnType<typeof slimItem> }>}
      */
     this.retries = new Map();
+    /**
+     * 推成了、还没撤的审批推给了哪些令牌：hostKey -> Map<审批编号, 令牌[]>，等它从电脑的列表里消失时撤回。
+     * 没配 clientId（撤不了）时不记。电脑下线、重连都留着；下线满 SHOWN_KEEP_MS 还没回来就整台忘掉（cleanup）。
+     * 每台电脑最多 MAX_ITEMS_PER_LIST 条，多了丢最早的（不撤）：平时每份可信的列表都会删掉不在的，只有列表一直被截过时才会多。
+     * @type {Map<string, Map<string, string[]>>}
+     */
+    this.shown = new Map();
+    /** 这次连上以后发过非空列表的电脑（hostKey）：只有它们发来的空列表才照着撤回 */
+    this.armed = new Set();
+    /** 下线了、还记着推成过的审批的电脑：hostKey -> 下线时间 */
+    this.goneAt = new Map();
     /** 账号到了每小时上限时，日志记到什么时候为止不再记：userId -> 毫秒 */
     this.cappedLogged = new Map();
     /** 上次记"可能是配置不对"警告的时间 */
@@ -201,6 +220,11 @@ class PushService {
 
   get enabled() {
     return !!this.huawei;
+  }
+
+  /** 能不能撤回通知（配了 clientId） */
+  get canRevoke() {
+    return !!this.huawei && typeof this.huawei.revoke === 'function';
   }
 
   /**
@@ -259,29 +283,35 @@ class PushService {
    * 出现还不满 delayMs 的先不推，到点看它还在不在（见 process）。
    * 电脑对每个控制端（含虚拟的 push）各发一份同样的列表：和这台电脑上一份处理完的列表一样时直接跳过，
    * 不碰数据库，也不算进每分钟的份数。账号到了每小时推送上限时，列表只记下编号、不碰数据库，等窗口过了再处理。
-   * @returns {Promise<void>} 这一批推送都结束时 resolve（测试用；hub 不等）
+   * 推成了的审批不在这份列表里了，就撤回它的通知（不受每分钟份数限制：只查内存，撤回次数也有上限）。
+   * @returns {Promise<void>} 这一批推送、撤回都结束时 resolve（测试用；hub 不等）
    */
   onApprovals(userId, hostId, list) {
     if (!this.enabled || this.closed || !Array.isArray(list)) return Promise.resolve();
     const items = validItems(list);
     const key = hostKey(userId, hostId);
+    // 放在跳过副本之前：重连后电脑发来和断开前一样的列表（副本）也算发过非空列表
+    if (items.length) this.armed.add(key);
     const last = this.lists.get(key);
     const now = this.now();
     if (last && last.done && !(last.cappedUntil && last.cappedUntil <= now) && sameIds(last.ids, items)) return Promise.resolve();
     // 超限、出错没处理的也记下最新的编号：重推前看审批还在不在，要用最新的列表
     const firstSeen = new Map();
     for (const x of items) firstSeen.set(x.id, (last && last.firstSeen.get(x.id)) ?? now);
-    const entry = { ids: new Set(items.map((x) => x.id)), items, firstSeen, done: false, cappedUntil: 0, at: now };
+    // 照着这份撤回可不可信：超过 100 条被截过的看不出后面的还在不在；重连后头几份空列表可能是被控端还没读到审批
+    const trusted = list.length <= MAX_ITEMS_PER_LIST && this.armed.has(key);
+    const entry = { ids: new Set(items.map((x) => x.id)), items, firstSeen, done: false, cappedUntil: 0, at: now, trusted };
     this.lists.set(key, entry);
+    const revoking = trusted ? this.revokeGone(userId, hostId, entry.ids) : Promise.resolve();
     const uk = String(userId);
     if (this.listRate.hit(uk)) {
       // 同一个窗口里只在刚超限那次记一条，免得刷屏
       if (this.listRate.count(uk) === MAX_LISTS_PER_MIN + 1) {
         this.log(`[push] 账号 ${userId} 一分钟内发来的审批列表超过 ${MAX_LISTS_PER_MIN} 份，这一分钟里余下的不处理`);
       }
-      return Promise.resolve();
+      return revoking;
     }
-    return this.process(userId, hostId, entry);
+    return Promise.all([revoking, this.process(userId, hostId, entry)]).then(() => {});
   }
 
   /**
@@ -438,7 +468,10 @@ class PushService {
     return job;
   }
 
-  /** 华为的回复：暂时性失败定时重推，无效令牌删掉 */
+  /**
+   * 华为的回复：暂时性失败定时重推，无效令牌删掉，推成了记下推给了谁（之后撤回用）。
+   * @returns {Promise<void>|void} 推的时候审批就已经处理掉了，要马上撤回时是撤回的 Promise
+   */
   onResult({ userId, hostId, item, attempt, targets, sentAt }, r) {
     const msg = redact(r.msg, targets);
     if (!r.ok) {
@@ -453,6 +486,72 @@ class PushService {
       this.log(`[push] 华为说令牌无效（${r.code}），删除账号 ${userId} 的 ${n} 个推送令牌: ${r.deadTokens.map(tokenTag).join(', ')}`);
       this.onTokensChanged(userId);
     }
+    if (r.ok && this.canRevoke) return this.noteShown(userId, hostId, item.id, targets.filter((t) => !r.deadTokens.includes(t)));
+  }
+
+  /**
+   * 一条审批推成了：记下推给了哪些令牌，等它从电脑的列表里消失时撤回。推送要一会儿，这期间它可能已经处理掉了：
+   * 电脑最近的列表可信、里面又没有它，就马上撤。这期间电脑下线了（列表没了）、最近的列表不可信时先记下，看以后的列表。
+   */
+  noteShown(userId, hostId, approvalId, tokens) {
+    if (this.closed || !tokens.length) return undefined;
+    const key = hostKey(userId, hostId);
+    const last = this.lists.get(key);
+    if (last && last.trusted && !last.ids.has(approvalId)) return this.revoke(userId, approvalId, tokens);
+    let shown = this.shown.get(key);
+    if (!shown) this.shown.set(key, (shown = new Map()));
+    shown.set(approvalId, [...new Set([...(shown.get(approvalId) || []), ...tokens])]);
+    if (shown.size > MAX_ITEMS_PER_LIST) shown.delete(shown.keys().next().value); // 丢最早的，不撤
+    return undefined;
+  }
+
+  /**
+   * 电脑发来了新列表：推成了、但已经不在列表里的审批（在电脑上处理了、手机上批了、会话结束了），撤回它们的通知。
+   * 每条只撤一次，撤完就忘掉。没推过的（推迟提醒等着时就处理掉了、推送失败的）本来就不在这里，不撤。
+   * @param {Set<string>} ids 新列表里的审批编号（只传可信的列表，见 onApprovals）
+   */
+  revokeGone(userId, hostId, ids) {
+    const key = hostKey(userId, hostId);
+    const shown = this.shown.get(key);
+    if (!shown) return Promise.resolve();
+    const jobs = [];
+    for (const [approvalId, tokens] of shown) {
+      if (ids.has(approvalId)) continue;
+      shown.delete(approvalId);
+      jobs.push(this.revoke(userId, approvalId, tokens));
+    }
+    if (!shown.size) this.shown.delete(key);
+    return Promise.all(jobs).then(() => {});
+  }
+
+  /** 撤回一条审批的通知。只试一次：失败只记日志，不重试，也不删令牌（推送那边会删）。不抛异常 */
+  revoke(userId, approvalId, tokens) {
+    if (this.closed) return Promise.resolve();
+    const uk = String(userId);
+    if (this.revokeRate.hit(uk)) {
+      if (this.revokeRate.count(uk) === this.revokeRate.limit + 1) {
+        this.log(`[push] 账号 ${userId} 一小时内撤回通知超过 ${this.revokeRate.limit} 次，这一小时里余下的不撤`);
+      }
+      return Promise.resolve();
+    }
+    const targets = tokens.slice(0, MAX_TOKENS_PER_USER);
+    const tags = targets.map(tokenTag).join(', ');
+    const job = Promise.resolve()
+      .then(() => this.huawei.revoke(targets, notifyIdOf(approvalId)))
+      .then(
+        (r) => {
+          if (r.ok) return this.log(`[push] 审批 ${approvalId} 已经处理掉了，撤回了它的通知: ${tags}`);
+          // 80200001（JWT 和 Client ID 不是同一个项目）、80300002（不是应用级的 Client ID）、80300028（令牌和 Client ID 不是同一个应用）、404
+          const badClient = ['80200001', '80300002', '80300028'].includes(r.code) || r.status === 404;
+          const hint = badClient ? '（核对 push.huawei.clientId 是不是这个应用的 Client ID）' : r.status === 503 ? '（华为流控，不重试）' : '';
+          return this.log(`[push] 撤回审批 ${approvalId} 的通知失败: HTTP ${r.status} ${r.code} ${redact(r.msg, targets)} requestId=${r.requestId}${hint}`);
+        },
+        (err) => this.log(`[push] 撤回审批 ${approvalId} 的通知出错: ${err && err.name === 'TimeoutError' ? '超时' : err && err.message}`)
+      )
+      .catch((err) => this.log(`[push] 处理审批 ${approvalId} 的撤回结果出错: ${err && err.message}`))
+      .finally(() => this.inflight.delete(job));
+    this.inflight.add(job);
+    return job;
   }
 
   /** 80300007 但不确定是令牌失效：提示查配置，每小时最多一条 */
@@ -527,9 +626,13 @@ class PushService {
    * 电脑下线了（hub 确认这台电脑没有别的连接以后才调）：忘掉它最近的列表，取消它等着的重推。
    * 不然到点会照着下线前的列表推一条可能早就失效的通知。等着重推的记录已经撤掉（这里再撤一次，以防上回撤销失败），
    * 电脑重连后发来的列表里还有这条的话会重新推。
+   * 列表没了不算审批处理掉：推过的通知不撤，记着推给了谁，重连后看电脑发来的列表再说；下线满 SHOWN_KEEP_MS 就忘掉（cleanup）。
    */
   hostGone(userId, hostId) {
-    this.lists.delete(hostKey(userId, hostId));
+    const key = hostKey(userId, hostId);
+    this.lists.delete(key);
+    this.armed.delete(key);
+    this.goneAt.set(key, this.now());
     this.clearHold(userId, hostId);
     for (const [key, r] of this.retries) {
       if (r.userId !== userId || r.hostId !== hostId) continue;
@@ -537,6 +640,18 @@ class PushService {
       this.retries.delete(key);
       this.unmark(userId, hostId, r.item.id);
     }
+  }
+
+  /**
+   * 电脑连上了（hub 每次电脑鉴权成功时调，包括新连接顶掉还没断开的旧连接时，那时不会有 hostGone）。
+   * 被控端刚启动时还没读到审批，会先发一份空列表，照着它撤就把还在等的通知全撤了：所以这次连上以后，
+   * 收到过非空的列表（arm）之前，空列表不拿来撤回。代价是重连前推过的审批要是在断开期间全处理掉了，
+   * 通知要等电脑下次发非空列表（来了新审批）时才撤。
+   */
+  hostOnline(userId, hostId) {
+    const key = hostKey(userId, hostId);
+    this.armed.delete(key);
+    this.goneAt.delete(key);
   }
 
   cleanup() {
@@ -548,15 +663,27 @@ class PushService {
     }
     const now = this.now();
     for (const [key, last] of this.lists) if (last.at <= now - LIST_KEEP_MS) this.lists.delete(key);
+    for (const [key, at] of this.goneAt) {
+      if (at > now - SHOWN_KEEP_MS) continue;
+      this.goneAt.delete(key);
+      this.shown.delete(key);
+    }
     for (const [uk, until] of this.cappedLogged) if (until <= now) this.cappedLogged.delete(uk);
     this.perHour.cleanup();
+    this.revokeRate.cleanup();
     this.registerRate.cleanup();
     this.listRate.cleanup();
   }
 
-  /** 停止推送，等着的重推都取消（它们的推送记录已经撤掉，服务器下次启动后电脑发来列表时照样推） */
+  /**
+   * 停止推送，等着的重推都取消（它们的推送记录已经撤掉，服务器下次启动后电脑发来列表时照样推）。
+   * 推过谁只在内存里：重启以后，重启前推过的审批不会再撤回
+   */
   close() {
     this.closed = true;
+    this.shown.clear();
+    this.armed.clear();
+    this.goneAt.clear();
     for (const r of this.retries.values()) this.timers.clearTimeout(r.timer);
     this.retries.clear();
     for (const timer of this.holds.values()) this.timers.clearTimeout(timer);

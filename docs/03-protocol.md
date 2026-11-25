@@ -682,8 +682,16 @@
 ```
 
 - 点通知打开 App 首页（`actionType: 0`），`clickAction.data` 的字段出现在 Want 的 `parameters` 里：冷启动在 `onCreate(want)`，热启动在 `onNewWant(want)`（UIAbility 要是 singleton）。App 拿 `approvalId` 和 `hostId` 打开审批面板。`actionType: 0` 要求入口 Ability 的 skills 里有 `entity.system.home` 和 `ohos.want.action.home`，而且不能配 `uris`，否则收不到。
-- `notifyId` 由审批编号算出（SHA-256 前 4 字节，取 0～2147483647），同一条审批再推会覆盖旧通知，不会叠两条。
+- `notifyId` 由审批编号算出（SHA-256 前 4 字节，取 0～2147483647），同一条审批再推会覆盖旧通知，不会叠两条；撤回时也靠它找到这条通知。
 - `category` 和 `testMessage` 取自配置，没申请到自分类权益前只能用 `MARKETING` 加测试消息（09 第 10 节）。
+
+**撤回**。推成了的审批之后不在电脑发来的列表里了（在电脑上处理了、手机上批了、会话结束了），服务器把它的通知从手机上撤掉（服务器配了 `clientId` 时才撤，说明见 [09](09-approvals.md) 10.1 第 6 步、10.5）。电脑下线时列表没了不算处理掉，不撤；重连以后照着电脑发来的列表撤，但每次连上以后要先收到过一份非空的列表，空列表才算数（被控端刚启动时会先发一份空列表）。发给华为的请求（`POST https://push-api.cloud.huawei.com/v1/<应用的 Client ID>/messages:revoke`，头和推送一样：`Authorization: Bearer <JWT>`、`push-type: 0`）：
+
+```json
+{ "notifyId": 1234567890, "token": ["<推送时推给的令牌>"] }
+```
+
+撤回只试一次，失败只记日志。控制端不用做什么，通知由系统收回。
 
 ## 3. WebRTC
 

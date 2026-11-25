@@ -36,7 +36,7 @@ function createHuaweiClient(hw, log, now, fetchImpl) {
   if (hw.projectId && account.projectId && hw.projectId !== account.projectId) {
     log(`警告: push.huawei.projectId（${hw.projectId}）和密钥文件里的 project_id（${account.projectId}）不一致，推送多半会被拒（80300002）`);
   }
-  return createHuaweiPushClient({ projectId, account, apiBase: hw.apiBase, timeoutMs: hw.timeoutMs, now, fetch: fetchImpl });
+  return createHuaweiPushClient({ projectId, clientId: hw.clientId, account, apiBase: hw.apiBase, timeoutMs: hw.timeoutMs, now, fetch: fetchImpl });
 }
 
 /**

@@ -126,6 +126,14 @@ class Hub {
         old.close(4002, 'replaced');
       }
       ws.ctx = { role, userId: session.userId, tokenId: session.tokenId, hostId, email: session.email };
+      // 每次连上（含顶掉还没断开的旧连接）：收到这次连接的非空列表之前，空列表不拿来撤回通知（被控端刚启动时会先发一份空列表）
+      if (this.push) {
+        try {
+          this.push.hostOnline(session.userId, hostId);
+        } catch (err) {
+          this.log(`[push] 处理电脑 ${hostId} 上线出错: ${err && err.message}`);
+        }
+      }
       // 先对已经在线的电脑同步虚拟控制端，再把这台加进去：这台从 auth-ok 的 viewers 里得知
       const pushViewer = this.syncPushViewer(session.userId);
       acc.hosts.set(hostId, ws);

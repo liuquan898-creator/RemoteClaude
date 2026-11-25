@@ -39,6 +39,7 @@ app.listen(cfg.port, cfg.bind).then(() => {
   const hw = cfg.push.huawei;
   if (app.push.enabled) {
     log(`华为推送已启用：类别 ${hw.category}${hw.testMessage ? '，测试消息（每个项目每天最多 1000 条）' : ''}`);
+    if (!app.push.canRevoke) log('提示: 没填 push.huawei.clientId，审批处理掉以后不会撤回鸿蒙手机上推过的通知。');
   } else {
     log('提示: 未配置华为推送，鸿蒙 App 没开着时收不到审批通知。');
   }

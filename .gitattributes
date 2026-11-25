@@ -9,3 +9,5 @@
 host/unlock-service/vdd/MttVDD.dll binary
 host/unlock-service/vdd/MttVDD.inf binary
 host/unlock-service/vdd/mttvdd.cat binary
+# 设置文件：安装脚本（install.ps1 的 $vddHashes）核对它的哈希，检出成 CRLF 就对不上、装不了
+host/unlock-service/vdd/vdd_settings.xml binary

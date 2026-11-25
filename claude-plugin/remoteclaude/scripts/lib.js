@@ -346,10 +346,19 @@ class ToolUseWatch {
 }
 
 /**
+ * 斜杠命令留下的记录（`<command-name>/model</command-name>…`、`<local-command-stdout>…`）不算用户接着说话：
+ * /model 这类本地命令不交给 Claude、不开新的一轮，"下一步"框也还在。而且一轮进行中切换模型时，桌面端要等这一轮
+ * 结束才把这几条写进会话记录（时间戳还是切换的那一刻），正好落在"这一轮结束之后"（2026-11-25 用户遇到：
+ * 叫醒钩子当成用户在电脑上接着做了，没叫醒，手机上没有通知）。斜杠命令要是真开了新的一轮，后面会有 Claude 的回复。
+ */
+const COMMAND_RECORD = /^\s*<(command-name|command-message|command-args|local-command-stdout|local-command-stderr|local-command-caveat)>/;
+const isCommandRecord = (text) => typeof text === 'string' && COMMAND_RECORD.test(text);
+
+/**
  * 一次工具调用之后，会话走到哪了（nextstep.js 用来盯"下一步"框）。顺着会话记录往后读：
  *   - 先认出这次的调用（isMine 说了算；同样的调用再出现就以后一次为准）
  *   - 之后出现 stop_reason 不是 tool_use 的助手消息，或 Stop 钩子的摘要：这一轮结束了（ended）
- *   - 之后出现用户输入（不是工具结果、不是附带信息）、又一次同名调用，或结束后又有新的助手消息：
+ *   - 之后出现用户输入（不是工具结果、不是附带信息、不是斜杠命令的记录）、又一次同名调用，或结束后又有新的助手消息：
  *     会话已经接着往下走了（superseded）
  * 助手的一条消息在记录里按内容块拆成几行，message.id 相同。
  * 钩子叫醒会话的消息在记录里也是一条用户输入（内容是字符串），所以 turnInput 能看出这一轮是不是被叫醒的。
@@ -395,7 +404,9 @@ class TurnWatch {
       const typed = typeof message.content === 'string' && message.content.trim() !== '';
       const blocksIn = blocks.length > 0 && !blocks.some((b) => b.type === 'tool_result');
       if (!typed && !blocksIn) return;
-      this.lastInput = typed ? message.content : blocks.map((b) => (b.type === 'text' ? String(b.text || '') : '')).join('\n');
+      const text = typed ? message.content : blocks.map((b) => (b.type === 'text' ? String(b.text || '') : '')).join('\n');
+      if (isCommandRecord(text)) return;
+      this.lastInput = text;
       if (this.found) this.status = 'superseded';
     } else if (this.found && e.type === 'system' && e.subtype === 'stop_hook_summary' && this.status === 'waiting') {
       this.status = 'ended';
@@ -436,5 +447,6 @@ module.exports = {
   eachLine,
   sessionTitle,
   ToolUseWatch,
+  isCommandRecord,
   TurnWatch,
 };

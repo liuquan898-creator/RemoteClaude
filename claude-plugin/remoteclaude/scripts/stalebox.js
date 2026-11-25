@@ -52,12 +52,12 @@ function scan(transcriptPath, ask, at) {
           seen.typed = false;
           seen.answer = null;
           asked.clear();
-        } else if (seen.woke && text.trim() && !text.startsWith('<task-notification>')) {
-          seen.typed = true; // 后台任务结束的通知不算用户说话
+        } else if (seen.woke && text.trim() && !text.startsWith('<task-notification>') && !lib.isCommandRecord(text)) {
+          seen.typed = true; // 后台任务结束的通知、/model 这类斜杠命令的记录不算用户说话
         }
       } else if (seen.woke) {
         for (const b of blocks) if (b.type === 'tool_result' && asked.has(String(b.tool_use_id))) seen.answer = textOf(b.content);
-        if (blocks.length && !blocks.some((b) => b.type === 'tool_result')) seen.typed = true;
+        if (blocks.length && !blocks.some((b) => b.type === 'tool_result') && !lib.isCommandRecord(textOf(blocks))) seen.typed = true;
       }
     }
   });

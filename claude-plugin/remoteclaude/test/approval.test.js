@@ -395,6 +395,27 @@ test('"下一步"提问：用户在电脑上接着做了就不叫醒', async (t)
   assert.deepEqual([r2.code, r2.stderr], [0, '']);
 });
 
+/** 一轮进行中切换模型：这三条等这一轮结束才写进会话记录，时间戳还是切换的那一刻（2.1.330 实测） */
+const modelSwitch = () => {
+  const timestamp = new Date(Date.now() - 1200000).toISOString();
+  return (
+    line({ type: 'user', isMeta: true, timestamp, message: { content: '<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request.</local-command-caveat>' } }) +
+    line({ type: 'user', timestamp, message: { content: '<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>claude-opus-5-5</command-args>' } }) +
+    line({ type: 'user', timestamp, message: { content: '<local-command-stdout>Set model to `claude-opus-5-5`</local-command-stdout>' } })
+  );
+};
+
+test('"下一步"提问：这一轮中途切换过模型，切换的记录写在结尾之后，照常叫醒', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  hostAlive(dir);
+  const transcript = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(transcript, wrapCall('toolu_w', followUp) + toolResult('toolu_w') + closing() + stopSummary() + modelSwitch());
+  const r = await runNext(wrapPayload(transcript), dir);
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /\n问题：要我把它细化成一份技术方案文档吗？\n/);
+});
+
 test('"下一步"提问：这一轮是被钩子叫醒的、框里还是同一个问题就不再叫醒；换了问题照常叫醒', async (t) => {
   const { wakeMessage } = require('../scripts/nextstep.js');
   const dir = tempDir();
@@ -455,6 +476,11 @@ test('TurnWatch：认出这次调用、这一轮结束、会话接着往下走',
     assert.equal(w.state(), 'ended');
     fs.appendFileSync(transcript, stopSummary() + line({ type: 'custom-title', customTitle: 'x' }));
     assert.equal(w.state(), 'ended');
+    // 斜杠命令的记录（字符串或内容块）不是用户接着说话
+    fs.appendFileSync(transcript, modelSwitch() + line({ type: 'user', message: { content: [{ type: 'text', text: '<command-name>/rename</command-name>' }] } }));
+    assert.equal(w.state(), 'ended');
+    assert.equal(lib.isCommandRecord('<local-command-stderr>x</local-command-stderr>'), true);
+    assert.equal(lib.isCommandRecord('帮我看看 <command-name> 是什么'), false);
     fs.appendFileSync(transcript, line({ type: 'assistant', message: { id: 'msg_next', stop_reason: 'tool_use', content: [{ type: 'text', text: '被别的事叫醒了' }] } }));
     assert.equal(w.state(), 'superseded');
 
@@ -556,6 +582,11 @@ test('旧的"下一步"框：提问答了、Claude 没再调 wrap_up，这一轮
     userSays('这个对性能影响大吗？') + wrapCall('toolu_w2', followUp) + toolResult('toolu_w2') + closing('msg_b') +
     wokenBy(wakeMessage(followUp)) + askCall('toolu_q2') + answered('toolu_q2', CHOSE) + closing('msg_done');
   fs.writeFileSync(transcript, twice);
+  mark();
+  assert.equal((await runStale(transcript, dir)).code, 2);
+
+  // 答了以后切换过模型：斜杠命令的记录不是用户说话，照样提醒
+  fs.writeFileSync(transcript, woken + askCall('toolu_q') + answered('toolu_q', CHOSE) + closing('msg_a') + modelSwitch() + closing('msg_done'));
   mark();
   assert.equal((await runStale(transcript, dir)).code, 2);
 });

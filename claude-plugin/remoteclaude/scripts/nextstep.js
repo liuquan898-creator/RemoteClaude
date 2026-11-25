@@ -103,7 +103,10 @@ async function run(payload, startedAt) {
   let endedAt = 0;
   for (;;) {
     const state = watch.state();
-    if (state === 'superseded') return ''; // 用户在电脑上接着做了
+    if (state === 'superseded') {
+      lib.log('"下一步"提问没叫醒：会话已经接着往下走了（用户在电脑上作答、打了字，或又有了新的回复）');
+      return '';
+    }
     if (state === 'ended') {
       endedAt = endedAt || Date.now();
       if (Date.now() - endedAt >= GRACE_MS) break;
@@ -114,7 +117,10 @@ async function run(payload, startedAt) {
     if (!lib.processAlive(parent)) return '';
     await lib.sleep(POLL_MS);
   }
-  if (!lib.hostAlive()) return '';
+  if (!lib.hostAlive()) {
+    lib.log('"下一步"提问没叫醒：被控端没在运行');
+    return '';
+  }
   if (watch.turnInput.includes(MARK) && watch.turnInput.includes(askLine(ask))) {
     lib.log('"下一步"框里还是刚问过的问题，不再叫醒');
     return '';

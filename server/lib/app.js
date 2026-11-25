@@ -36,7 +36,7 @@ function createHuaweiClient(hw, log, now, fetchImpl) {
   if (hw.projectId && account.projectId && hw.projectId !== account.projectId) {
     log(`警告: push.huawei.projectId（${hw.projectId}）和密钥文件里的 project_id（${account.projectId}）不一致，推送多半会被拒（80300002）`);
   }
-  return createHuaweiPushClient({ projectId, account, apiBase: hw.apiBase, timeoutMs: hw.timeoutMs, now, fetch: fetchImpl });
+  return createHuaweiPushClient({ projectId, clientId: hw.clientId, account, apiBase: hw.apiBase, timeoutMs: hw.timeoutMs, now, fetch: fetchImpl });
 }
 
 /**
@@ -77,7 +77,7 @@ function createApp(cfg, opts = {}) {
     onRevoke: (ids, userId) => hub && hub.revoke(ids, userId),
   });
   const push = new PushService({ store, huawei, options: hw || {}, log, now, ...(opts.timers ? { timers: opts.timers } : {}) });
-  hub = new Hub({ auth, iceServers, limits: cfg.limits, log, push });
+  hub = new Hub({ auth, iceServers, limits: cfg.limits, log, push, store, now });
   push.onTokensChanged = (userId) => hub.syncPushViewer(userId);
 
   const releases = createReleases({ dir: cfg.releasesDir, auth, log });

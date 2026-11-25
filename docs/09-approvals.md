@@ -172,7 +172,8 @@ done 的内容：`{ "kind": "answer", "choice": "allow"|"deny", "text": "拒绝�
   - 提问：每个问题的选项（单选或多选），可以自己填文字，"提交"。问题原文里用反引号括起来的部分（`命令` 或 ```代码块```，代码块第一行的语言名不算）单独显示成等宽字体的一块，旁边有"复制"按钮（0.8.2 起）。原因：用户在手机上看到的是电脑画面，没法从画面上复制文字，照着截图转写长串（比如公钥）容易认错字。
 - **后台常驻**（设置里"后台接收审批"，默认开）：App 切到后台时停止看画面，但保持和服务器的连接，系统要求这时通知栏常驻一条"正在接收审批"。手机重启后自动恢复。国产手机还要在系统设置里允许自启动、不限制后台（设置里有按钮直达"忽略电池优化"）。
   后台连接会被手机掐断：2026-11-21 服务器日志里，用户的小米手机（App 0.9.3）凌晨 1:06 最后一次作答，1:51 连接断开，直到 7:00 用户打开 App 才重新连上，中间 5 个小时收不到任何通知。是系统杀了进程还是休眠断了网，从服务器这边分不出来；App 没有走厂商推送，进程不在或断网时没有别的通道。
-- **通知**：App 不在前台时，每个新审批弹一条系统通知；审批类的通知上有"允许""拒绝"两个按钮，按了要先解锁手机；提问类的点通知打开 App 作答。审批在别处答了或结束了，通知自动消失。
+- **通知推迟 60 秒**（App 0.9.9、服务器 2026-11-24 起，用户 2026-11-24 提的）：审批照常马上出现在 App 的列表里，开着 App 时看得到、答得了；系统通知（Android 的后台通知、鸿蒙的推送）等审批出现满 60 秒、在电脑上还没处理才发。电脑前的人多半马上就在电脑上点了，不用再响手机。提问、被控端自己发的提醒同样推迟。Android 在 App 里按手机收到这条审批的时间算（电脑和手机的时钟可能对不上），鸿蒙在服务器上按服务器第一次看到它的时间算（`push.huawei.alertDelaySec`，见 10.2）。
+- **通知**：App 不在前台时，每个新审批弹一条系统通知（推迟见上一条）；审批类的通知上有"允许""拒绝"两个按钮，按了要先解锁手机；提问类的点通知打开 App 作答。审批在别处答了或结束了，通知自动消失。
 - **提示音**（App 0.9.3 起交给系统）：通知渠道"审批和提问"（`approvals_ring`）的默认铃声是布谷鸟叫（`res/raw/cuckoo.ogg`，由 `tools/make-cuckoo-sound.py` 合成）。换铃声、关声音都在手机的通知设置里改，App 设置里"通知铃声"旁边的"去设置"直接打开这一页；静音、震动、勿扰都由系统处理。一次发出几条新通知时只有第一条响铃、震动、弹横幅，其余静默进通知栏；断线重连后同一个审批重发通知也静默（`setSilent`）。审批通知归在 App 自己的一组里（`approvals`，带一条不响的汇总"Claude 在等你 · N 个审批或提问"，由单条通知负责响）：不分组的话，Android 16 在已有一条通知时会把新来的和它自动归成一组，新来的那条就不响了。App 在前台时不发通知，也不响。渠道的声音建好后 App 改不了，所以每换一次做法就换一个渠道编号，旧的删掉：0.8.x 是 `approvals`（系统默认铃声），0.9.0～0.9.2 是 `approvals_quiet`（渠道无声，App 自己用 MediaPlayer 放布谷鸟，设置里有开关和"试听"）。改回系统管的原因：用户发现手机设置里本来就能选铃声，两处都能设会一次响两声。
 - 连着多台电脑时，审批前面标上电脑名。
 
@@ -212,7 +213,7 @@ node --test --test-timeout=20000 claude-plugin/remoteclaude/test/approval.test.j
 
 ## 10. 鸿蒙手机的系统推送（华为 Push Kit）
 
-鸿蒙 App（HarmonyOS NEXT 原生版 `harmony-native/`，包名 `com.remoteclaude.mobile`）切到后台就会被冻结，保持不了信令连接，不能像 Android App 那样自己弹通知。所以由服务器在有新审批、提问时调华为推送服务（Push Kit）的服务端接口发一条系统通知，App 没开着也能收到；点通知打开 App 的审批面板。消息格式见协议文档 2.10。
+鸿蒙 App（HarmonyOS NEXT 原生版 `harmony-native/`，包名 `com.remoteclaude.mobile`）切到后台就会被冻结，保持不了信令连接，不能像 Android App 那样自己弹通知。所以由服务器在有新审批、提问时调华为推送服务（Push Kit）的服务端接口发一条系统通知，App 没开着也能收到；点通知打开 App 的审批面板。审批处理掉以后（电脑上处理了、手机上批了、会话结束了），服务器把推过的那条通知撤回，通知栏里那条消失（10.5）。消息格式见协议文档 2.10。
 
 ### 10.1 怎么工作
 
@@ -223,11 +224,12 @@ node --test --test-timeout=20000 claude-plugin/remoteclaude/test/approval.test.j
 
 1. App 每次连上信令都用 `pushService.getToken()` 拿到的令牌发 `push-register`。令牌挂在这次登录上：退出登录、重置密码、同一设备重新登录、登录过期时一起删。
 2. 被控端只把 `approvals` 发给连着的控制端。账号有推送令牌时，服务器对电脑报一个编号为 `push` 的虚拟控制端，电脑就会一直把审批列表发过来，被控端不用改。
-3. 服务器比对列表，对没推送过的审批，每条给账号下所有令牌发一条通知。推送过的记在数据库的 `push_notified` 表（留 8 天），电脑重连、重发、服务器重启都不会重推。同一台电脑连着发来的同一份列表（对每个控制端各一份）只处理一次；为了不让恶意账号占住服务器、把库写大，每个账号每分钟最多处理 60 份列表，推送记录每个账号最多留 5000 条（多了删最旧的），一份列表的记录在一个事务里写完。
+3. 服务器比对列表，对没推送过、而且出现满 `alertDelaySec`（默认 60 秒）的审批，每条给账号下所有令牌发一条通知。不满的定个时，到点拿那时电脑最新的列表再看一遍：这期间在电脑上处理掉了（列表里没有了）就不推；电脑下线了就取消，重连后从头算。推送过的记在数据库的 `push_notified` 表（留 8 天），电脑重连、重发、服务器重启都不会重推。同一台电脑连着发来的同一份列表（对每个控制端各一份）只处理一次；为了不让恶意账号占住服务器、把库写大，每个账号每分钟最多处理 60 份列表，推送记录每个账号最多留 5000 条（多了删最旧的），一份列表的记录在一个事务里写完。
 4. 对方服务器出错（5xx、81000001）、流控（429、80300029）、网络不通、超时时，服务器自己隔 30 秒、2 分钟、10 分钟各重推一次（被控端只在审批有变化时才重发列表，指望不上）。重推前这条已经不在电脑最近的列表里（处理掉了）就不推；电脑下线时它等着的重推一并取消，重连后发来的列表里还有这条会重新推；每小时上限照样算；3 次都没成就等电脑下次发列表。等着重推时数据库里没有这条的记录，服务器这时重启了也不会漏推。
 5. 华为说令牌无效时删掉令牌：部分成功 80100000 里 `illegalTokens` 的 `tokenFormatError`、`noRight` 照删；全部无效 80300007 只在这台服务器 24 小时内推成功过（说明配置是对的）时才删——项目 ID、密钥文件和应用对不上时华为也回这个码，照删会把所有账号的令牌删光，所以这时只在日志里提示核对 `projectId`、密钥文件和 App 包名。卸载 App 造成的失效在发送时不报错，只出现在消息回执里，现在没接回执，失效的令牌会留到那次登录作废为止。
+6. 推成了（80000000、80100000）的审批，服务器在内存里记下推给了哪些令牌。之后电脑发来的列表里没有它了，就对这些令牌调一次撤回（`notifyId` 和推送时一样），手机通知栏里那条消失；推送还没回来时就处理掉了的，推成以后马上撤。没推过的（60 秒内就处理掉、推送失败、没有令牌）不撤。电脑下线时列表没了不算处理掉，不撤；推给了谁照样记着，重连以后照着电脑发来的列表撤。但被控端刚启动时还没读到审批，会先发一份空列表，照着它撤就把还在等的通知全撤了：所以每次连上以后，要先收到过一份非空的列表，空列表才拿来撤（断开期间全处理掉了的，要等来了新审批、电脑发非空列表时才撤）。电脑下线满 24 小时没回来就忘掉，不再撤。每台电脑最多记 100 条（列表一直超过 100 条时丢最早的，不撤）。撤回只试一次，失败只记日志（不重试、不删令牌、不影响推送）；每个账号每小时最多撤 `maxPerHour` 次（每条推成的审批最多撤一次，正常到不了）。没填 `clientId` 时不撤回，启动日志里有提示。细节和查到的限制见 10.5。
 
-实现：`server/lib/push.js`（登记、比对、通知内容）、`server/lib/huawei-push.js`（签 JWT、调接口、解读结果），测试 `server/test/push.test.js`（本机假的华为接口）。
+实现：`server/lib/push.js`（登记、比对、通知内容、什么时候撤回）、`server/lib/huawei-push.js`（签 JWT、调推送和撤回接口、解读结果），测试 `server/test/push.test.js`（本机假的华为接口）。
 
 ### 10.2 配置
 
@@ -237,6 +239,7 @@ node --test --test-timeout=20000 claude-plugin/remoteclaude/test/approval.test.j
 "push": {
   "huawei": {
     "projectId": "AppGallery Connect 的项目 ID",
+    "clientId": "应用的 Client ID（一长串数字，写成字符串）",
     "serviceAccountFile": "/etc/remoteclaude/agc-push-key.json",
     "category": "MARKETING",
     "testMessage": true
@@ -247,17 +250,19 @@ node --test --test-timeout=20000 claude-plugin/remoteclaude/test/approval.test.j
 | 字段 | 说明 |
 |---|---|
 | `projectId` | AGC「项目设置」里的项目 ID。不填就用密钥文件里的 `project_id`；两者不一致时启动日志里有警告（华为会回 80300002） |
+| `clientId` | 应用的 Client ID，撤回通知要用（撤回接口的路径里是它，不是项目 ID，见 10.5）。在 HarmonyOS 开发者中心（AGC）「应用管理 → 选这个应用 → 基础信息 → 基本信息」里的「OAuth 2.0客户端ID(凭据)-Client ID」，是应用级的，不是项目设置里那个项目级的客户端 ID。一长串数字，**写成字符串**（写成 JSON 数字会丢精度，服务器起不来）。环境变量 `RC_PUSH_HUAWEI_CLIENT_ID` 优先。不填就只推不撤 |
 | `serviceAccountFile` | 服务账号密钥 JSON 的路径（相对配置文件所在目录）。**放在仓库外**，别提交。环境变量 `RC_PUSH_HUAWEI_KEY_FILE` 优先，`RC_PUSH_HUAWEI_PROJECT_ID` 同理（容器里把密钥文件只读挂进去用） |
 | `category` | 通知类别，默认 `MARKETING`。申请到自分类权益后改成批下来的类别，比如 `WORK` |
 | `testMessage` | 默认 `true`，发测试消息（见 10.3）。拿到自分类权益后改成 `false` |
 | `ttl` | 手机离线时华为保留多久，秒，默认 86400 |
-| `maxPerHour` | 每个账号每小时最多推几条，默认 60（重推也算）。推满以后新来的审批先不推，这个小时过去后电脑再发列表时补推 |
+| `maxPerHour` | 每个账号每小时最多推几条，默认 60（重推也算）。推满以后新来的审批先不推，这个小时过去后电脑再发列表时补推。撤回另算，每小时最多也是这么多次 |
+| `alertDelaySec` | 审批出现多少秒还没在电脑上处理才推送，默认 60，0 是一出现就推（0～600） |
 | `showDetail` | 默认 `false`：通知只说有一条审批（标题按种类是"Claude 要你审批""Claude 要你审批计划""Claude 有问题要问你"，正文"打开 App 查看"），工具名、会话名、命令、路径、问题原文都不经过华为服务器，也不显示在锁屏上。`true` 时带这些细节（正文截到 100 字）。这是服务器级的开关，用户在手机上关不了，只建议自用的服务器打开 |
 | `enabled` | `false` 时不推送（`config.example.json` 里是 `false`） |
 
 没有 `push.huawei` 时不推送，`push-register` 回 `push-not-configured`。配了推送但密钥文件读不出来（不存在、不是 JSON、缺字段、私钥坏了）时服务器起不来，和配置写错一样，报错里写着是哪个文件；暂时不用推送就把 `enabled` 设为 `false`。
 
-鉴权：用密钥文件里的 `private_key` 签 JWT（`alg` 为 PS256，`kid` 为 `key_id`；`iss` 为 `sub_account`，`aud` 为 `https://oauth-login.cloud.huawei.com/oauth2/v3/token`，有效 3600 秒），直接当 `Authorization: Bearer` 用，不用换 OAuth 令牌（HarmonyOS 5 起不支持 OAuth）。JWT 缓存到过期前 5 分钟；华为说过期（80200005）时重签再试一次。日志里推送令牌只留前 6 位，不出现密钥和 JWT。
+鉴权：用密钥文件里的 `private_key` 签 JWT（`alg` 为 PS256，`kid` 为 `key_id`；`iss` 为 `sub_account`，`aud` 为 `https://oauth-login.cloud.huawei.com/oauth2/v3/token`，有效 3600 秒），直接当 `Authorization: Bearer` 用，不用换 OAuth 令牌（HarmonyOS 5 起不支持 OAuth）。推送和撤回用同一个 JWT。JWT 缓存到过期前 5 分钟；华为说过期（80200005）时重签再试一次。日志里推送令牌只留前 6 位，不出现密钥和 JWT。
 
 ### 10.3 限制（2026-11 查的官方文档）
 
@@ -285,9 +290,67 @@ node --test --test-timeout=20000 claude-plugin/remoteclaude/test/approval.test.j
 
 1. 在 AGC 创建项目，项目下创建 HarmonyOS 应用，包名 `com.remoteclaude.mobile`（AppGallery Connect 不允许包名里带 harmony）。项目没设数据处理位置的先设（推送只支持中国境内）。
 2. 开通推送服务：「开发与服务 → 选项目 → 选应用 → 增长 → 推送服务 → 立即开通」。
-3. 签名：DevEco Studio「Project Structure → Signing」登录华为账号自动签名（能力里勾上 Push Kit），或手动申请调试证书和 Profile、注册调试设备。签名必须关联 AGC 里这个应用，否则 `getToken` 失败（1000900010）。HarmonyOS NEXT 不用再配公钥指纹和 Client ID。
+3. 签名：DevEco Studio「Project Structure → Signing」登录华为账号自动签名（能力里勾上 Push Kit），或手动申请调试证书和 Profile、注册调试设备。签名必须关联 AGC 里这个应用，否则 `getToken` 失败（1000900010）。HarmonyOS NEXT 的 App 里不用再配公钥指纹和 Client ID（服务器撤回通知要用 Client ID，见第 5 步）。
 4. 下载服务账号密钥：在 API Console（AGC 的「项目设置 → 服务账号密钥」一类入口，新版界面的菜单名没核实）为这个项目创建"服务账号密钥"，下载 JSON。核对里面的 `project_id` 和项目设置里的项目 ID 一致。
-5. 把密钥文件放到服务器上仓库外的地方（权限只给运行服务器的用户读），在 `config.json` 填 `push.huawei`，或设 `RC_PUSH_HUAWEI_KEY_FILE`。重启服务器，日志里应有"华为推送已启用"。
+5. 把密钥文件放到服务器上仓库外的地方（权限只给运行服务器的用户读），在 `config.json` 填 `push.huawei`，或设 `RC_PUSH_HUAWEI_KEY_FILE`。想让处理掉的审批从手机通知栏撤回，再填 `clientId`：HarmonyOS 开发者中心「应用管理 → 选这个应用 → 基础信息 → 基本信息」里的「OAuth 2.0客户端ID(凭据)-Client ID」（写成字符串）。重启服务器，日志里应有"华为推送已启用"，没填 `clientId` 时还有一条"不会撤回"的提示。
 6. App 侧：`onWindowStageCreate` 里 `loadContent` 成功后调 `notificationManager.requestEnableNotification()` 请求通知权限；每次启动 `pushService.getToken()`，连上信令后 `push-register`。
 7. 想要横幅和铃声时申请自分类权益（10.3），批下来后改配置。
 8. （可选）在「推送服务 → 配置」里配消息回执，能知道卸载、令牌失效、被频控丢弃；服务器现在没有接收回执的接口。
+
+### 10.5 撤回通知（2026-11-24 查的官方文档）
+
+审批处理掉以后，服务器调华为的"消息撤回"接口，把推过的那条通知从手机上撤掉。App 不用改：通知是系统收回的。Android App 自己的后台通知本来就会收回不在新列表里的审批；网页没有系统通知，不涉及。
+
+**接口**（查到的事实）：
+
+```
+POST https://push-api.cloud.huawei.com/v1/<clientId>/messages:revoke
+Content-Type: application/json
+Authorization: Bearer <JWT>          和推送用同一个服务账号签的 JWT
+push-type: 0                         0 是通知消息（2 是语音播报消息，只有这两种能撤）
+
+{ "notifyId": 1234567890, "token": ["<推送令牌>", ...] }
+```
+
+| 项 | 官方写的 |
+|---|---|
+| URL | **v1**，路径里是**应用的 Client ID**，不是项目 ID（推送是 v3 加项目 ID）。指南里专门提醒了这一点 |
+| `notifyId` | 必填，就是推送时 `payload.notification.notifyId`。要撤回的话推送时就得带，而且在 [0, 2147483647] 里（我们用审批编号算的，见协议 2.10，满足） |
+| `token` | 必填，推给了哪些令牌就撤哪些；一次最多 1000 个（我们一个账号最多 10 个） |
+| 怎么撤 | 只能按令牌加 `notifyId` 撤（只给一个会回 80300032） |
+| 撤得掉的 | 还没送到手机的（比如手机离线、华为还缓存着），和已经显示在通知栏但用户还没点的。撤回不改应用角标 |
+| 消息体 | 不超过 4096 字节（不算令牌），超了回 80300008 |
+| 设备 | 手机、平板、PC/2in1；手表从 API 18、智慧屏从 API 19、车机从 API 26.0.1 起 |
+| 成功 | HTTP 200，`code` 为 `80000000` |
+| 撤回接口列的错误码 | 80100001、80100003、80100020（参数、结构体错误）；80200001（没带 JWT，或者签 JWT 的项目和路径里的 Client ID 不是同一个项目）；80200003、80200005（令牌过期）；80300002（推送服务没开通，或者 Client ID 不是应用级的）；80300007（令牌全都无效）；80300010（令牌超过 1000 个）；80300017（令牌属于多个应用）；80300028（令牌和 Client ID 对应的应用对不上）；80300032（没有撤回权限：要同时带令牌和 `notifyId`）；80000001（系统内部错误）。HTTP 401 鉴权失败、404 URL 不对、500/502 服务端或网络、**503 流控** |
+
+服务器的做法：只有推成了的才撤，每条最多撤一次，失败只记日志；80200001、80300002、80300028 和 404 时日志里提示核对 `clientId`，503 时注明是流控、不重试。80200005 时和推送一样重签 JWT 再试一次。撤回的结果不用来删令牌。一份列表里同时消失好几条时，撤回请求是并发发出的（和推送一样）。
+
+**官方没写、没核实的**：
+
+- 推送以后多久之内能撤：没写时限。按"已经显示、还没点"推断，只要通知还在通知栏就能撤，没实测。
+- 撤回有没有每天的配额、算不算进测试消息每天 1000 条、流控的阈值：都没写，只说 503 是流控。
+- 测试消息（`testMessage: true`）推的通知能不能撤：撤回请求里没有 `testMessage` 字段，文档没提。只影响还在用测试消息的服务器（默认配置）；申请到自分类权益、`testMessage` 改成 `false` 以后推的是正式消息，不涉及。
+- 手机离线时：文档说"还没送到手机的"能撤，按字面是华为不再下发这条，没实测。
+- 撤一条已经被点掉、划掉的通知回什么码：没写。
+
+**没测**（要服务器部署、填上 `clientId` 以后用鸿蒙手机实测）：
+
+- 通知栏里那条真的会消失：推一条审批，等 60 秒手机响了以后在电脑上处理掉，看通知是不是没了，服务器日志里有没有"已经处理掉了，撤回了它的通知"。
+- 手机离线时撤回以后上线还收不收得到；还在用测试消息的话，测试消息能不能撤、撤回算不算进每天 1000 条。
+
+**已经对真接口核对过的**（2026-11-24，用服务账号密钥签的 JWT，请求体放一个假令牌、`notifyId` 为 0，撤不掉任何真通知）：
+
+- Client ID 填对时回 HTTP 200、`80300007`（令牌全都无效）：JWT、Client ID、URL 和请求体格式都过了，只是令牌是假的。
+- Client ID 填错（填成 `1`）时回 HTTP 401、`80300002`（No permission）。服务器日志会提示核对 `clientId`。
+- 想自己核对：用 `server/lib/huawei-push.js` 的 `createHuaweiPushClient({ projectId, clientId, account: loadServiceAccount(密钥文件) }).revoke(['假令牌'], 0)`，看回的是 80300007 还是 80300002/80200001。
+
+服务器重启后，重启前推过的不会再撤（推给了谁只在内存里）。电脑下线、重连时的规则见 10.1 第 6 步。
+
+官方文档：
+
+- 撤回通知消息（指南）：https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-revoke-alert （2026-11-19 更新）
+- 消息撤回（接口参考、错误码）：https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-msg-revoke
+- `notifyId` 的取值：https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-scenariozed-api-request-param
+- 在哪看 Client ID：https://developer.huawei.com/consumer/cn/doc/app/agc-help-view-app-info-0000002282674569
+- 官方 Java 示例：https://gitee.com/harmonyos_samples/push-kit_-sample-code_-server-demo_-java 的 `RevokeExamples.java`、`RevokeRequest.java`（请求体只有 `notifyId` 和 `token`，`clientId`、`pushType` 不进请求体）、`PushClient.java`（撤回 URL `https://{域名}/v1/{clientId}/messages:revoke`，头 `push-type` 取 `pushType` 的值，通知为 0）

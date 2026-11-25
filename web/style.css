@@ -447,6 +447,10 @@ button.more { flex: none; min-width: 36px; padding: 0 8px; font-size: 18px; font
 .menu button:active { background: var(--line); }
 .menu-note { padding: 4px 12px 6px; font-size: 12px; white-space: normal; }
 #menuEmail { word-break: break-all; }
+/* 开关一类的菜单项（解锁时打开隐私屏）：右边写着开着还是关着，点了菜单不收起 */
+.menu button.toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.toggle-state { font-size: 13px; color: var(--muted); }
+.menu button.toggle[aria-checked="true"] .toggle-state { color: var(--accent); }
 
 /* ---------------------------------------------------------------- 对话框：锁定确认、解锁 */
 
@@ -464,6 +468,13 @@ button.more { flex: none; min-width: 36px; padding: 0 8px; font-size: 18px; font
 .dialog strong { font-size: 17px; }
 .dialog p { margin: 0; font-size: 14px; }
 .dialog input { height: 44px; margin-top: 0; }
+.dialog p.fine { font-size: 12px; line-height: 1.4; }
+.dialog p.warn-text { color: var(--warn); }
+/* 解锁框里的"记住密码"：勾选框盖掉上面给密码框的宽、高 */
+.dialog .remember { display: flex; flex-direction: column; gap: 2px; }
+.dialog .check { display: flex; align-items: center; gap: 10px; min-height: 36px; font-size: 14px; cursor: pointer; }
+.dialog .check input { flex: none; width: 20px; height: 20px; margin: 0; padding: 0; accent-color: var(--accent); }
+.dialog .check input:focus { outline-offset: 2px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .dialog-actions button { min-width: 72px; min-height: 40px; }
 

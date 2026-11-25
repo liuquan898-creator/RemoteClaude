@@ -7,15 +7,19 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -23,6 +27,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -33,6 +38,7 @@ import com.remoteclaude.android.AppState
 import com.remoteclaude.android.Link
 import com.remoteclaude.android.RemoteController
 import com.remoteclaude.android.RtcPhase
+import com.remoteclaude.android.UnlockPrompt
 import com.remoteclaude.android.windows.HostCommands
 
 /**
@@ -41,11 +47,13 @@ import com.remoteclaude.android.windows.HostCommands
  * 这几项和具体哪个窗口无关：连着画面时走数据通道，没连画面时走信令通道（协议文档 2.9）。
  */
 
-/** 锁定确认、解锁对话框开没开；每个页面各有一份 */
+/**
+ * 锁定确认是为哪台电脑开的，没开时为 null；每个页面各有一份。换了电脑就关掉。
+ * 解锁输入框由 RemoteController 管（[AppState.unlockPrompt]），它要绑定是哪台电脑
+ */
 @Stable
 class HostDialogs {
-    var lockConfirm by mutableStateOf(false)
-    var unlock by mutableStateOf(false)
+    var lockConfirm by mutableStateOf<String?>(null)
 }
 
 @Composable
@@ -85,7 +93,7 @@ fun HostMenuItems(state: AppState, controller: RemoteController, dialogs: HostDi
             enabled = menu.lockEnabled,
             onClick = {
                 onPicked()
-                dialogs.lockConfirm = true
+                dialogs.lockConfirm = state.hostId
             },
         )
         HostCommands.LockItem.Unlock -> DropdownMenuItem(
@@ -93,7 +101,30 @@ fun HostMenuItems(state: AppState, controller: RemoteController, dialogs: HostDi
             enabled = menu.lockEnabled && !state.unlocking,
             onClick = {
                 onPicked()
-                dialogs.unlock = true
+                controller.requestUnlock()
+            },
+        )
+    }
+    // 电脑记着解锁密码时（协议文档 2.9"记住解锁密码"）可以让它忘掉，走信令通道的 host-cmd
+    if (state.unlockSaved && state.hostCommands) {
+        DropdownMenuItem(
+            text = { Text("忘掉记下的解锁密码") },
+            enabled = state.link == Link.Online && state.hostOnline,
+            onClick = {
+                onPicked()
+                controller.forgetUnlockPassword()
+            },
+        )
+    }
+    // 隐私屏（docs/11 第 4.4 节）走信令通道的 host-cmd、要靠解锁服务：被控端 0.9.32 起才认（旧版回 bad-op），
+    // 服务装了且核实过才显示；锁着时不显示，解锁那一下会按设置自动盖
+    if (state.hostCommands && state.canRemember && state.unlockAvailable && !state.pcLocked) {
+        DropdownMenuItem(
+            text = { Text(if (state.pcPrivacy) "关闭隐私屏" else "打开隐私屏") },
+            enabled = menu.lockEnabled,
+            onClick = {
+                onPicked()
+                controller.setPrivacy(!state.pcPrivacy)
             },
         )
     }
@@ -102,19 +133,22 @@ fun HostMenuItems(state: AppState, controller: RemoteController, dialogs: HostDi
 /** 锁定确认和输入密码的对话框，放在页面最外层 */
 @Composable
 fun HostDialogsHost(state: AppState, controller: RemoteController, dialogs: HostDialogs) {
-    if (dialogs.unlock) {
+    state.unlockPrompt?.let { prompt ->
         UnlockDialog(
-            onUnlock = { password ->
-                dialogs.unlock = false
-                controller.unlockPc(password)
-            },
-            onDismiss = { dialogs.unlock = false },
+            prompt = prompt,
+            onUnlock = { password, save -> controller.unlockPc(prompt.host, password, save) },
+            onDismiss = controller::dismissUnlockPrompt,
         )
     }
-    if (dialogs.lockConfirm) {
+    // 锁定确认是为原来那台开的：换了电脑就关掉（确认时还会再核对一次）
+    LaunchedEffect(state.hostId) {
+        if (dialogs.lockConfirm != null && dialogs.lockConfirm != state.hostId) dialogs.lockConfirm = null
+    }
+    dialogs.lockConfirm?.let { host ->
+        val name = state.hosts.firstOrNull { it.id == host }?.name
         AlertDialog(
-            onDismissRequest = { dialogs.lockConfirm = false },
-            title = { Text("锁定电脑？") },
+            onDismissRequest = { dialogs.lockConfirm = null },
+            title = { Text("锁定${HostCommands.pcLabel(name)}？") },
             text = {
                 Text(
                     when {
@@ -127,11 +161,11 @@ fun HostDialogsHost(state: AppState, controller: RemoteController, dialogs: Host
             },
             confirmButton = {
                 TextButton(onClick = {
-                    dialogs.lockConfirm = false
-                    controller.lockPc()
+                    dialogs.lockConfirm = null
+                    controller.lockPc(host)
                 }) { Text("锁定") }
             },
-            dismissButton = { TextButton(onClick = { dialogs.lockConfirm = false }) { Text("取消") } },
+            dismissButton = { TextButton(onClick = { dialogs.lockConfirm = null }) { Text("取消") } },
         )
     }
 }
@@ -144,9 +178,11 @@ fun LockBanner(state: AppState, onUnlock: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
-            Text("电脑已锁屏", fontWeight = FontWeight.SemiBold)
+            Text("${HostCommands.pcLabel(state.currentHost?.name)}已锁屏", fontWeight = FontWeight.SemiBold)
             Text(
                 when {
+                    state.unlockingSaved -> "正在用记下的密码解锁…"
+                    state.unlockAvailable && state.unlockSaved -> "解锁后才能操作。记着密码，点解锁不用再输"
                     state.unlockAvailable -> "解锁后才能操作"
                     state.unlockUntrusted -> "电脑上的解锁服务要重新安装（版本太旧或没通过核实），现在要回到电脑前解锁"
                     else -> "电脑上没装解锁服务，要回到电脑前解锁"
@@ -161,17 +197,31 @@ fun LockBanner(state: AppState, onUnlock: () -> Unit) {
     }
 }
 
-/** 输入 Windows 密码或 PIN。密码只放在这个对话框的内存里，发出去就丢掉 */
+/**
+ * 输入 [prompt] 那台电脑的 Windows 密码或 PIN，标题写明是哪台，免得解错。密码只放在这个对话框的内存里，发出去就丢掉；
+ * 勾着"记住密码"时由电脑加密后存到服务器上（协议文档 2.9"记住解锁密码"），手机不存。
+ * 被控端太旧、不认记住密码时（[UnlockPrompt.canRemember] 为 false）不显示那个勾，也不带 save
+ */
 @Composable
-private fun UnlockDialog(onUnlock: (String) -> Unit, onDismiss: () -> Unit) {
-    var password by remember { mutableStateOf("") }
-    val submit = { if (password.isNotEmpty()) onUnlock(password) }
+private fun UnlockDialog(prompt: UnlockPrompt, onUnlock: (String, Boolean?) -> Unit, onDismiss: () -> Unit) {
+    var password by remember(prompt) { mutableStateOf("") }
+    var save by remember(prompt) { mutableStateOf(true) }
+    val submit = { if (password.isNotEmpty()) onUnlock(password, if (prompt.canRemember) save else null) }
+    val label = HostCommands.pcLabel(prompt.name)
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("解锁电脑") },
+        title = { Text("解锁${label}") },
         text = {
             Column {
-                Text("输入这台电脑的 Windows 登录密码或 PIN。只用这一次，手机和电脑都不保存。", color = RcColors.Muted, fontSize = 13.sp)
+                prompt.note?.let { note ->
+                    Text(note, color = RcColors.Warn, fontSize = 13.sp)
+                    Spacer(Modifier.height(8.dp))
+                }
+                Text(
+                    "输入${label}的 Windows 登录密码或 PIN。" + if (prompt.canRemember) "" else "只用这一次，手机和电脑都不保存。",
+                    color = RcColors.Muted,
+                    fontSize = 13.sp,
+                )
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = password,
@@ -183,6 +233,28 @@ private fun UnlockDialog(onUnlock: (String) -> Unit, onDismiss: () -> Unit) {
                     keyboardActions = KeyboardActions(onDone = { submit() }),
                     modifier = Modifier.fillMaxWidth(),
                 )
+                if (prompt.canRemember) {
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .toggleable(value = save, role = Role.Checkbox, onValueChange = { save = it }),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(checked = save, onCheckedChange = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("记住密码")
+                    }
+                    Text(
+                        if (save) {
+                            "解开以后由这台电脑加密，存在服务器上，只有这台电脑解得开。下次点解锁不用再输"
+                        } else {
+                            "只用这一次，不保存。电脑原来记下的也会删掉"
+                        },
+                        color = RcColors.Muted,
+                        fontSize = 12.sp,
+                    )
+                }
             }
         },
         confirmButton = { TextButton(onClick = submit, enabled = password.isNotEmpty()) { Text("解锁") } },

@@ -6,7 +6,7 @@
  * 信令（列窗口、选窗口、WebRTC 协商）走 WebSocket，发给电脑的消息都带上 host（要操作哪台电脑）；
  * 画面走 WebRTC 视频轨道，鼠标键盘事件走 WebRTC 数据通道。协议见 docs/03-protocol.md。
  * 审批和提问（2.7，界面在 approvals.js）、电脑锁屏状态和不连画面的锁定解锁（2.9、4.6，加密在 unlock.js）
- * 走信令通道，停在会话列表、没看画面时也能用。
+ * 走信令通道，停在会话列表、没看画面时也能用。隐私屏、记住解锁密码、结束控制见 2.9 和 docs/11 第 4.2、4.4 节。
  *
  * 发给被控端的输入事件：
  *   {t:'m', x, y}            移动指针，x/y 是窗口内 0~1 的相对位置
@@ -30,7 +30,11 @@
     approvals: $('approvals'), apprTitle: $('apprTitle'), apprList: $('apprList'), apprEmpty: $('apprEmpty'),
     menuLayer: $('menuLayer'), menu: $('menu'), menuHost: $('menuHost'), menuLock: $('menuLock'), menuLockNote: $('menuLockNote'),
     menuEmail: $('menuEmail'), lockDlg: $('lockDlg'), lockDlgText: $('lockDlgText'),
+    menuPrivacy: $('menuPrivacy'), menuForget: $('menuForget'),
+    menuPrivacyOnUnlock: $('menuPrivacyOnUnlock'), menuPrivacyOnUnlockState: $('menuPrivacyOnUnlockState'),
     unlockDlg: $('unlockDlg'), unlockForm: $('unlockForm'), unlockPw: $('unlockPw'),
+    unlockTitle: $('unlockDlgTitle'), unlockNote: $('unlockDlgNote'), unlockHint: $('unlockDlgHint'),
+    unlockRememberBox: $('unlockRememberBox'), unlockRemember: $('unlockRemember'),
   };
 
   const PROTO = 2;
@@ -61,12 +65,19 @@
     'still-locked': '没解开，请检查密码或 PIN',
     'no-logon-screen': '没找到电脑的登录界面，没有输入密码',
     'busy': '正在解锁，请稍候',
+    // 要先盖隐私屏却没盖上，被控端没有解锁（docs/11 第 4.4 节）
+    'privacy-failed': '隐私屏没盖上，没有解锁。电脑上的解锁服务可能要重新安装；也可以在菜单里关掉“解锁时打开隐私屏”',
+    // 用记下的密码解锁的结果（协议文档 2.9"记住解锁密码"）；一般会直接弹出输入框，用不到这两句
+    'saved-wrong': '记下的密码不对了（可能改过密码），已经删掉，请重新输入',
+    'no-saved': '电脑上没有记下的密码了，请输入密码',
     'failed': '解锁失败',
     'bad-op': '电脑上的被控端不认这个命令，请升级被控端',
   };
   /** 不打开会话窗口就锁定、解锁，要被控端从这个版本起（协议文档 2.9） */
   const HOST_CMD_MIN_VERSION = '0.9.6';
   const UNLOCK_REPLY_TIMEOUT_MS = 30000;
+  /** 开关隐私屏、忘掉记下的密码等回执的时间：电脑上盖、撤黑幕最多要十几秒（同安卓 PRIVACY_REPLY_TIMEOUT_MS） */
+  const HOST_CMD_REPLY_TIMEOUT_MS = 20000;
   /** 图片 id -> 收到回执时调用，参数是错误码，成功时是 'ok'（协议文档 4.5） */
   const imageWaiters = new Map();
   const WHEEL_PER_PIXEL = 1.2; // 浏览器滚轮一格约 100 像素，对应 Windows 的 120
@@ -76,6 +87,12 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch { /* 隐私模式下可能不可用 */ } },
     del(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } },
   };
+
+  /** 设置"解锁时打开隐私屏"（docs/11 第 4.4 节），默认开，记在本浏览器里：'1' 开、'0' 关 */
+  const PRIVACY_ON_UNLOCK_KEY = 'rc.privacyOnUnlock';
+  const privacyOnUnlock = () => store.get(PRIVACY_ON_UNLOCK_KEY) !== '0';
+  /** 解锁框里"记住密码"上次勾没勾（默认勾）。只记这个选择，密码本身浏览器不存 */
+  const REMEMBER_UNLOCK_KEY = 'rc.rememberUnlock';
 
   /** 本浏览器的设备编号：第一次打开时随机生成，不是机密 */
   function deviceId() {
@@ -114,16 +131,26 @@
   let wantHwnd = Number(store.get('rc.hwnd')) || 0; // 上次看的窗口，重连后自动选回去
   let reselectTimer = null;
 
-  /** 电脑 id -> 被控端推来的状态 { lock: {locked, unlock}, key }（协议文档 2.9）；电脑下线、断开服务器时作废 */
+  /**
+   * 电脑 id -> 被控端推来的状态 { lock: {locked, unlock, untrusted, saved}, key, privacy, v032 }（协议文档 2.9）；
+   * 电脑下线、断开服务器时作废。privacy 是隐私屏开着没有（被控端 0.9.32 起，旧版没有，当作没开）；
+   * v032 是被控端 0.9.32 起、认隐私屏和"记住解锁密码"（0.9.32 起的 host-state 总带布尔的 privacy，拿它认版本）
+   */
   const hostStates = new Map();
   /** 数据通道上收到的锁屏状态（协议文档 4.6），只对正在看的这台电脑、这条画面连接有效 */
   let peerLock = null;
   /** 当前电脑回了窗口列表却没推过 host-state：被控端是 0.9.6 以前的版本，不认不连画面的命令 */
   let hostTooOld = false;
-  /** 解锁请求的编号 -> 收到回执时调用（参数是错误码，成功时是 'ok'），via 是 peer 或 server */
+  /** 等回执的命令（解锁、开关隐私屏、忘掉记下的密码）的编号 -> 收到回执时调用（参数是错误码，成功时是 'ok'），via 是 peer 或 server */
   const cmdWaiters = new Map();
   let cmdSeq = 0;
   let unlocking = false;
+  /** 解锁框是为哪台电脑打开的：提交时选的电脑换了就不发（输的是原来那台的密码） */
+  let unlockFor = null;
+  /** 正在等开关隐私屏的回执：要开时是 true、要关时是 false，没在等时是 null */
+  let privacyBusy = null;
+  /** 正在等"忘掉记下的解锁密码"的回执 */
+  let forgetting = false;
 
   const currentHost = () => hosts.find((h) => h.id === hostId) || null;
   const hostOnline = () => {
@@ -286,12 +313,15 @@
 
   /** 清掉登录状态回到登录页，返回原来的令牌（用于通知服务器作废） */
   function signOut(error) {
+    // 退出登录：先告诉正在控制的电脑不控制了（还连着服务器时才发得出去；登录失效时就不用了）
+    releaseHost(hostId);
     const old = token;
     token = null;
     store.del('rc.token');
     clearTimeout(retryTimer);
     if (ws) { ws.onclose = null; ws.close(); ws = null; }
     authed = false;
+    listWhenVisible = false;
     current = null;
     hosts = [];
     windows = [];
@@ -365,9 +395,35 @@
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
 
+  /**
+   * 告诉电脑不再控制它了（host-cmd 的 release，被控端 0.9.32 起，docs/11 第 4.2 节）：被控端马上关掉为这次控制开的虚拟屏、
+   * 不再防息屏，开着的隐私屏先锁屏再撤。换到别的电脑、退出登录时发；页面只是切到后台时不发（回个消息电脑就锁屏了）。
+   * 只发给推过 host-state 的电脑（认 host-cmd）；0.9.32 以前的回 bad-op，不带 req 就没有回执，不影响什么
+   */
+  function releaseHost(id) {
+    if (id && authed && hostStates.has(id)) send({ type: 'host-cmd', host: id, op: 'release' });
+  }
+
   /** 发给当前所选电脑的消息 */
   function sendHost(obj) {
     if (hostId) send({ ...obj, host: hostId });
+  }
+
+  /** 页面藏在后台时连上服务器、电脑上线，没要窗口列表，等回到前台再要 */
+  let listWhenVisible = false;
+
+  /**
+   * 连上服务器、电脑上线时自动要窗口列表。页面藏在后台（切到别的标签页、手机 App 退到后台）时不要：
+   * 被控端会当成在控制这台电脑，防息屏、开虚拟屏（docs/11 第 4.2 节）；记下来，回到前台时再要（见 visibilitychange）
+   */
+  function requestList() {
+    if (!hostOnline()) return;
+    if (document.hidden) {
+      listWhenVisible = true;
+      return;
+    }
+    listWhenVisible = false;
+    sendHost({ type: 'list' });
   }
 
   function wsUrl() {
@@ -418,11 +474,18 @@
   function setHost(id) {
     if (id === hostId) return;
     if (hostId && pc) sendHost({ type: 'stop' });
+    // 换到别的电脑：告诉原来那台不控制了（马上关虚拟屏、隐私屏先锁屏再撤）。原来那台下线、被删掉了就不用发
+    releaseHost(hostId);
     closePeer();
     current = null;
     windows = [];
     hostId = id;
     hostTooOld = false;
+    // 解锁框是为原来那台开的（标题、"记住密码"都是那台的）：关掉、清掉输了一半的密码。提交时还会再核对一次
+    if (!el.unlockDlg.hidden && unlockFor !== id) {
+      closeUnlock();
+      toast('选的电脑换了，解锁框已经关掉，密码没有发出去');
+    }
     if (id) store.set('rc.host', id);
     else store.del('rc.host');
     wantHwnd = 0;
@@ -453,7 +516,7 @@
         showApp();
         renderHostTabs();
         refreshStatus();
-        if (hostOnline()) sendHost({ type: 'list' });
+        if (hostOnline()) requestList();
         else if (hosts.length) openPicker();
         syncPush();
         break;
@@ -477,7 +540,7 @@
         chooseHost();
         renderHostTabs();
         if (wasOnline && !hostOnline()) closePeer();
-        if (hostOnline() && (!wasOnline || !windows.length)) sendHost({ type: 'list' });
+        if (hostOnline() && (!wasOnline || !windows.length)) requestList();
         if (!el.picker.hidden) renderList();
         refreshStatus();
         break;
@@ -536,6 +599,8 @@
         hostStates.set(msg.host, {
           lock: lockFrom(msg.lock),
           key: typeof msg.key === 'string' && msg.key ? msg.key : null,
+          privacy: msg.privacy === true,
+          v032: typeof msg.privacy === 'boolean',
         });
         if (msg.host === hostId) hostTooOld = false;
         refreshStatus();
@@ -1409,11 +1474,13 @@
 
   /**
    * 电脑报来的锁屏状态（host-state 的 lock、数据通道的 lock 消息）。untrusted：电脑上有解锁服务在跑，
-   * 但被控端核实不过它（多半是旧版服务，被控端自动升级了、服务没升级），这时 unlock 是 false
+   * 但被控端核实不过它（多半是旧版服务，被控端自动升级了、服务没升级），这时 unlock 是 false。
+   * saved：电脑记着上次解锁的密码（被控端 0.9.32 起，协议文档 2.9"记住解锁密码"），只在解锁服务能用时算数
    */
   function lockFrom(m) {
     const o = m && typeof m === 'object' ? m : {};
-    return { locked: o.locked === true, unlock: o.unlock === true, untrusted: o.unlock !== true && o.untrusted === true };
+    const unlock = o.unlock === true;
+    return { locked: o.locked === true, unlock, untrusted: !unlock && o.untrusted === true, saved: unlock && o.saved === true };
   }
 
   /** 锁着但不能从这里解锁时的说明 */
@@ -1499,7 +1566,7 @@
       b.className = 'primary';
       b.textContent = unlocking ? '解锁中…' : '解锁';
       b.disabled = unlocking;
-      b.addEventListener('click', openUnlock);
+      b.addEventListener('click', startUnlock);
       box.append(b);
     }
     return box;
@@ -1515,6 +1582,7 @@
     el.menuLock.disabled = !m.enabled;
     el.menuLockNote.textContent = m.note;
     el.menuLockNote.hidden = !m.show || !m.note;
+    renderPrivacyMenu();
     el.menuEmail.textContent = email;
     el.btnKeys.textContent = el.keys.hidden ? '显示按键栏' : '隐藏按键栏';
   }
@@ -1546,8 +1614,47 @@
     closeMenu();
     const m = lockMenu();
     if (!m.enabled) return;
-    if (m.unlock) openUnlock();
+    if (m.unlock) startUnlock();
     else openLockConfirm();
+  });
+
+  /**
+   * 菜单里隐私屏、记下的密码那几项（同安卓 ui/HostMenu.kt）。这两个命令只走信令通道的 host-cmd，
+   * 要电脑认这种命令（推过 host-state）、在线；隐私屏还要被控端 0.9.32 起（v032，更旧的回 bad-op），
+   * 靠解锁服务，装了且核实过、电脑没锁着才显示（锁着时解锁那一下按"解锁时打开隐私屏"自动盖）
+   */
+  function renderPrivacyMenu() {
+    const st = authed && hostOnline() && hostId ? hostStates.get(hostId) : null;
+    const lock = st ? lockInfo() : null;
+    el.menuPrivacy.hidden = !(st && st.v032 && lock.unlock && !lock.locked);
+    el.menuPrivacy.textContent = privacyBusy === true ? '正在打开隐私屏…'
+      : privacyBusy === false ? '正在关闭隐私屏…'
+        : st && st.privacy ? '关闭隐私屏' : '打开隐私屏';
+    el.menuPrivacy.disabled = privacyBusy !== null;
+    el.menuForget.hidden = !(lock && lock.saved);
+    el.menuForget.textContent = forgetting ? '正在忘掉记下的解锁密码…' : '忘掉记下的解锁密码';
+    el.menuForget.disabled = forgetting;
+    const on = privacyOnUnlock();
+    el.menuPrivacyOnUnlock.setAttribute('aria-checked', String(on));
+    el.menuPrivacyOnUnlockState.textContent = on ? '开' : '关';
+  }
+
+  el.menuPrivacy.addEventListener('click', () => {
+    closeMenu();
+    const st = hostId && hostStates.get(hostId);
+    setPrivacy(!(st && st.privacy));
+  });
+  el.menuForget.addEventListener('click', () => {
+    closeMenu();
+    forgetPassword();
+  });
+  // 开关一类的设置：点了菜单不收起，看得到变成了什么
+  el.menuPrivacyOnUnlock.addEventListener('click', () => {
+    const on = !privacyOnUnlock();
+    store.set(PRIVACY_ON_UNLOCK_KEY, on ? '1' : '0');
+    renderMenu();
+    toast(on ? '从这里解锁时，电脑的显示器先盖上黑幕、挡住电脑前的键盘鼠标；不再控制这台电脑时先锁屏再撤掉'
+      : '从这里解锁时不再打开隐私屏，电脑前的人能看到桌面');
   });
 
   /**
@@ -1573,11 +1680,13 @@
 
   function openLockConfirm() {
     const lock = lockInfo();
-    el.lockDlgText.textContent = lock && lock.unlock
-      ? '效果和在电脑上按 Win+L 一样。之后可以在这里输入 Windows 密码或 PIN 解锁。'
-      : lock && lock.untrusted
-        ? '效果和在电脑上按 Win+L 一样。这台电脑上的解锁服务要重新安装（版本太旧或没通过核实），锁定后只能回到电脑前解锁。'
-        : '效果和在电脑上按 Win+L 一样。这台电脑没装解锁服务，锁定后只能回到电脑前解锁。';
+    el.lockDlgText.textContent = lock && lock.saved
+      ? '效果和在电脑上按 Win+L 一样。电脑记着上次的解锁密码，之后在这里点"解锁"就能解开。'
+      : lock && lock.unlock
+        ? '效果和在电脑上按 Win+L 一样。之后可以在这里输入 Windows 密码或 PIN 解锁。'
+        : lock && lock.untrusted
+          ? '效果和在电脑上按 Win+L 一样。这台电脑上的解锁服务要重新安装（版本太旧或没通过核实），锁定后只能回到电脑前解锁。'
+          : '效果和在电脑上按 Win+L 一样。这台电脑没装解锁服务，锁定后只能回到电脑前解锁。';
     el.lockDlg.hidden = false;
     $('lockDlgCancel').focus();
   }
@@ -1592,8 +1701,41 @@
     if (sendHostCommand('lock', { t: 'lock-now' })) toast('已发送锁定命令');
   });
 
-  function openUnlock() {
-    if (unlocking) return;
+  /** 电脑在提示里的叫法：「办公室电脑」，不知道名字时是"这台电脑" */
+  function hostLabel(id) {
+    const h = hosts.find((x) => x.id === id);
+    return h && h.name ? `「${h.name}」` : '这台电脑';
+  }
+
+  /**
+   * 点了"解锁"：电脑记着密码（lock.saved，协议文档 2.9"记住解锁密码"）就不弹输入框，直接让电脑用记下的解锁，
+   * 只试一次、不自动重试（Windows 和解锁服务都限制输错的次数）；没记着就弹输入框
+   */
+  function startUnlock() {
+    if (unlocking || !hostId) return;
+    const lock = lockInfo();
+    if (lock && lock.saved) unlockPc(hostId, { saved: true });
+    else openUnlock('');
+  }
+
+  /** 这台电脑的被控端认不认"记住解锁密码"（0.9.32 起）；旧版不认 save，勾了也记不住，就不显示那个勾 */
+  function canRemember(id) {
+    const st = id && hostStates.get(id);
+    return !!st && st.v032;
+  }
+
+  /** 弹出输入密码的框，记下是为哪台电脑弹的。note 是框里最上面的提醒（记下的密码不对了），没有时是空串 */
+  function openUnlock(note) {
+    if (unlocking || !hostId) return;
+    unlockFor = hostId;
+    el.unlockTitle.textContent = `解锁${hostLabel(hostId)}`;
+    el.unlockNote.textContent = note || '';
+    el.unlockNote.hidden = !note;
+    const remember = canRemember(hostId);
+    el.unlockRememberBox.hidden = !remember;
+    el.unlockRemember.checked = store.get(REMEMBER_UNLOCK_KEY) !== '0';
+    el.unlockHint.textContent = remember ? '输入这台电脑的 Windows 登录密码或 PIN。'
+      : '输入这台电脑的 Windows 登录密码或 PIN。只用这一次，手机和电脑都不保存。';
     el.unlockPw.value = '';
     el.unlockDlg.hidden = false;
     el.unlockPw.focus();
@@ -1602,6 +1744,7 @@
   function closeUnlock() {
     el.unlockPw.value = '';
     el.unlockDlg.hidden = true;
+    unlockFor = null;
   }
 
   $('unlockCancel').addEventListener('click', closeUnlock);
@@ -1618,15 +1761,34 @@
       el.unlockPw.focus();
       return;
     }
-    closeUnlock(); // 密码只在这里经过一下，不保存、不写日志
-    unlockPc(pw);
+    const host = unlockFor;
+    // 勾没显示（旧版被控端）就不带 save
+    const save = el.unlockRememberBox.hidden ? undefined : el.unlockRemember.checked;
+    closeUnlock(); // 密码只在这里经过一下，浏览器不保存、不写日志；记不记住由电脑解开以后自己办
+    if (!host || host !== hostId) {
+      // 框开着的时候换了电脑：输的是原来那台的密码，不能发给现在这台
+      toast('选的电脑已经换了，密码没有发出去');
+      return;
+    }
+    if (save !== undefined) store.set(REMEMBER_UNLOCK_KEY, save ? '1' : '0');
+    unlockPc(host, { password: pw, save });
   }
 
-  /** 登记一条等回执的解锁请求，返回收到回执时完成的 Promise */
+  /** 登记一条等回执的命令，返回收到回执时完成的 Promise */
   function waitCmd(id, via) {
     return new Promise((resolve) => {
       cmdWaiters.set(id, { via, done: resolve });
     });
+  }
+
+  /** 等 waitCmd 登记的回执，最多等 ms 毫秒。返回错误码，成功时是 'ok'，没等到时是 null */
+  async function awaitReply(id, reply, ms) {
+    let timer;
+    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); });
+    const code = await Promise.race([reply, timeout]);
+    clearTimeout(timer);
+    cmdWaiters.delete(id);
+    return code;
   }
 
   function setUnlocking(on) {
@@ -1634,49 +1796,120 @@
     refreshStatus();
   }
 
-  /** 把用户这次输入的 Windows 密码或 PIN 发给电脑解锁 */
-  async function unlockPc(password) {
-    if (!password || unlocking) return;
+  /**
+   * 让电脑 host（就是当前所选的那台）解锁。password 是用户这次输入的 Windows 密码或 PIN，save 是解开以后要不要电脑记住它
+   * （被控端 0.9.32 起，false 时电脑把原来记下的也删掉，undefined 时不带、不动）；saved 为 true 时不带密码，让电脑用记下的。
+   * 都带上设置"解锁时打开隐私屏"（privacy，docs/11 第 4.4 节）。旧版被控端不认这几个字段，照旧解锁
+   */
+  async function unlockPc(host, { password = '', save, saved = false } = {}) {
+    if (unlocking || (!saved && !password) || !host || host !== hostId) return;
     const id = `u${Date.now().toString(36)}${++cmdSeq}`;
+    const privacy = privacyOnUnlock();
     let reply;
     if (isLive()) {
-      // 连着画面：密码走数据通道，端到端加密（协议文档 4.6）
+      // 连着画面：走数据通道，端到端加密（协议文档 4.6）
       reply = waitCmd(id, 'peer');
-      sendInput({ t: 'unlock', id, p: password });
+      sendInput(saved ? { t: 'unlock', id, saved: true, privacy } : { t: 'unlock', id, p: password, privacy, save });
     } else {
-      // 没连画面：用电脑给的公钥加密后经服务器转发（协议文档 2.9）
-      const host = hostCommandTarget();
-      if (!host) return;
-      const key = hostStates.get(host).key;
-      if (!key) {
-        toast('电脑上的被控端刚启动，还没准备好，过几秒再试');
-        return;
-      }
-      setUnlocking(true);
-      const r = await RcUnlock.encrypt(key, password);
-      if (!r.enc) {
-        setUnlocking(false);
-        toast(r.code === 'too-long' ? '密码太长，在这里发不了。请打开一个会话窗口，在画面里解锁'
-          : r.code === 'no-crypto' ? '浏览器不让在这个页面里加密（要用 https 打开）。请打开一个会话窗口，在画面里解锁'
-            : '没能加密密码。请打开一个会话窗口，在画面里解锁');
-        return;
-      }
-      if (!authed || hostId !== host || !hostOnline()) {
-        setUnlocking(false);
-        toast('这台电脑不在线');
-        return;
-      }
+      // 没连画面：经服务器转发（协议文档 2.9）。用记下的密码时什么都不带，否则先用电脑给的公钥加密
+      if (hostCommandTarget() !== host) return;
+      const msg = saved
+        ? { type: 'host-cmd', host, op: 'unlock', req: id, saved: true, privacy }
+        : await sealedUnlock(host, id, password, privacy, save);
+      if (!msg) return;
       reply = waitCmd(id, 'server');
-      send({ type: 'host-cmd', host, op: 'unlock', req: id, enc: r.enc });
+      send(msg);
+    }
+    if (saved) toast(`正在用记下的密码解锁${hostLabel(host)}…`);
+    setUnlocking(true);
+    const code = await awaitReply(id, reply, UNLOCK_REPLY_TIMEOUT_MS);
+    setUnlocking(false);
+    if (!token) return; // 退出登录了就不提示
+    if (saved && (code === 'saved-wrong' || code === 'no-saved')) {
+      // 记下的不对了（电脑已经删掉）、电脑上其实没有：弹输入框让用户手动输。这期间换了电脑就只提示
+      if (authed && hostId === host) {
+        el.toast.hidden = true;
+        openUnlock(ERROR_TEXT[code]);
+      } else {
+        toast(unlockText(code));
+      }
+      return;
+    }
+    toast(unlockText(code)); // 别的错误照常提示，电脑记下的密码留着
+  }
+
+  /** 不连画面时的解锁请求：密码用电脑给的公钥加密（unlock.js）。发不了时提示原因、返回 null */
+  async function sealedUnlock(host, id, password, privacy, save) {
+    const key = hostStates.get(host).key;
+    if (!key) {
+      toast('电脑上的被控端刚启动，还没准备好，过几秒再试');
+      return null;
     }
     setUnlocking(true);
-    let timer;
-    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(null), UNLOCK_REPLY_TIMEOUT_MS); });
-    const code = await Promise.race([reply, timeout]);
-    clearTimeout(timer);
-    cmdWaiters.delete(id);
-    setUnlocking(false);
-    if (token) toast(unlockText(code)); // 退出登录了就不提示
+    const r = await RcUnlock.encrypt(key, password);
+    if (!r.enc) {
+      setUnlocking(false);
+      toast(r.code === 'too-long' ? '密码太长，在这里发不了。请打开一个会话窗口，在画面里解锁'
+        : r.code === 'no-crypto' ? '浏览器不让在这个页面里加密（要用 https 打开）。请打开一个会话窗口，在画面里解锁'
+          : '没能加密密码。请打开一个会话窗口，在画面里解锁');
+      return null;
+    }
+    // 加密要一会儿，这期间可能断开、换了电脑
+    if (!authed || hostId !== host || !hostOnline()) {
+      setUnlocking(false);
+      toast('这台电脑不在线');
+      return null;
+    }
+    return { type: 'host-cmd', host, op: 'unlock', req: id, enc: r.enc, privacy, save };
+  }
+
+  /**
+   * 开、关隐私屏（host-cmd 的 privacy，被控端 0.9.32 起，docs/11 第 4.4 节）：开是电脑的显示器盖上黑幕、挡住电脑前的键盘鼠标，
+   * 关只撤黑幕、不锁屏。只走信令通道，等回执；开着没有以电脑随后推来的 host-state 为准（同安卓 RemoteController.setPrivacy）
+   */
+  async function setPrivacy(on) {
+    if (privacyBusy !== null) return;
+    const host = hostCommandTarget();
+    if (!host) return;
+    const req = `p${Date.now().toString(36)}${++cmdSeq}`;
+    const reply = waitCmd(req, 'server');
+    send({ type: 'host-cmd', host, op: 'privacy', req, on });
+    privacyBusy = on;
+    renderHostUi();
+    const code = await awaitReply(req, reply, HOST_CMD_REPLY_TIMEOUT_MS);
+    privacyBusy = null;
+    renderHostUi();
+    if (token) toast(privacyText(on, code));
+  }
+
+  /** 开关隐私屏的回执对应的提示；code 为 null 表示没等到回执 */
+  function privacyText(on, code) {
+    if (code === 'ok') return on ? '已打开隐私屏：电脑的显示器盖上了黑幕' : '已关闭隐私屏';
+    if (code === null) return '电脑没有回应';
+    if (code === 'closed') return on ? '连接断开了，不知道隐私屏打开了没有' : '连接断开了，不知道隐私屏关掉了没有';
+    if (code === 'bad-op') return '电脑上的被控端太旧，不支持隐私屏，请升级';
+    return on ? '隐私屏没打开，电脑上的解锁服务可能要重新安装' : '隐私屏没关掉';
+  }
+
+  /** 让电脑忘掉记下的解锁密码（host-cmd 的 forget-password，被控端 0.9.32 起）。删掉以后电脑会推来不带 saved 的状态 */
+  async function forgetPassword() {
+    if (forgetting) return;
+    const host = hostCommandTarget();
+    if (!host) return;
+    const req = `f${Date.now().toString(36)}${++cmdSeq}`;
+    const reply = waitCmd(req, 'server');
+    send({ type: 'host-cmd', host, op: 'forget-password', req });
+    forgetting = true;
+    renderHostUi();
+    const code = await awaitReply(req, reply, HOST_CMD_REPLY_TIMEOUT_MS);
+    forgetting = false;
+    renderHostUi();
+    if (!token) return;
+    toast(code === 'ok' ? `${hostLabel(host)}不再记着解锁密码了，下次解锁要重新输入`
+      : code === null ? '电脑没有回应'
+        : code === 'closed' ? '连接断开了，不知道电脑删掉了没有'
+          : code === 'bad-op' ? '电脑上的被控端太旧，请升级'
+            : '没能忘掉记下的解锁密码');
   }
 
   /** 解锁回执对应的提示；code 为 null 表示没等到回执（同安卓 HostCommands.unlockText） */
@@ -1804,6 +2037,8 @@
   }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
+    // 藏在后台时没要的窗口列表，现在要；还没连上服务器就等连上时再要（auth-ok）
+    if (listWhenVisible && authed) requestList();
     if (isLive()) keepAwake();
     checkLaunchIntent();
     syncPush();

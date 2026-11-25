@@ -22,11 +22,13 @@
     "huawei": {
       "enabled": false,
       "projectId": "AppGallery Connect 的项目 ID（项目设置里看；不填就用密钥文件里的 project_id）",
+      "clientId": "应用的 Client ID（应用基本信息里的 OAuth 2.0 客户端 ID，写成字符串）；撤回处理掉的审批的通知要用，不填就不撤回",
       "serviceAccountFile": "服务账号密钥 JSON 的路径，放在仓库外；也可以用环境变量 RC_PUSH_HUAWEI_KEY_FILE",
       "category": "MARKETING",
       "testMessage": true,
       "ttl": 86400,
       "maxPerHour": 60,
+      "alertDelaySec": 60,
       "showDetail": false
     }
   }

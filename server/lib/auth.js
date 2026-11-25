@@ -185,6 +185,8 @@ class AuthService {
 
     this.store.setPassword(user.id, await hashPassword(password));
     const revoked = this.store.deleteTokensOfUser(user.id);
+    // 账号可能被别人知道了：电脑记下的解锁密码一起删掉，不然知道账号的人照样能从手机解开电脑
+    this.store.deleteUnlockSecretsOfUser(user.id);
     this.loginFailEmail.reset(email);
     this.log(`[账号] ${email} 重置了密码（${ip}），${revoked.length} 个设备已下线`);
     this.onRevoke(revoked, user.id);
@@ -196,6 +198,8 @@ class AuthService {
     const row = typeof token === 'string' && token ? this.store.findToken(sha256(token)) : null;
     if (!row) return { ok: true };
     this.store.deleteToken(Number(row.id));
+    // 电脑退出登录：它记下的解锁密码也删掉
+    if (row.kind === 'host') this.store.deleteUnlockSecret(Number(row.user_id), String(row.device_id));
     this.onRevoke([Number(row.id)], Number(row.user_id));
     return { ok: true };
   }

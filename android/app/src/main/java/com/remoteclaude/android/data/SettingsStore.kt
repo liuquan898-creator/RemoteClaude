@@ -32,6 +32,8 @@ data class AppSettings(
     val backgroundApprovals: Boolean = true,
     /** 看画面时，电脑上新复制的文字自动放进手机剪贴板（协议文档 4.9） */
     val syncClipboard: Boolean = true,
+    /** 从手机解锁时先在电脑的真显示器上盖隐私屏的黑幕，电脑前的人看不到桌面（docs/11 第 4.4 节） */
+    val privacyOnUnlock: Boolean = true,
 )
 
 /** 启动时一次性读出的全部本地数据 */
@@ -72,6 +74,7 @@ class SettingsStore(context: Context) {
         val appLock = booleanPreferencesKey("app_lock")
         val backgroundApprovals = booleanPreferencesKey("background_approvals")
         val syncClipboard = booleanPreferencesKey("sync_clipboard")
+        val privacyOnUnlock = booleanPreferencesKey("privacy_on_unlock")
         val collapsedGroups = stringSetPreferencesKey("collapsed_groups")
     }
 
@@ -97,6 +100,7 @@ class SettingsStore(context: Context) {
                 appLock = p[Keys.appLock] ?: defaults.appLock,
                 backgroundApprovals = p[Keys.backgroundApprovals] ?: defaults.backgroundApprovals,
                 syncClipboard = p[Keys.syncClipboard] ?: defaults.syncClipboard,
+                privacyOnUnlock = p[Keys.privacyOnUnlock] ?: defaults.privacyOnUnlock,
             ),
             collapsedGroups = p[Keys.collapsedGroups].orEmpty(),
         )
@@ -124,6 +128,7 @@ class SettingsStore(context: Context) {
         it[Keys.appLock] = s.appLock
         it[Keys.backgroundApprovals] = s.backgroundApprovals
         it[Keys.syncClipboard] = s.syncClipboard
+        it[Keys.privacyOnUnlock] = s.privacyOnUnlock
     }
 
     /** "全部会话"里折叠起来的环境；环境删掉以后它的记录留着也没关系，超过 [MAX_COLLAPSED] 个就不再多记 */

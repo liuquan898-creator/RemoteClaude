@@ -30,6 +30,20 @@ $srcOld = Join-Path $dir 'UnlockService.old.cs'
 $exeOld = Join-Path $dir 'RemoteClaudeUnlock.old.exe'
 $dataDir = Join-Path $env:ProgramData 'RemoteClaude'
 
+# 虚拟屏驱动（docs/11）：VirtualDrivers/Virtual-Display-Driver 25.7.23 的 VirtualDisplayDriver-x86.Driver.Only.zip
+#（sha256 e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a）里的三个文件，MIT 许可，SignPath Foundation 签名。
+# 先复制进只有管理员能改的安装目录，核对哈希和签名后再装；驱动的设置也放在那里，用注册表 VDDPATH 告诉驱动
+$vddSource = Join-Path $PSScriptRoot 'vdd'
+$vddDir = Join-Path $dir 'vdd'
+$vddRegKey = 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver'
+$vddHashes = @{
+    'MttVDD.dll' = 'C9CA837F57A98FBD43BC416A7F535A95843626E7759EAF85CF0CD7CE334DBB05'
+    'MttVDD.inf' = '550D211FE481E74DFE3F9D724ED78BE48B3A9113405965D683D9373E8D672F5D'
+    'mttvdd.cat' = '08A0093FC9B2E32B287A6F8A77CA4DE0A31830D29FC33D2B13A918DC859468F6'
+    # 我们自己的设置（改了它就要改这里）
+    'vdd_settings.xml' = '04392AD0307D59E8DB994F226BD078B9D696D75A783A0BE8997F0038B8F4A3B3'
+}
+
 # 用 SID 而不是名字，中文 Windows 上组名是"管理员""用户"
 $sidSystem = 'S-1-5-18'
 $sidAdmins = 'S-1-5-32-544'
@@ -222,14 +236,76 @@ function Repair-AfterFailure {
     }
 }
 
+# 装虚拟屏驱动：复制、核对哈希和签名、写设置和 VDDPATH，再让服务程序建设备、装驱动、停用（--install-display）。
+# 失败只警告不中止：解锁服务已经装好了，虚拟屏用不了不影响解锁。返回 $true 表示装好了
+function Install-VirtualDisplay {
+    if (-not (Test-Path -LiteralPath $vddSource)) {
+        Write-Host '安装包里没有虚拟屏驱动，跳过。'
+        return $true
+    }
+    try {
+        New-Item -ItemType Directory -Force -Path $vddDir | Out-Null
+        foreach ($f in $vddHashes.Keys) {
+            Copy-Item -LiteralPath (Join-Path $vddSource $f) -Destination (Join-Path $vddDir $f) -Force
+        }
+        foreach ($f in $vddHashes.Keys) {
+            $h = (Get-FileHash -LiteralPath (Join-Path $vddDir $f) -Algorithm SHA256).Hash
+            if ($h -ne $vddHashes[$f]) { throw "$f 的哈希不对（$h），不装" }
+        }
+        foreach ($f in @('mttvdd.cat', 'MttVDD.dll')) {
+            $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $vddDir $f)
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch '^CN=SignPath Foundation,') { throw "$f 的签名不对（$($sig.Status)），不装" }
+        }
+        # 驱动每次启用时从 VDDPATH 指的目录读 vdd_settings.xml；没写就读 C:\VirtualDisplayDriver，那个目录普通用户能建、能放文件。
+        # 所以装之前就写好：装的时候驱动会启动一次，也读这里。电脑上已经有别人装的同一个驱动时（退出码 2）改回去
+        $hadPath = (Get-ItemProperty -Path $vddRegKey -Name VDDPATH -ErrorAction SilentlyContinue).VDDPATH
+        New-Item -Path $vddRegKey -Force | Out-Null
+        Set-ItemProperty -Path $vddRegKey -Name VDDPATH -Value $vddDir
+        Write-Host '安装虚拟屏驱动。Windows 可能问要不要安装 SignPath Foundation 的设备软件：点"安装"，不要勾"始终信任"……'
+        & $exe --install-display (Join-Path $vddDir 'MttVDD.inf') | Out-Host
+        $code = $LASTEXITCODE
+        if ($code -ne 0) {
+            if ($hadPath) { Set-ItemProperty -Path $vddRegKey -Name VDDPATH -Value $hadPath }
+            else { Remove-ItemProperty -Path $vddRegKey -Name VDDPATH -ErrorAction SilentlyContinue }
+        }
+        # 2：电脑上已经有别的程序装的同一个驱动，什么都没动，虚拟屏功能不启用
+        if ($code -eq 2) { return $true }
+        if ($code -ne 0) { throw "--install-display 退出码 $code" }
+        return $true
+    } catch {
+        Write-Host "虚拟屏驱动没装上：$_。解锁服务不受影响，可以重新运行安装脚本再试。" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+# 卸载虚拟屏驱动：先停用再删设备（开着删要重启才消失），再删驱动包和设置
+function Remove-VirtualDisplay {
+    if (Test-Path -LiteralPath $exe) {
+        & $exe --uninstall-display | Out-Host
+        # 没停用、没删掉就别往下删服务：之后没有看门狗了，开着的虚拟屏会一直开着
+        if ($LASTEXITCODE -ne 0) { throw '没能停用、删除虚拟屏设备，解锁服务先不卸载。可以在设备管理器里停用"Virtual Display Driver"后再运行一次' }
+    }
+    # pnputil 的输出跟着系统语言走：按空行分成一个个驱动，找原始名是 mttvdd.inf 的那个 oemNN.inf。
+    # 不加 /uninstall、/force：别的程序装的同一个驱动还有设备在用时，pnputil 会拒绝删，不会把它从那个设备上卸掉
+    foreach ($block in ((& pnputil.exe /enum-drivers | Out-String) -split "(\r?\n){2,}")) {
+        if ($block -match '(?i)\bmttvdd\.inf\b' -and $block -match '(?i)\b(oem\d+\.inf)\b') {
+            & pnputil.exe /delete-driver $Matches[1] | Out-Host
+        }
+    }
+    $current = (Get-ItemProperty -Path $vddRegKey -Name VDDPATH -ErrorAction SilentlyContinue).VDDPATH
+    if ($current -eq $vddDir) { Remove-ItemProperty -Path $vddRegKey -Name VDDPATH -ErrorAction SilentlyContinue }
+}
+
 # $replacing：开始停用、替换旧服务以后为 $true，在这之前出错或取消，旧服务和旧程序原样不动；
 # 之后出错由 Repair-AfterFailure 看实际状态处理。$hadService：开始替换前装着服务；$exeReplaced：新程序已经就位
 $replacing = $false
 $hadService = $false
 $exeReplaced = $false
 $failed = $false
+$warned = $false
 try {
     if ($Uninstall) {
+        Remove-VirtualDisplay
         Remove-UnlockService
         if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
         Write-Host '解锁服务已卸载。' -ForegroundColor Green
@@ -251,7 +327,8 @@ try {
         } else {
             if ((Read-Host '核对一致后输入 y 继续安装') -ne 'y') { throw '已取消，没有安装' }
         }
-        & $csc /nologo /codepage:65001 /target:exe /optimize+ /platform:x64 "/out:$exeNew" /reference:System.ServiceProcess.dll $srcNew
+        # WinForms、Drawing：隐私屏的黑幕程序（--shade，docs/11）
+        & $csc /nologo /codepage:65001 /target:exe /optimize+ /platform:x64 "/out:$exeNew" /reference:System.ServiceProcess.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll $srcNew
         if ($LASTEXITCODE -ne 0) { throw '编译失败，没有安装' }
         # 可能把可疑的日志目录挪开重建，所以也放在核对、编译之后：取消时不动它，它出错时旧服务也还没动
         Initialize-DataDir
@@ -274,6 +351,8 @@ try {
         Write-Host '请核对下面的 BINARY_PATH_NAME 带引号、指向 Program Files，SERVICE_START_NAME 是 LocalSystem：'
         & sc.exe qc $name | Out-Host
         Write-Host '被控端 30 秒内会发现它，不用重启。日志在 C:\ProgramData\RemoteClaude\unlock.log（不含密码）。'
+        # 虚拟屏驱动装不上只是警告，但要让人看到：窗口留着等回车
+        if (-not (Install-VirtualDisplay)) { $warned = $true }
     }
 } catch {
     $failed = $true
@@ -290,7 +369,7 @@ try {
         try { Remove-TempFiles } catch { Write-Host "$_。下次安装时会再清。" -ForegroundColor Yellow }
     }
 }
-if ($failed -or -not $NoPause) { Read-Host '按回车关闭' | Out-Null }
+if ($failed -or $warned -or -not $NoPause) { Read-Host '按回车关闭' | Out-Null }
 # 被控端靠退出码知道装没装好（-FromHost）
 if ($failed) { exit 1 }
 exit 0

@@ -91,8 +91,49 @@ export class HostCommands {
       case 'bad-key':
       case 'replayed':
         return '电脑上的被控端刚重启过，请再试一次';
+      // 要先盖隐私屏却没盖上，被控端没有解锁（docs/11 第 4.4 节）
+      case 'privacy-failed':
+        return '隐私屏没盖上，没有解锁。电脑上的解锁服务可能要重新安装；也可以在设置里关掉“解锁时打开隐私屏”';
+      // 用记下的密码解锁（协议 2.9"记住解锁密码"）：不对了被控端已经删掉；或者电脑上其实没有
+      case 'saved-wrong':
+        return '记下的密码不对了（可能改过密码），已经删掉，请重新输入';
+      case 'no-saved':
+        return '电脑上没有记下的密码了，请输入密码';
       default:
         return null;
     }
+  }
+
+  /** 用记下的密码解锁的结果要不要弹输入框让用户手动输（只试一次，别的错误照常提示） */
+  static needsPassword(code: string | null): boolean {
+    return code === 'saved-wrong' || code === 'no-saved';
+  }
+
+  /** 开、关隐私屏（docs/11 第 4.4 节）的回执对应的提示；code 为 null 表示没等到回执 */
+  static privacyText(on: boolean, code: string | null): string {
+    if (code === HostCommands.OK) {
+      return on ? '已打开隐私屏：电脑的显示器盖上了黑幕' : '已关闭隐私屏';
+    }
+    if (code === null) {
+      return '电脑没有回应';
+    }
+    if (code === 'bad-op') {
+      return '电脑上的被控端太旧，不支持隐私屏，请升级';
+    }
+    return on ? '隐私屏没打开，电脑上的解锁服务可能要重新安装' : '隐私屏没关掉';
+  }
+
+  /** 忘掉记下的解锁密码（forget-password）的回执对应的提示 */
+  static forgetText(code: string | null): string {
+    if (code === HostCommands.OK) {
+      return '电脑已经忘掉记下的解锁密码';
+    }
+    if (code === null) {
+      return '电脑没有回应';
+    }
+    if (code === 'bad-op') {
+      return '电脑上的被控端太旧，请升级';
+    }
+    return `没能忘掉记下的密码（${code}）`;
   }
 }

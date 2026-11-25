@@ -64,8 +64,42 @@ object HostCommands {
         "closed" -> "连接断开了，不知道电脑解锁了没有"
         // 被控端重启后换了密钥，手机手里的还是旧的；新的随后会推过来
         "bad-key", "replayed" -> "电脑上的被控端刚重启过，请再试一次"
+        // 要先盖隐私屏却没盖上，被控端没有解锁（docs/11 第 4.4 节）
+        "privacy-failed" -> "隐私屏没盖上，没有解锁。电脑上的解锁服务可能要重新安装；也可以在设置里关掉“解锁时打开隐私屏”"
+        // 用记下的密码解锁没成（协议文档 2.9"记住解锁密码"）：弹出输入框，这两句写在框里
+        SAVED_WRONG -> "记下的密码不对了（可能改过密码），已经删掉，请重新输入"
+        NO_SAVED -> "电脑上没有记下的密码了，请输入"
         else -> null
     }
 
+    /** 用记下的密码解锁回了这个，要弹出输入框让用户手动输（只试一次，不自动重试） */
+    fun needsPassword(code: String?): Boolean = code == SAVED_WRONG || code == NO_SAVED
+
+    /** "忘掉记下的解锁密码"的回执对应的提示；[code] 为 null 表示没等到回执 */
+    fun forgetText(code: String?): String = when (code) {
+        OK -> "已忘掉记下的解锁密码，下次解锁要重新输入"
+        null -> "电脑没有回应"
+        "closed" -> "连接断开了，不知道忘掉没有"
+        "bad-op" -> "电脑上的被控端太旧，请升级"
+        else -> "没能忘掉记下的解锁密码（$code）"
+    }
+
+    /** 解锁框开着时换了电脑：框关掉了（和网页、鸿蒙端同一句） */
+    const val PROMPT_CLOSED_TEXT = "选的电脑换了，解锁框已经关掉，密码没有发出去"
+
+    /** 解锁框开着时那台电脑下线了：框关掉了 */
+    fun promptOfflineText(name: String?): String = "${pcLabel(name)}下线了，解锁框已经关掉，密码没有发出去"
+
+    /** 解锁框开着时那台电脑已经解开了（比如电脑前有人输了密码）：框关掉了 */
+    fun promptUnlockedText(name: String?): String = "${pcLabel(name)}已经解锁了，解锁框已经关掉"
+
+    /** 提交解锁、确认锁定时选的已经不是框打开时那台（兜底，换电脑时框一般已经关掉了） */
+    const val HOST_CHANGED_TEXT = "选的电脑已经换了，没有发出去"
+
+    /** 提示里怎么称呼这台电脑：有名字就是「名字」，不知道时是"这台电脑" */
+    fun pcLabel(name: String?): String = name?.trim()?.takeIf { it.isNotEmpty() }?.let { "「$it」" } ?: "这台电脑"
+
     const val OK = "ok"
+    const val SAVED_WRONG = "saved-wrong"
+    const val NO_SAVED = "no-saved"
 }

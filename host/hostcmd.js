@@ -14,14 +14,18 @@
    * 推给控制端的电脑状态。key 是解锁密码用的公钥，还没生成好时不带。
    * lock.untrusted 只在是 true 时带：电脑上有解锁服务，但被控端核实不过（多半是旧版，要重新安装）
    */
-  function stateMessage(to, lock, tile, key) {
+  function stateMessage(to, lock, tile, key, privacy) {
     const msg = {
       type: 'host-state',
       to,
       lock: { locked: !!(lock && lock.locked), unlock: !!(lock && lock.unlock) },
       tile: { available: !!(tile && tile.available), paused: !!(tile && tile.paused) },
+      // 隐私屏开着没有（docs/11 第 4.4 节，被控端 0.9.32 起）
+      privacy: !!privacy,
     };
     if (lock && lock.untrusted && !lock.unlock) msg.lock.untrusted = true;
+    // 有记下的解锁密码（docs/06"记住解锁密码"）：手机点"解锁"时先用它。只在是 true、解锁服务能用时带
+    if (lock && lock.saved && lock.unlock) msg.lock.saved = true;
     if (key) msg.key = key;
     return msg;
   }
@@ -51,12 +55,33 @@
       log(`控制端 ${msg.from} 锁定了电脑`);
       return result(await bridge.lockNow(), 'failed');
     }
+    if (op === 'release') {
+      // 手机离开了这台电脑、App 退到后台（docs/11 第 4.2 节）：不用等 3 分钟，马上关虚拟屏、不再防息屏
+      log(`控制端 ${msg.from} 结束控制`);
+      bridge.controlRelease(msg.from);
+      return result(true);
+    }
+    if (op === 'privacy') {
+      // 手机上开、关隐私屏（docs/11 第 4.4 节）：开是盖黑幕、挡电脑前的键鼠；关只撤黑幕，不锁屏
+      if (typeof msg.on !== 'boolean') return result(false, 'bad-request');
+      log(`控制端 ${msg.from} ${msg.on ? '打开' : '关掉'}了隐私屏`);
+      return result(await bridge.setPrivacy(msg.on), 'failed');
+    }
     if (op === 'unlock') {
-      log(`控制端 ${msg.from} 请求解锁`);
+      // saved：用记下的密码解锁（docs/06"记住解锁密码"），不带密文
+      const saved = msg.saved === true;
+      log(`控制端 ${msg.from} 请求${saved ? '用记下的密码' : ''}解锁`);
       // 密文原样交给主进程，这里看不到密码
-      const code = await bridge.unlockEnc(typeof msg.enc === 'string' ? msg.enc : '');
+      // privacy：解锁前要不要先盖隐私屏；save：解开以后记不记住这次的密码。主进程只认 true、false，别的按配置、不动
+      const code = saved
+        ? await bridge.unlockSaved(msg.privacy)
+        : await bridge.unlockEnc(typeof msg.enc === 'string' ? msg.enc : '', msg.privacy, msg.save);
       log(code ? `解锁没有成功: ${code}` : '已从控制端解锁');
       return result(!code, code);
+    }
+    if (op === 'forget-password') {
+      log(`控制端 ${msg.from} 要求忘掉记下的解锁密码`);
+      return result(await bridge.forgetPassword());
     }
     return result(false, 'bad-op');
   }

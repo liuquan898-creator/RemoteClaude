@@ -34,6 +34,7 @@ import {
   parseIncoming,
   pushRegisterMessage,
   pushUnregisterMessage,
+  savedUnlockEvent,
   selectMessage,
   stopMessage,
   textEvent,
@@ -298,20 +299,29 @@ test('图片回执', () => {
 test('锁定和解锁消息符合 4.6 节', () => {
   assert.deepEqual(parseChannelMessage('{"t":"lock","locked":true,"unlock":false}'), {
     t: 'lock',
-    state: { locked: true, unlockAvailable: false, unlockUntrusted: false },
+    state: { locked: true, unlockAvailable: false, unlockUntrusted: false, saved: false },
   });
   assert.deepEqual(parseChannelMessage('{"t":"lock","locked":false,"unlock":true}'), {
     t: 'lock',
-    state: { locked: false, unlockAvailable: true, unlockUntrusted: false },
+    state: { locked: false, unlockAvailable: true, unlockUntrusted: false, saved: false },
   });
   // 解锁服务核实不过（旧版要重新安装）：和"没装"分开；能解锁时 untrusted 不算数
   assert.deepEqual(parseChannelMessage('{"t":"lock","locked":true,"unlock":false,"untrusted":true}'), {
     t: 'lock',
-    state: { locked: true, unlockAvailable: false, unlockUntrusted: true },
+    state: { locked: true, unlockAvailable: false, unlockUntrusted: true, saved: false },
   });
   assert.deepEqual(parseChannelMessage('{"t":"lock","locked":true,"unlock":true,"untrusted":true}'), {
     t: 'lock',
-    state: { locked: true, unlockAvailable: true, unlockUntrusted: false },
+    state: { locked: true, unlockAvailable: true, unlockUntrusted: false, saved: false },
+  });
+  // 电脑记着解锁密码（被控端 0.9.32 起）；解锁服务不能用时不算数
+  assert.deepEqual(parseChannelMessage('{"t":"lock","locked":true,"unlock":true,"saved":true}'), {
+    t: 'lock',
+    state: { locked: true, unlockAvailable: true, unlockUntrusted: false, saved: true },
+  });
+  assert.deepEqual(parseChannelMessage('{"t":"lock","locked":true,"unlock":false,"saved":true}'), {
+    t: 'lock',
+    state: { locked: true, unlockAvailable: false, unlockUntrusted: false, saved: false },
   });
 
   assert.deepEqual(parseChannelMessage('{"t":"unlock-result","id":"u1","ok":true}'), {
@@ -334,7 +344,20 @@ test('锁定和解锁消息符合 4.6 节', () => {
   });
   assert.deepEqual(obj(tileEvent('arrange')), { t: 'tile', op: 'arrange' });
   assert.deepEqual(obj(lockNowEvent()), { t: 'lock-now' });
-  assert.deepEqual(obj(unlockEvent('u1', 'p@ss 中文"引号')), { t: 'unlock', id: 'u1', p: 'p@ss 中文"引号' });
+  // 解锁前要不要先盖隐私屏、解开后记不记住密码（被控端 0.9.32 起）：开着、关着都明说，旧版被控端忽略
+  assert.deepEqual(obj(unlockEvent('u1', 'p@ss 中文"引号', true, true)), {
+    t: 'unlock',
+    id: 'u1',
+    p: 'p@ss 中文"引号',
+    privacy: true,
+    save: true,
+  });
+  assert.deepEqual(obj(unlockEvent('u2', 'x', false, false)), { t: 'unlock', id: 'u2', p: 'x', privacy: false, save: false });
+  // 被控端不认"记住密码"时不带 save
+  assert.deepEqual(obj(unlockEvent('u5', 'x', true, null)), { t: 'unlock', id: 'u5', p: 'x', privacy: true });
+  // 用电脑记下的密码：不带 p、不带 save
+  assert.deepEqual(obj(savedUnlockEvent('u3', true)), { t: 'unlock', id: 'u3', saved: true, privacy: true });
+  assert.deepEqual(obj(savedUnlockEvent('u4', false)), { t: 'unlock', id: 'u4', saved: true, privacy: false });
 });
 
 test('审批消息符合 2.7 节', () => {
@@ -526,30 +549,97 @@ test('host-state 和不连画面的命令符合 2.9 节', () => {
     {
       type: 'host-state',
       host: 'pc-1',
-      state: { lock: { locked: true, unlockAvailable: true, unlockUntrusted: false }, tile: { available: true, paused: false }, key: 'MIIB' },
+      state: {
+        lock: { locked: true, unlockAvailable: true, unlockUntrusted: false, saved: false },
+        tile: { available: true, paused: false },
+        key: 'MIIB',
+        privacy: false,
+        canRemember: false,
+      },
     },
   );
   // 被控端刚启动、公钥还没生成好时不带 key；缺的字段都当 false
   assert.deepEqual(parseIncoming('{"type":"host-state","host":"pc-1","lock":{"locked":false},"key":""}'), {
     type: 'host-state',
     host: 'pc-1',
-    state: { lock: { locked: false, unlockAvailable: false, unlockUntrusted: false }, tile: { available: false, paused: false }, key: null },
+    state: {
+      lock: { locked: false, unlockAvailable: false, unlockUntrusted: false, saved: false },
+      tile: { available: false, paused: false },
+      key: null,
+      privacy: false,
+      canRemember: false,
+    },
   });
   assert.deepEqual(parseAs('{"type":"host-state","host":"pc-1","lock":{"locked":true,"unlock":false,"untrusted":true}}', 'host-state').state.lock, {
     locked: true,
     unlockAvailable: false,
     unlockUntrusted: true,
+    saved: false,
   });
   assert.deepEqual(parseAs('{"type":"host-state","host":"pc-1","tile":{"paused":true}}', 'host-state').state.tile, {
     available: false,
     paused: true,
   });
+  // 记着解锁密码（lock.saved）、隐私屏开着（privacy），被控端 0.9.32 起；旧版没有这两个字段，当作没有
+  const saved = parseAs('{"type":"host-state","host":"pc-1","lock":{"locked":true,"unlock":true,"saved":true},"privacy":true}', 'host-state');
+  assert.equal(saved.state.lock.saved, true);
+  assert.equal(saved.state.privacy, true);
+  // 0.9.32 起的 host-state 总带布尔的 privacy，拿它认"记住密码"能不能用；关着也算
+  assert.equal(saved.state.canRemember, true);
+  assert.equal(parseAs('{"type":"host-state","host":"pc-1","privacy":false}', 'host-state').state.canRemember, true);
+  assert.equal(parseAs('{"type":"host-state","host":"pc-1","lock":{"locked":true,"unlock":false,"saved":true}}', 'host-state').state.lock.saved, false);
+  const odd = parseAs('{"type":"host-state","host":"pc-1","privacy":"yes"}', 'host-state').state;
+  assert.equal(odd.privacy, false);
+  assert.equal(odd.canRemember, false);
 
   const arrange = obj(hostCmdMessage('pc-1', 'arrange'));
   assert.deepEqual(Object.keys(arrange).sort(), ['host', 'op', 'type']);
   assert.deepEqual(arrange, { type: 'host-cmd', host: 'pc-1', op: 'arrange' });
   const unlock = obj(hostCmdMessage('pc-1', 'unlock', 'u1', 'QUJD'));
   assert.deepEqual([unlock['op'], unlock['req'], unlock['enc']], ['unlock', 'u1', 'QUJD']);
+  assert.deepEqual(Object.keys(unlock).sort(), ['enc', 'host', 'op', 'req', 'type'], '没给的附加字段不带');
+  // 解锁时盖隐私屏、记住密码；用记下的密码时不带 enc（被控端 0.9.32 起）
+  assert.deepEqual(obj(hostCmdMessage('pc-1', 'unlock', 'u2', 'QUJD', { privacy: true, save: false })), {
+    type: 'host-cmd',
+    host: 'pc-1',
+    op: 'unlock',
+    req: 'u2',
+    enc: 'QUJD',
+    privacy: true,
+    save: false,
+  });
+  assert.deepEqual(Object.keys(obj(hostCmdMessage('pc-1', 'unlock', 'u6', 'QUJD', { privacy: true }))).sort(), [
+    'enc',
+    'host',
+    'op',
+    'privacy',
+    'req',
+    'type',
+  ]);
+  assert.deepEqual(obj(hostCmdMessage('pc-1', 'unlock', 'u3', null, { privacy: false, saved: true })), {
+    type: 'host-cmd',
+    host: 'pc-1',
+    op: 'unlock',
+    req: 'u3',
+    privacy: false,
+    saved: true,
+  });
+  // 隐私屏开关、忘掉记下的密码、结束控制（docs/11）
+  assert.deepEqual(obj(hostCmdMessage('pc-1', 'privacy', 'p1', null, { on: true })), {
+    type: 'host-cmd',
+    host: 'pc-1',
+    op: 'privacy',
+    req: 'p1',
+    on: true,
+  });
+  assert.equal(obj(hostCmdMessage('pc-1', 'privacy', 'p2', null, { on: false }))['on'], false);
+  assert.deepEqual(obj(hostCmdMessage('pc-1', 'forget-password', 'f1', null, {})), {
+    type: 'host-cmd',
+    host: 'pc-1',
+    op: 'forget-password',
+    req: 'f1',
+  });
+  assert.deepEqual(obj(hostCmdMessage('pc-1', 'release')), { type: 'host-cmd', host: 'pc-1', op: 'release' });
 
   assert.deepEqual(parseIncoming('{"type":"host-cmd-result","host":"pc-1","req":"u1","op":"unlock","ok":true}'), {
     type: 'host-cmd-result',
@@ -567,6 +657,7 @@ test('host-state 和不连画面的命令符合 2.9 节', () => {
     ok: false,
     code: 'still-locked',
   });
+  assert.equal(parseAs('{"type":"host-cmd-result","host":"pc-1","req":"u4","op":"unlock","ok":false,"code":"saved-wrong"}', 'host-cmd-result').code, 'saved-wrong');
   assert.deepEqual(parseIncoming('{"type":"host-cmd-result","host":"pc-1","req":"u3","ok":false}'), {
     type: 'host-cmd-result',
     host: 'pc-1',

@@ -216,7 +216,7 @@ fun RemoteScreen(state: AppState, controller: RemoteController) {
             }
         }
 
-        if (state.pcLocked) LockBanner(state, onUnlock = { hostDialogs.unlock = true })
+        if (state.pcLocked) LockBanner(state, onUnlock = controller::requestUnlock)
         ApprovalBanner(state, onOpen = controller::openApprovals)
 
         // ---------------------------------------------------------------- 画面区

@@ -93,7 +93,8 @@ async function pushServer(t, { clock, timers, extra = {}, dataDir, autoClose = t
   const { file } = keyFile(t);
   const logs = [];
   const s = await startServer(
-    { ...(dataDir ? { dataDir } : {}), push: { huawei: { projectId: PROJECT, serviceAccountFile: file, apiBase: fake.base, ...extra } } },
+    // 原有的用例都按"一出现就推"写的；推迟提醒的用例自己给 alertDelaySec
+    { ...(dataDir ? { dataDir } : {}), push: { huawei: { projectId: PROJECT, serviceAccountFile: file, apiBase: fake.base, alertDelaySec: 0, ...extra } } },
     { log: (...a) => logs.push(a.join(' ')), ...(clock ? { now: () => clock.t } : {}), ...(timers ? { timers } : {}) }
   );
   if (autoClose) t.after(() => s.close());
@@ -156,11 +157,14 @@ function marked(store, userId, hostId) {
 const huaweiOk = () => ({ ok: true, status: 200, code: '80000000', msg: 'Success', requestId: 'r', deadTokens: [], configSuspect: false });
 const huaweiDown = () => ({ ok: false, status: 500, code: '81000001', msg: 'Internal error', requestId: 'r', deadTokens: [], configSuspect: false });
 
+const revokeOk = () => ({ ok: true, status: 200, code: '80000000', msg: 'Success', requestId: 'r' });
+
 /**
  * 直接测 PushService：内存数据库（一个账号、一个推送令牌）、假的华为客户端（回复按次改，返回 Error 就当网络出错）、
- * 手动定时器、可拨的时钟
+ * 手动定时器、可拨的时钟。revoke 为 true 时假客户端能撤回（相当于配了 clientId），撤回请求记在 revoked 里
  */
-function pushUnit(t, { options = {} } = {}) {
+function pushUnit(t, { options: extra = {}, revoke = false } = {}) {
+  const options = { alertDelaySec: 0, ...extra };
   const clock = { t: Date.UTC(2026, 10, 24, 8, 0, 0) };
   const store = new Store(':memory:');
   const userId = store.createUser('a@example.com', 'x', clock.t);
@@ -175,6 +179,15 @@ function pushUnit(t, { options = {} } = {}) {
       return r instanceof Error ? Promise.reject(r) : Promise.resolve(r);
     },
   };
+  const revoked = [];
+  let revokeReply = revokeOk;
+  if (revoke) {
+    huawei.revoke = (tokens, notifyId) => {
+      revoked.push({ tokens, notifyId });
+      const r = revokeReply(revoked.length);
+      return r instanceof Error ? Promise.reject(r) : Promise.resolve(r);
+    };
+  }
   const timers = manualTimers();
   const logs = [];
   const push = new PushService({ store, huawei, options, log: (...a) => logs.push(a.join(' ')), now: () => clock.t, timers });
@@ -189,11 +202,18 @@ function pushUnit(t, { options = {} } = {}) {
     logs,
     clock,
     userId,
+    authTokenId,
     sent,
+    revoked,
     /** 推过哪些审批（按推的顺序） */
     sentIds: () => sent.map((x) => x.notification.clickAction.data.approvalId),
+    /** 撤回过哪些通知的 notifyId（按撤的顺序） */
+    revokedIds: () => revoked.map((x) => x.notifyId),
     setReply(fn) {
       reply = fn;
+    },
+    setRevokeReply(fn) {
+      revokeReply = fn;
     },
   };
 }
@@ -582,6 +602,65 @@ test('网络不通、超时：信令照常，服务器定时重推', async (t) =
   v.close();
 });
 
+test('推迟提醒：审批出现满 60 秒还没处理才推；这期间在电脑上处理掉了就不推（docs/09 第 10 节）', async (t) => {
+  const u = pushUnit(t, { options: { alertDelaySec: 60 } });
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1')]);
+  assert.deepEqual(u.sentIds(), [], '刚出现不推');
+  assert.deepEqual(marked(u.store, u.userId, 'pc'), [], '也不记：到点前服务器重启了，电脑重连发来的列表照样会推它');
+  assert.deepEqual(u.timers.pending.map((x) => x.ms), [60 * 1000]);
+  assert.ok(u.timers.pending[0].unrefed, '定时器不拦着进程退出');
+
+  // 30 秒后又来一条 d2：定时器按最早到点的 d1 定，还剩 30 秒
+  u.clock.t += 30 * 1000;
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1'), permission('d2')]);
+  assert.deepEqual(u.timers.pending.map((x) => x.ms), [30 * 1000]);
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1'), permission('d2')]);
+  assert.equal(u.timers.pending.length, 1, '同一份列表的副本不动定时器');
+
+  // 到点：d1 推了，d2 还差 30 秒
+  u.clock.t += 30 * 1000;
+  await u.timers.fire();
+  assert.deepEqual(u.sentIds(), ['d1']);
+  assert.deepEqual(marked(u.store, u.userId, 'pc'), ['d1']);
+  assert.deepEqual(u.timers.pending.map((x) => x.ms), [30 * 1000]);
+
+  // d2 在电脑上处理掉了（新列表里没有它）：不用再等，也不推
+  u.clock.t += 10 * 1000;
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1')]);
+  assert.equal(u.timers.pending.length, 0);
+  u.clock.t += 60 * 1000;
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1')]);
+  assert.deepEqual(u.sentIds(), ['d1'], 'd1 推过了不再推，d2 没推');
+});
+
+test('推迟提醒：等着的时候电脑下线了就不推，重连后重新等满；close() 取消', async (t) => {
+  const u = pushUnit(t, { options: { alertDelaySec: 60 } });
+  await u.push.onApprovals(u.userId, 'pc', [permission('g1')]);
+  u.clock.t += 50 * 1000;
+  u.push.hostGone(u.userId, 'pc');
+  assert.equal(u.timers.pending.length, 0, '下线时取消');
+  await u.push.onApprovals(u.userId, 'pc', [permission('g1')]);
+  assert.deepEqual(u.sentIds(), []);
+  assert.deepEqual(u.timers.pending.map((x) => x.ms), [60 * 1000], '重连后从头算');
+  u.clock.t += 60 * 1000;
+  await u.timers.fire();
+  assert.deepEqual(u.sentIds(), ['g1']);
+
+  await u.push.onApprovals(u.userId, 'pc', [permission('g1'), permission('g2')]);
+  assert.equal(u.timers.pending.length, 1);
+  u.push.close();
+  assert.equal(u.timers.pending.length, 0, 'close() 取消等着的');
+});
+
+test('推迟提醒：配置 alertDelaySec，不填是 60 秒，0 是一出现就推', () => {
+  const hw = (extra) => normalizeConfig({ push: { huawei: { serviceAccountFile: 'k.json', ...extra } } }, __dirname).push.huawei;
+  assert.equal(hw({}).alertDelaySec, 60);
+  assert.equal(hw({ alertDelaySec: 0 }).alertDelaySec, 0);
+  assert.throws(() => hw({ alertDelaySec: -1 }), /alertDelaySec/);
+  assert.throws(() => hw({ alertDelaySec: 1.5 }), /alertDelaySec/);
+  assert.throws(() => hw({ alertDelaySec: 601 }), /alertDelaySec/);
+});
+
 test('重推按 30 秒、2 分钟、10 分钟最多 3 次；等着重推时新列表只推新的；都没成就等电脑下次发列表', async (t) => {
   const u = pushUnit(t);
   u.setReply(huaweiDown);
@@ -788,6 +867,337 @@ test('电脑真下线才取消重推；同一台电脑换了新连接、旧连�
   h3.send(JSON.stringify({ type: 'approvals', to: 'push', list: [permission('q1')] }));
   assert.equal((await fake.waitFor(2)).body.payload.notification.clickAction.data.approvalId, 'q1');
   h3.close();
+});
+
+test('撤回：推过的审批从电脑的列表里消失了，撤回一次，带推送时的 notifyId 和推给的令牌', async (t) => {
+  const u = pushUnit(t, { revoke: true });
+  u.store.putPushToken({ token: TOK_A2, platform: 'harmony', userId: u.userId, authTokenId: u.authTokenId, now: u.clock.t, maxPerUser: 10 });
+  await u.push.onApprovals(u.userId, 'pc', [permission('v1'), permission('v2')]);
+  assert.deepEqual(u.sentIds(), ['v1', 'v2']);
+  assert.deepEqual(u.revoked, [], '还在列表里的不撤');
+
+  // 推完以后才登记的令牌没收到这条，撤回时也不带它
+  u.store.putPushToken({ token: TOK_B, platform: 'harmony', userId: u.userId, authTokenId: u.authTokenId, now: u.clock.t + 1, maxPerUser: 10 });
+  await u.push.onApprovals(u.userId, 'pc', [permission('v2')]); // v1 处理掉了
+  assert.equal(u.revoked.length, 1);
+  assert.equal(u.revoked[0].notifyId, notifyIdOf('v1'), '和推送时 payload.notification.notifyId 一样');
+  assert.equal(u.revoked[0].notifyId, u.sent[0].notification.notifyId);
+  assert.deepEqual([...u.revoked[0].tokens].sort(), [TOK_A, TOK_A2].sort(), '推给了哪些令牌就撤哪些');
+
+  // 同一份列表的副本、之后的列表都不会再撤 v1
+  await u.push.onApprovals(u.userId, 'pc', [permission('v2')]);
+  await u.push.onApprovals(u.userId, 'pc', [permission('v2'), permission('v3')]);
+  assert.deepEqual(u.revokedIds(), [notifyIdOf('v1')]);
+  // 会话结束、列表空了：v2、v3 都撤，各一次
+  await u.push.onApprovals(u.userId, 'pc', []);
+  await u.push.onApprovals(u.userId, 'pc', []);
+  assert.deepEqual(u.revokedIds().sort(), [notifyIdOf('v1'), notifyIdOf('v2'), notifyIdOf('v3')].sort());
+  assert.deepEqual([...u.revoked.find((x) => x.notifyId === notifyIdOf('v3')).tokens].sort(), [TOK_A, TOK_A2, TOK_B].sort(), 'v3 推的时候 B 已经登记了');
+  assert.ok(!u.push.shown.has(JSON.stringify([u.userId, 'pc'])), '撤完就忘掉');
+
+  // 别的电脑的列表不影响这台
+  await u.push.onApprovals(u.userId, 'pc', [permission('v4')]);
+  await u.push.onApprovals(u.userId, 'pc2', []);
+  assert.equal(u.revoked.length, 3);
+  assert.ok(u.logs.some((l) => l.includes('审批 v1 已经处理掉了，撤回了它的通知')));
+  assert.ok(!u.logs.some((l) => l.includes(TOK_A) || l.includes(TOK_A2) || l.includes(TOK_B)), '日志里令牌只留前几位');
+  assert.equal(u.timers.pending.length, 0);
+});
+
+test('撤回：没推过的不撤（推迟提醒等着时就处理掉了、推送失败的）；没配 clientId 时不撤', async (t) => {
+  // 推迟提醒：60 秒内在电脑上处理掉了，根本没推过
+  const u = pushUnit(t, { revoke: true, options: { alertDelaySec: 60 } });
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1')]);
+  u.clock.t += 10 * 1000;
+  await u.push.onApprovals(u.userId, 'pc', []);
+  assert.deepEqual(u.sentIds(), []);
+  assert.deepEqual(u.revoked, []);
+
+  // 推送失败（等着重推）时处理掉了
+  const f = pushUnit(t, { revoke: true });
+  f.setReply(huaweiDown);
+  await f.push.onApprovals(f.userId, 'pc', [permission('f1')]);
+  // 华为说参数错误之类（不重推）
+  f.setReply(() => ({ ok: false, status: 400, code: '80100003', msg: 'Illegal payload', requestId: 'r', deadTokens: [], configSuspect: false }));
+  await f.push.onApprovals(f.userId, 'pc', [permission('f1'), permission('f2')]);
+  await f.push.onApprovals(f.userId, 'pc', []);
+  await f.timers.fire();
+  assert.deepEqual(f.sentIds(), ['f1', 'f2']);
+  assert.deepEqual(f.revoked, []);
+
+  // 重推推成了，之后才处理掉：推成过，撤
+  f.setReply(huaweiDown);
+  await f.push.onApprovals(f.userId, 'pc', [permission('f3')]);
+  f.setReply(huaweiOk);
+  await f.timers.fire();
+  assert.deepEqual(f.sentIds(), ['f1', 'f2', 'f3', 'f3']);
+  assert.deepEqual(f.revoked, []);
+  await f.push.onApprovals(f.userId, 'pc', []);
+  assert.deepEqual(f.revokedIds(), [notifyIdOf('f3')]);
+
+  // 没配 clientId（假客户端没有 revoke）：不记也不撤
+  const n = pushUnit(t);
+  assert.equal(n.push.canRevoke, false);
+  await n.push.onApprovals(n.userId, 'pc', [permission('n1')]);
+  await n.push.onApprovals(n.userId, 'pc', []);
+  assert.deepEqual(n.sentIds(), ['n1']);
+  assert.equal(n.push.shown.size, 0);
+});
+
+test('撤回：电脑下线时列表没了不撤；重连后照着电脑发来的列表撤，但重连后头几份空列表不算（被控端刚启动）', async (t) => {
+  const u = pushUnit(t, { revoke: true });
+  const key = JSON.stringify([u.userId, 'pc']);
+  await u.push.onApprovals(u.userId, 'pc', [permission('g1'), permission('g2')]);
+  await u.push.onApprovals(u.userId, 'pc2', [permission('k1')]);
+  u.push.hostGone(u.userId, 'pc');
+  assert.deepEqual(u.revoked, [], '下线本身不撤');
+  u.push.hostOnline(u.userId, 'pc');
+  await u.push.onApprovals(u.userId, 'pc', []); // 被控端刚启动时还没读到审批
+  assert.deepEqual(u.revoked, [], '重连后先来的空列表不撤');
+  await u.push.onApprovals(u.userId, 'pc', [permission('g2')]); // 读到了：g1 在断开期间处理掉了
+  assert.deepEqual(u.revokedIds(), [notifyIdOf('g1')]);
+  await u.push.onApprovals(u.userId, 'pc', []); // 这次连上以后收到过非空列表，空列表照撤
+  assert.deepEqual(u.revokedIds(), [notifyIdOf('g1'), notifyIdOf('g2')]);
+
+  // 新连接顶掉还没断开的旧连接（hub 只调 hostOnline）：发来和断开前一样的列表（副本，跳过不处理）也算发过非空列表
+  await u.push.onApprovals(u.userId, 'pc', [permission('h1'), permission('h2')]);
+  u.push.hostOnline(u.userId, 'pc');
+  await u.push.onApprovals(u.userId, 'pc', [permission('h1'), permission('h2')]);
+  assert.equal(u.push.lists.size, 2, 'hostOnline 不动列表（推迟、重推照旧）');
+  await u.push.onApprovals(u.userId, 'pc', []);
+  assert.deepEqual(u.revokedIds().slice(2).sort(), [notifyIdOf('h1'), notifyIdOf('h2')].sort());
+
+  // 断开期间全处理掉了、重连后列表一直是空的：先不撤，等电脑下次发非空列表（来了新审批）时撤
+  await u.push.onApprovals(u.userId, 'pc', [permission('j1')]);
+  u.push.hostGone(u.userId, 'pc');
+  u.push.hostOnline(u.userId, 'pc');
+  await u.push.onApprovals(u.userId, 'pc', []);
+  await u.push.onApprovals(u.userId, 'pc', []);
+  assert.equal(u.revoked.length, 4);
+  await u.push.onApprovals(u.userId, 'pc', [permission('j2')]);
+  assert.deepEqual(u.revokedIds().slice(4), [notifyIdOf('j1')]);
+  assert.deepEqual(u.sentIds().slice(-1), ['j2']);
+
+  // 别的电脑没受影响
+  await u.push.onApprovals(u.userId, 'pc2', []);
+  assert.deepEqual(u.revokedIds().slice(5), [notifyIdOf('k1')]);
+
+  // 推的时候电脑下线、重连后先来一份空列表：推成后先记下，不撤，等可信的列表
+  let finish = null;
+  u.setReply(() => new Promise((resolve) => (finish = () => resolve(huaweiOk()))));
+  const pushing = u.push.onApprovals(u.userId, 'pc', [permission('j2'), permission('y1')]);
+  await until(() => finish);
+  u.push.hostGone(u.userId, 'pc');
+  u.push.hostOnline(u.userId, 'pc');
+  await u.push.onApprovals(u.userId, 'pc', []);
+  finish();
+  await pushing;
+  assert.equal(u.revoked.length, 6);
+  assert.deepEqual([...u.push.shown.get(key).keys()].sort(), ['j2', 'y1'], 'y1 推成了，记下');
+  u.setReply(huaweiOk);
+  await u.push.onApprovals(u.userId, 'pc', [permission('j2')]);
+  assert.deepEqual(u.revokedIds().slice(6), [notifyIdOf('y1')]);
+
+  // 下线满 24 小时还没回来就忘掉：之后重连也不撤
+  u.push.hostGone(u.userId, 'pc');
+  u.clock.t += 23 * 3600 * 1000;
+  u.push.cleanup();
+  assert.ok(u.push.shown.has(key), '23 小时还记着');
+  u.clock.t += 2 * 3600 * 1000;
+  u.push.cleanup();
+  assert.ok(!u.push.shown.has(key));
+  u.push.hostOnline(u.userId, 'pc');
+  await u.push.onApprovals(u.userId, 'pc', [permission('z1')]);
+  assert.equal(u.revoked.length, 7, 'j2 不撤了');
+  assert.deepEqual(u.sentIds().slice(-1), ['z1']);
+});
+
+test('撤回：推的时候审批就处理掉了，推成以后马上撤；列表超过 100 条（被截过）时不撤；每台电脑最多记 100 条', async (t) => {
+  const u = pushUnit(t, { revoke: true, options: { maxPerHour: 1000 } });
+  const key = JSON.stringify([u.userId, 'pc']);
+  let finish = null;
+  u.setReply(() => new Promise((resolve) => (finish = () => resolve(huaweiOk()))));
+  const pushing = u.push.onApprovals(u.userId, 'pc', [permission('x1')]);
+  await until(() => finish);
+  await u.push.onApprovals(u.userId, 'pc', []); // 推送还没回来时就在电脑上处理掉了
+  assert.deepEqual(u.revoked, []);
+  finish();
+  await pushing;
+  assert.deepEqual(u.revokedIds(), [notifyIdOf('x1')], '推成以后马上撤');
+  assert.ok(!u.push.shown.has(key), '马上撤的不记');
+
+  // 超过 100 条的列表只看前 100 条：后面的看不出在不在，不撤
+  u.setReply(huaweiOk);
+  const many = Array.from({ length: 100 }, (_, i) => permission(`m${i}`));
+  await u.push.onApprovals(u.userId, 'pc', many);
+  await u.push.onApprovals(u.userId, 'pc', [many[0], ...many]); // 101 条（m0 重复）：m99 被挤出前 100 条
+  assert.equal(u.revoked.length, 1, 'm99 不当成处理掉了');
+  await u.push.onApprovals(u.userId, 'pc', many.slice(1)); // 99 条，m0 处理掉了
+  assert.deepEqual(u.revokedIds(), [notifyIdOf('x1'), notifyIdOf('m0')]);
+
+  // 列表一直被截过（照着它不撤）时又推了 100 条：只记最新的 100 条，挤掉的不撤
+  const more = Array.from({ length: 100 }, (_, i) => permission(`n${i}`));
+  await u.push.onApprovals(u.userId, 'pc', [...more, more[0]]);
+  assert.equal(u.sentIds().length, 201, 'x1、m0～m99、n0～n99');
+  const shown = u.push.shown.get(key);
+  assert.equal(shown.size, 100);
+  assert.ok(shown.has('n0') && shown.has('n99') && !shown.has('m1'));
+  assert.equal(u.revoked.length, 2);
+});
+
+test('撤回失败只记日志：不重试、不删令牌、不影响推送；每小时撤回次数有上限', async (t) => {
+  const u = pushUnit(t, { revoke: true, options: { maxPerHour: 3 } });
+  await u.push.onApprovals(u.userId, 'pc', [permission('e1'), permission('e2')]);
+
+  // 华为回错误码：日志里有错误码、提示查 clientId，令牌只留前几位
+  u.setRevokeReply(() => ({ ok: false, status: 400, code: '80300028', msg: `Token app mismatch with specify app: ${TOK_A}`, requestId: 'r9' }));
+  await u.push.onApprovals(u.userId, 'pc', [permission('e2')]);
+  assert.equal(u.revoked.length, 1);
+  const failLog = u.logs.find((l) => l.includes('撤回审批 e1 的通知失败'));
+  assert.ok(failLog && failLog.includes('80300028') && failLog.includes('push.huawei.clientId') && failLog.includes('r9'));
+  assert.ok(!u.logs.some((l) => l.includes(TOK_A)));
+
+  // 网络出错、超时：只记日志
+  u.setRevokeReply(() => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }));
+  await u.push.onApprovals(u.userId, 'pc', []);
+  assert.ok(u.logs.some((l) => l.includes('撤回审批 e2 的通知出错: 超时')));
+
+  // 不重试、不删令牌，推送照常
+  assert.equal(u.timers.pending.length, 0, '没排重试');
+  await u.push.onApprovals(u.userId, 'pc', []);
+  assert.equal(u.revoked.length, 2);
+  assert.deepEqual(u.store.pushTokens(u.userId, 'harmony'), [TOK_A]);
+  u.setRevokeReply(revokeOk);
+  await u.push.onApprovals(u.userId, 'pc', [permission('e3')]);
+  assert.deepEqual(u.sentIds(), ['e1', 'e2', 'e3']);
+
+  // 撤回单独有每小时上限（和 maxPerHour 一样）：这一小时已经撤了 2 次，第 4 次起不撤，日志只记一条
+  await u.push.onApprovals(u.userId, 'pc', []);
+  assert.equal(u.revoked.length, 3);
+  await u.push.revoke(u.userId, 'z1', [TOK_A]);
+  await u.push.revoke(u.userId, 'z2', [TOK_A]);
+  assert.equal(u.revoked.length, 3);
+  assert.equal(u.logs.filter((l) => l.includes('一小时内撤回通知超过 3 次')).length, 1);
+  u.clock.t += 3600 * 1000;
+  await u.push.revoke(u.userId, 'z3', [TOK_A]);
+  assert.equal(u.revoked.length, 4, '窗口过了恢复');
+  u.push.cleanup();
+  assert.equal(u.push.revokeRate.map.size, 1);
+
+  // 503 是华为流控：同样只记日志，不重试
+  u.setRevokeReply(() => ({ ok: false, status: 503, code: '', msg: '', requestId: '' }));
+  await u.push.revoke(u.userId, 'z4', [TOK_A]);
+  assert.ok(u.logs.some((l) => l.includes('撤回审批 z4 的通知失败') && l.includes('华为流控，不重试')));
+  assert.equal(u.timers.pending.length, 0);
+
+  // close() 以后不撤
+  await u.push.onApprovals(u.userId, 'pc', [permission('c1')]);
+  u.push.close();
+  await u.push.onApprovals(u.userId, 'pc', []);
+  await u.push.revoke(u.userId, 'c1', [TOK_A]);
+  assert.equal(u.revoked.length, 5);
+});
+
+test('撤回请求：POST /v1/<clientId>/messages:revoke，头 push-type 0、和推送同一个 JWT，请求体是 notifyId 和令牌；经 hub 下线、重连后先来的空列表不撤，之后照撤', async (t) => {
+  const CLIENT = '1234567890123456789';
+  const { s, fake, logs } = await pushServer(t, { extra: { clientId: CLIENT } });
+  assert.equal(s.app.push.canRevoke, true);
+  const a = await account(s, 'a@example.com', 'pc-a');
+  (await registerPush(s, a.viewerToken, TOK_A)).close();
+  const h1 = await connect(s.wsUrl, auth('host', a.hostToken));
+  await h1.next('auth-ok');
+  const send = (h, ...ids) => h.send(JSON.stringify({ type: 'approvals', to: 'push', list: ids.map((x) => permission(x)) }));
+
+  send(h1, 'a1');
+  const pushed = await fake.waitFor(1);
+  assert.equal(pushed.url, `/v3/${PROJECT}/messages:send`);
+  send(h1); // 在电脑上处理掉了
+  const r = await fake.waitFor(2);
+  assert.equal(r.method, 'POST');
+  assert.equal(r.url, `/v1/${CLIENT}/messages:revoke`, 'v1、路径里是 Client ID，不是项目 ID');
+  assert.equal(r.headers['push-type'], '0');
+  assert.match(r.headers['content-type'], /^application\/json/);
+  assert.ok(verifyJwt(r.headers.authorization).ok);
+  assert.equal(r.headers.authorization, pushed.headers.authorization, '和推送用同一个 JWT');
+  assert.deepEqual(r.body, { notifyId: notifyIdOf('a1'), token: [TOK_A] });
+  assert.equal(r.body.notifyId, pushed.body.payload.notification.notifyId);
+  send(h1);
+  await fake.settle();
+  assert.equal(fake.requests.length, 2, '只撤一次');
+  await until(() => logs.some((l) => l.includes('审批 a1 已经处理掉了，撤回了它的通知')));
+
+  // 新连接顶掉旧连接（旧连接还没断）、先发空列表（被控端刚启动时那样）：不撤；发过非空列表以后再空了才撤
+  send(h1, 'b1');
+  await fake.waitFor(3);
+  const h2 = await connect(s.wsUrl, auth('host', a.hostToken));
+  await h2.next('auth-ok');
+  assert.equal(await h1.closed, 4002);
+  send(h2);
+  await fake.settle();
+  assert.equal(fake.requests.length, 3, '重连后先来的空列表不撤');
+  send(h2, 'b1');
+  await fake.settle();
+  assert.equal(fake.requests.length, 3, 'b1 推过了不再推');
+  send(h2);
+  assert.deepEqual((await fake.waitFor(4)).body, { notifyId: notifyIdOf('b1'), token: [TOK_A] });
+
+  // 电脑下线：不撤；重连后先来的空列表也不撤，读到审批以后照撤
+  send(h2, 'b2');
+  await fake.waitFor(5);
+  h2.close();
+  await until(() => s.app.push.lists.size === 0);
+  await fake.settle();
+  assert.equal(fake.requests.length, 5, '下线本身不撤');
+  const h3 = await connect(s.wsUrl, auth('host', a.hostToken));
+  await h3.next('auth-ok');
+  send(h3);
+  send(h3, 'b2');
+  await fake.settle();
+  assert.equal(fake.requests.length, 5);
+
+  // b2 处理掉了，撤回时华为说 JWT 过期：换一个重试一次
+  fake.setReply((req, n) => (n === 6 ? { status: 401, body: { code: '80200005', msg: 'JWT expired', requestId: 'r' } } : { status: 200, body: { code: '80000000', msg: 'Success', requestId: 'r' } }));
+  send(h3);
+  const again = await fake.waitFor(7);
+  assert.equal(again.url, `/v1/${CLIENT}/messages:revoke`);
+  assert.equal(again.body.notifyId, notifyIdOf('b2'));
+  assert.equal(fake.requests[5].body.notifyId, notifyIdOf('b2'));
+  assert.notEqual(again.headers.authorization, fake.requests[5].headers.authorization, '重试用新签的 JWT');
+  await fake.settle();
+  assert.equal(fake.requests.length, 7);
+  assert.ok(!logs.some((l) => l.includes(TOK_A)), '日志里没有完整的推送令牌');
+  h3.close();
+});
+
+test('撤回：没配 clientId 时只推不撤', async (t) => {
+  const { s, fake } = await pushServer(t);
+  assert.equal(s.app.push.canRevoke, false);
+  const a = await account(s, 'a@example.com', 'pc-a');
+  (await registerPush(s, a.viewerToken, TOK_A)).close();
+  const host = await connect(s.wsUrl, auth('host', a.hostToken));
+  await host.next('auth-ok');
+  host.send(JSON.stringify({ type: 'approvals', to: 'push', list: [permission('a1')] }));
+  await fake.waitFor(1);
+  host.send(JSON.stringify({ type: 'approvals', to: 'push', list: [] }));
+  await fake.settle();
+  assert.equal(fake.requests.length, 1);
+  host.close();
+});
+
+test('推送配置：clientId 要写成字符串，环境变量 RC_PUSH_HUAWEI_CLIENT_ID 优先，不填是空（不撤回）', (t) => {
+  const hw = (extra) => normalizeConfig({ push: { huawei: { serviceAccountFile: 'k.json', ...extra } } }, __dirname).push.huawei;
+  const saved = process.env.RC_PUSH_HUAWEI_CLIENT_ID;
+  t.after(() => {
+    if (saved === undefined) delete process.env.RC_PUSH_HUAWEI_CLIENT_ID;
+    else process.env.RC_PUSH_HUAWEI_CLIENT_ID = saved;
+  });
+  delete process.env.RC_PUSH_HUAWEI_CLIENT_ID;
+  assert.equal(hw({}).clientId, '');
+  assert.equal(hw({ clientId: ' 1234567890123456789 ' }).clientId, '1234567890123456789');
+  assert.throws(() => hw({ clientId: 1234567890123456789 }), /clientId 要写成字符串/);
+  assert.throws(() => hw({ clientId: 'a/b' }), /clientId/);
+  process.env.RC_PUSH_HUAWEI_CLIENT_ID = '999';
+  assert.equal(hw({ clientId: '1234567890123456789' }).clientId, '999');
 });
 
 test('到了每小时上限：同一份列表的副本照样跳过、不算份数、不碰库，日志每个窗口只记一条；窗口过了再推', async (t) => {

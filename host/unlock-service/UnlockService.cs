@@ -1,12 +1,16 @@
-// RemoteClaude 解锁服务：电脑锁屏时，替控制端把 Windows 密码或 PIN 输进登录界面。
+// RemoteClaude 解锁服务：电脑锁屏时，替控制端把 Windows 密码或 PIN 输进登录界面；
+// 被控端控制这台电脑、电脑又没有显示器时，开关虚拟屏（docs/11-virtual-display.md）。
 // 设计和安全措施见 docs/06-unlock-service.md。
 // 用 .NET Framework 自带的 csc.exe 编译（只支持 C# 5 语法），安装见 install.ps1。
-// UNLOCK_SERVICE_VERSION 2：改了这个文件就把数字加 1，被控端据此提示"解锁服务有新版本"（host/unlockinstall.js）
+// UNLOCK_SERVICE_VERSION 3：改了这个文件就把数字加 1，被控端据此提示"解锁服务有新版本"（host/unlockinstall.js）
 //
 // 运行方式：
 //   RemoteClaudeUnlock.exe            作为 Windows 服务运行（由服务管理器启动，SYSTEM 身份）
 //   RemoteClaudeUnlock.exe --console  以普通身份在控制台运行，只用于测试管道协议，不能真正解锁
 //   RemoteClaudeUnlock.exe --inject   由服务在用户会话的安全桌面上启动，从标准输入读密码并输入
+//   RemoteClaudeUnlock.exe --shade locked|unlocked <就绪事件名>  由服务在用户会话的普通桌面上启动：隐私屏的黑幕（docs/11 第 4.4 节）
+//   RemoteClaudeUnlock.exe --install-display <inf>  由安装脚本以管理员身份调用：建好虚拟屏设备、装驱动，装完停用
+//   RemoteClaudeUnlock.exe --uninstall-display      由安装脚本以管理员身份调用：先停用再删掉虚拟屏设备
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -19,6 +23,8 @@ using System.Security.Principal;
 using System.ServiceProcess;
 using System.Text;
 using System.Threading;
+using System.Drawing;
+using System.Windows.Forms;
 using Microsoft.Win32.SafeHandles;
 
 namespace RemoteClaude
@@ -32,6 +38,9 @@ namespace RemoteClaude
         {
             string mode = args.Length > 0 ? args[0] : "";
             if (mode == "--inject") return Injector.Run();
+            if (mode == "--shade") return args.Length > 2 ? Shade.Run(args[1], args[2]) : 2;
+            if (mode == "--install-display") return VirtualDisplay.InstallCommand(args.Length > 1 ? args[1] : null);
+            if (mode == "--uninstall-display") return VirtualDisplay.UninstallCommand();
             if (mode == "--console")
             {
                 ConsoleMode = true;
@@ -67,6 +76,8 @@ namespace RemoteClaude
 
         protected override void OnStop()
         {
+            if (server != null) server.ShutdownShade();
+            if (server != null) server.ShutdownDisplay();
             if (server != null) server.Stop();
             Log.Write("服务已停止");
         }
@@ -122,6 +133,9 @@ namespace RemoteClaude
         const int ReadTimeoutMs = 2000;
         const int CloseWaitMs = 1000;
         static readonly TimeSpan NameTakenLogInterval = TimeSpan.FromMinutes(10);
+        // 虚拟屏（docs/11）：被控端要求开着、又这么久没发 PING（被控端每隔 2 秒发一次），就自己停用，
+        // 免得被控端崩了、被结束了，虚拟屏一直开着
+        const int DisplayLeaseMs = 15000;
 
         readonly bool asService;
         readonly byte[] securityDescriptor;
@@ -137,6 +151,21 @@ namespace RemoteClaude
         NamedPipeServerStream anchor;
         NamedPipeClientStream anchorClient;
         DateTime nameTakenLoggedAt = DateTime.MinValue;
+        // 虚拟屏开关和看门狗共用这把锁：displayRequested 是被控端要求开着，pendingOff 是看门狗要关、还没关成。
+        // last*PingTicks 是被控端最近一次为虚拟屏、隐私屏报平安（Stopwatch 时间戳，不受改系统时间影响），不在锁里，用 Interlocked 读写。
+        // 两个分开记：被控端关一边没关成时，只停那一边的 PING，另一边照常续，看门狗收拾没关成的那边
+        const int MaxDisplaySwitches = 10;
+        readonly object displayGate = new object();
+        readonly List<long> displaySwitches = new List<long>();
+        bool displayRequested;
+        bool pendingOff;
+        long lastDisplayPingTicks;
+        long lastShadePingTicks;
+        // 隐私屏（docs/11 第 4.4 节）：黑幕程序由 ShadeHost 管，开、关和看门狗都在这把锁里。
+        // 控制台会话里任何程序都能连管道：一分钟最多开 MaxShadeStarts 次，免得被反复开关、反复锁屏
+        const int MaxShadeStarts = 10;
+        readonly object shadeGate = new object();
+        readonly List<long> shadeStarts = new List<long>();
 
         public PipeServer(bool asService)
         {
@@ -167,6 +196,17 @@ namespace RemoteClaude
         {
             ProcessAccess.AllowQueryByInteractiveUsers();
             if (!EstablishAnchor()) return; // 还没拿到名字就被要求停止
+            if (asService)
+            {
+                // 服务刚启动时没有被控端要求开虚拟屏：上次开着没关（服务被结束、电脑开着虚拟屏重启了）就先关掉
+                string err;
+                if (VirtualDisplay.State() >= VirtualDisplay.Enabled)
+                    Log.Write(VirtualDisplay.SetEnabled(false, out err) ? "服务启动时虚拟屏开着，已停用" : "服务启动时虚拟屏开着，停用失败：" + err);
+                var watchdog = new Thread(DisplayWatchdog);
+                watchdog.IsBackground = true;
+                watchdog.Name = "display-watchdog";
+                watchdog.Start();
+            }
             for (int i = 0; i < Slots; i++)
             {
                 var t = new Thread(SlotLoop);
@@ -348,7 +388,7 @@ namespace RemoteClaude
         {
             // 只服务两种程序，别的（别的用户、正连着的远程桌面会话里的程序）连上就断开，
             // 免得它们拿错误密码烧掉失败次数，或者占着槽位：
-            //   - 控制台会话里的程序：STATUS、UNLOCK、ATTACH（ATTACH 这时等同 UNLOCK）；
+            //   - 控制台会话里的程序：STATUS、UNLOCK、ATTACH（ATTACH 这时等同 UNLOCK），以及虚拟屏、隐私屏的 PING、DISPLAY、SHADE；
             //   - 远程桌面断开后、可以接回控制台的会话里的程序（docs/06"远程桌面断开后从手机接回"）：只认 STATUS、ATTACH。
             // 会话号只认 GetNamedPipeClientSessionId，不看请求里写了什么
             uint clientSession;
@@ -370,11 +410,15 @@ namespace RemoteClaude
             if (line == null) reply = "ERR failed";
             else if (line == "STATUS")
             {
-                // 旧版被控端只看开头是不是 OK，后面多出的字段不影响它
+                // 旧版被控端只看开头是不是 OK，后面多出的字段不影响它。display：虚拟屏设备 -1 没装、0 停用、1 启用
                 reply = atConsole
-                    ? "OK locked=" + (Session.IsLocked(console) ? "1" : "0") + " attach=0"
+                    ? "OK locked=" + (Session.IsLocked(console) ? "1" : "0") + " attach=0 display=" + VirtualDisplay.State() + " shade=" + ShadeState(console)
                     : "OK locked=1 attach=1";
             }
+            // 虚拟屏、隐私屏只为控制台会话里的被控端开关（docs/11）
+            else if (line == "PING" || line.StartsWith("PING ", StringComparison.Ordinal)) reply = atConsole ? Ping(line.Substring(4), console) : "ERR failed";
+            else if (line == "DISPLAY ON" || line == "DISPLAY OFF") reply = atConsole ? Display(line == "DISPLAY ON") : "ERR failed";
+            else if (line == "SHADE ON" || line == "SHADE OFF" || line == "SHADE END") reply = atConsole ? ShadeCommand(line.Substring(6), console) : "ERR failed";
             else if (line.StartsWith("UNLOCK ", StringComparison.Ordinal))
             {
                 if (atConsole) reply = Unlock(clientSession, line.Substring(7));
@@ -442,6 +486,239 @@ namespace RemoteClaude
                 if (ar.AsyncWaitHandle.WaitOne(timeoutMs)) s.EndRead(ar);
             }
             catch (Exception) { }
+        }
+
+        /// <summary>
+        /// 被控端报平安："PING display"、"PING shade" 只续那一边，"PING" 不带参数两边都续。
+        /// 它要求开着的虚拟屏、隐私屏，在 DisplayLeaseMs 里收不到下一次就由看门狗收拾（DisplayWatchdog、ShadeWatchdog）。
+        /// 不碰 displayGate、shadeGate：开关时那两把锁可能要占几秒，报平安不能跟着排队、占住槽位。
+        /// 回应带上两边现在的状态，被控端据此发现被看门狗关了（被控端卡了 15 秒以上）、或者电脑前有人按了 Ctrl+Alt+Del
+        /// </summary>
+        string Ping(string args, uint console)
+        {
+            bool display = false, shade = false;
+            foreach (string word in args.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (word == "display") display = true;
+                else if (word == "shade") shade = true;
+                else return "ERR failed";
+            }
+            if (!display && !shade) display = shade = true;
+            long now = Stopwatch.GetTimestamp();
+            if (display) Interlocked.Exchange(ref lastDisplayPingTicks, now);
+            if (shade) Interlocked.Exchange(ref lastShadePingTicks, now);
+            return "OK display=" + VirtualDisplay.State() + " shade=" + ShadeState(console);
+        }
+
+        /// <summary>
+        /// 隐私屏开着没有：1 黑幕程序在控制台会话里运行，0 没有。不抢 shadeGate（开、关要好几秒）。
+        /// 切换了用户、黑幕还在原来的会话里，算 0：它盖的不是现在显示器上的桌面
+        /// </summary>
+        static int ShadeState(uint console)
+        {
+            return ShadeHost.RunningIn(console) ? 1 : 0;
+        }
+
+        /// <summary>
+        /// 被控端要求开隐私屏（ON）、撤掉（OFF）、先锁屏再撤（END，控制结束时）。ON 在控制台会话的普通桌面上启动黑幕程序，
+        /// 等它盖好、钩子装好才回 OK（被控端据此才开始输密码）；已经开着就不再开。
+        /// 黑幕程序之后由看门狗盯着：被控端 DisplayLeaseMs 没报平安就按 END 收尾
+        /// </summary>
+        string ShadeCommand(string what, uint console)
+        {
+            if (!asService) return "ERR no-service";
+            if (!Monitor.TryEnter(shadeGate, 500)) return "ERR busy";
+            try
+            {
+                if (what == "ON")
+                {
+                    if (ShadeHost.Running() && !ShadeHost.RunningIn(console))
+                    {
+                        // 切换了用户：原来那个会话已经不在显示器上了（接回它要输密码），只撤黑幕，不锁屏
+                        Log.Write("控制台换了会话，撤了原来会话里的隐私屏：" + ShadeHost.Describe(ShadeHost.Stop(false)));
+                    }
+                    if (!ShadeHost.Running())
+                    {
+                        ShadeHost.Reap();
+                        shadeStarts.RemoveAll(t => MsSince(t) > 60000);
+                        if (shadeStarts.Count >= MaxShadeStarts)
+                        {
+                            Log.Throttled("shade-rate", "一分钟里开隐私屏太多次，拒绝");
+                            return "ERR busy";
+                        }
+                        shadeStarts.Add(Stopwatch.GetTimestamp());
+                        string err;
+                        bool ready;
+                        try
+                        {
+                            ready = ShadeHost.Start(console, Session.IsLocked(console), out err);
+                        }
+                        catch (Exception e)
+                        {
+                            ready = false;
+                            err = e.Message;
+                        }
+                        if (!ready)
+                        {
+                            Log.Throttled("shade", "开隐私屏失败：" + err);
+                            return "ERR failed";
+                        }
+                        Log.Write("被控端要求开隐私屏，已盖上黑幕");
+                    }
+                    Interlocked.Exchange(ref lastShadePingTicks, Stopwatch.GetTimestamp());
+                    return "OK";
+                }
+                if (!ShadeHost.Running())
+                {
+                    ShadeHost.Reap();
+                    return "OK";
+                }
+                int code = ShadeHost.Stop(what == "END");
+                Log.Write((what == "END" ? "控制结束，撤了隐私屏：" : "被控端要求关隐私屏，撤了黑幕：") + ShadeHost.Describe(code));
+                return "OK";
+            }
+            finally
+            {
+                Monitor.Exit(shadeGate);
+            }
+        }
+
+        /// <summary>看门狗里看一眼隐私屏：黑幕程序自己退出了就收拾、记下原因；被控端太久没报平安就先锁屏再撤</summary>
+        void ShadeWatchdog()
+        {
+            if (!Monitor.TryEnter(shadeGate)) return; // 正在开、关，下一秒再看
+            try
+            {
+                int exited = ShadeHost.Reap();
+                if (exited >= 0)
+                {
+                    Log.Write("隐私屏的黑幕程序自己退出了（电脑前有人按了 Ctrl+Alt+Del，或者弹了管理员确认框）：" + ShadeHost.Describe(exited));
+                    return;
+                }
+                if (!ShadeHost.Running() || MsSince(Interlocked.Read(ref lastShadePingTicks)) < DisplayLeaseMs) return;
+                int code = ShadeHost.Stop(true);
+                Log.Write("被控端 " + DisplayLeaseMs / 1000 + " 秒没报平安，撤了隐私屏：" + ShadeHost.Describe(code));
+            }
+            finally
+            {
+                Monitor.Exit(shadeGate);
+            }
+        }
+
+        /// <summary>服务停止时撤隐私屏，先锁屏：之后没有看门狗了，黑幕程序读到标准输入断开也会锁屏退出，这里只是不等它自己发现</summary>
+        public void ShutdownShade()
+        {
+            if (!asService || !Monitor.TryEnter(shadeGate, 3000)) return;
+            try
+            {
+                if (ShadeHost.Running()) Log.Write("服务停止，撤了隐私屏：" + ShadeHost.Describe(ShadeHost.Stop(true)));
+            }
+            finally
+            {
+                Monitor.Exit(shadeGate);
+            }
+        }
+
+        static double MsSince(long ticks)
+        {
+            return (Stopwatch.GetTimestamp() - ticks) * 1000.0 / Stopwatch.Frequency;
+        }
+
+        /// <summary>
+        /// 被控端要求开、关虚拟屏。已经是要的状态就不再动设备（重复启用会让它闪一下）。
+        /// 控制台会话里任何程序都能连管道，所以一分钟最多切换 MaxDisplaySwitches 次：反复开关会让窗口被挪来挪去
+        /// </summary>
+        string Display(bool on)
+        {
+            // 控制台测试模式没有管理员权限，动不了设备
+            if (!asService) return "ERR no-service";
+            if (!Monitor.TryEnter(displayGate, 500)) return "ERR busy";
+            try
+            {
+                int state = VirtualDisplay.State();
+                if (state < 0) return "ERR no-display";
+                if (state == VirtualDisplay.Broken && on)
+                {
+                    Log.Throttled("display-broken", "虚拟屏设备启用了但没能启动（设备有问题），没法开虚拟屏");
+                    return "ERR failed";
+                }
+                bool change = (state == VirtualDisplay.Enabled) != on;
+                if (change)
+                {
+                    displaySwitches.RemoveAll(t => MsSince(t) > 60000);
+                    if (displaySwitches.Count >= MaxDisplaySwitches)
+                    {
+                        Log.Throttled("display-rate", "一分钟里开关虚拟屏太多次，拒绝");
+                        return "ERR busy";
+                    }
+                    string err;
+                    if (!VirtualDisplay.SetEnabled(on, out err))
+                    {
+                        Log.Throttled("display", (on ? "启用" : "停用") + "虚拟屏失败：" + err);
+                        return "ERR failed";
+                    }
+                    displaySwitches.Add(Stopwatch.GetTimestamp());
+                    Log.Write(on ? "被控端要求开虚拟屏，已启用" : "被控端要求关虚拟屏，已停用");
+                }
+                displayRequested = on;
+                pendingOff = false;
+                Interlocked.Exchange(ref lastDisplayPingTicks, Stopwatch.GetTimestamp());
+                return "OK";
+            }
+            finally
+            {
+                Monitor.Exit(displayGate);
+            }
+        }
+
+        /// <summary>
+        /// 被控端要求开着虚拟屏、却 DisplayLeaseMs 没报平安（崩了、被结束了、用户注销了），就把虚拟屏关掉。
+        /// 关不掉（设备忙）就每秒再试
+        /// </summary>
+        void DisplayWatchdog()
+        {
+            while (!stopped.WaitOne(1000))
+            {
+                // 隐私屏这边出了什么异常都不能让这个线程停下：虚拟屏的租约也靠它看
+                try
+                {
+                    ShadeWatchdog();
+                }
+                catch (Exception e)
+                {
+                    Log.Throttled("shade-watchdog", "隐私屏的看门狗出错：" + e.Message);
+                }
+                lock (displayGate)
+                {
+                    if (displayRequested && MsSince(Interlocked.Read(ref lastDisplayPingTicks)) >= DisplayLeaseMs)
+                    {
+                        displayRequested = false;
+                        pendingOff = true;
+                        Log.Write("被控端 " + DisplayLeaseMs / 1000 + " 秒没报平安，停用虚拟屏");
+                    }
+                    if (!pendingOff) continue;
+                    string err;
+                    if (VirtualDisplay.SetEnabled(false, out err)) pendingOff = false;
+                    else Log.Throttled("display-off", "停用虚拟屏失败，过一秒再试：" + err);
+                }
+            }
+        }
+
+        /// <summary>服务停止时把虚拟屏关掉：之后没有看门狗了，开着的设备会一直开到下次服务启动</summary>
+        public void ShutdownDisplay()
+        {
+            if (!asService || !Monitor.TryEnter(displayGate, 3000)) return;
+            try
+            {
+                string err;
+                if ((displayRequested || pendingOff) && !VirtualDisplay.SetEnabled(false, out err)) Log.Write("服务停止时停用虚拟屏失败：" + err);
+                displayRequested = false;
+                pendingOff = false;
+            }
+            finally
+            {
+                Monitor.Exit(displayGate);
+            }
         }
 
         /// <summary>clientSession：发请求的程序所在的会话，接受连接时它是控制台会话；输入前再确认它仍是控制台</summary>
@@ -710,6 +987,278 @@ namespace RemoteClaude
             AddFailure(failureKey);
             Log.Write("已输入，但电脑仍然锁着");
             return "ERR still-locked";
+        }
+    }
+
+    /// <summary>
+    /// 虚拟屏（docs/11）：VirtualDrivers/Virtual-Display-Driver（MIT，SignPath 签名），硬件 ID Root\MttVDD。
+    /// 安装脚本以管理员身份调用 --install-display：建好根设备（和 devcon install 一样）、装驱动，装完停用。
+    /// 之后设备一直留着，被控端要用时服务启用、用完停用（启用、停用各约 0.3 秒）。
+    /// 设备开着时直接删，要重启才完全消失（驱动还在它的 WUDFHost 里跑），所以卸载时先停用再删
+    /// </summary>
+    static class VirtualDisplay
+    {
+        public const string HardwareId = @"Root\MttVDD";
+        static readonly Guid DisplayClass = new Guid("4d36e968-e325-11ce-bfc1-08002be10318");
+        // 安装时把我们建的设备的实例 ID 记在这里（只有管理员能改），之后只认它：
+        // 电脑上别的程序、用户自己装的同一个驱动（硬件 ID 一样），不启用、不停用、不删
+        const string RecordKey = @"SOFTWARE\RemoteClaude";
+        const string RecordValue = "DisplayDevice";
+
+        static string Recorded()
+        {
+            using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(RecordKey))
+            {
+                return key == null ? null : key.GetValue(RecordValue) as string;
+            }
+        }
+
+        // 设备状态（STATUS、PING 回应里的 display=）
+        public const int Missing = -1;
+        public const int Disabled = 0;
+        public const int Enabled = 1;
+        public const int Broken = 2; // 启用了但没能启动（设备管理器里的错误代码 10、43 之类）
+
+        /// <summary>设备状态：Missing 没装，Disabled 停用，Enabled 启用并在运行，Broken 启用了但有问题</summary>
+        public static int State()
+        {
+            IntPtr set;
+            Native.SP_DEVINFO_DATA data;
+            if (!Find(out set, out data)) return Missing;
+            try
+            {
+                uint status, problem;
+                if (Native.CM_Get_DevNode_Status(out status, out problem, data.DevInst, 0) != 0) return Broken;
+                if ((status & Native.DN_HAS_PROBLEM) == 0) return Enabled;
+                return problem == Native.CM_PROB_DISABLED ? Disabled : Broken;
+            }
+            finally
+            {
+                Native.SetupDiDestroyDeviceInfoList(set);
+            }
+        }
+
+        /// <summary>启用或停用设备（DIF_PROPERTYCHANGE，DICS_FLAG_GLOBAL：重启后也保持）。失败时 error 是原因</summary>
+        public static bool SetEnabled(bool on, out string error)
+        {
+            IntPtr set;
+            Native.SP_DEVINFO_DATA data;
+            if (!Find(out set, out data))
+            {
+                error = "没装虚拟屏驱动";
+                return false;
+            }
+            try
+            {
+                var p = new Native.SP_PROPCHANGE_PARAMS();
+                p.ClassInstallHeader.cbSize = (uint)Marshal.SizeOf(typeof(Native.SP_CLASSINSTALL_HEADER));
+                p.ClassInstallHeader.InstallFunction = Native.DIF_PROPERTYCHANGE;
+                p.StateChange = on ? Native.DICS_ENABLE : Native.DICS_DISABLE;
+                p.Scope = Native.DICS_FLAG_GLOBAL;
+                if (!Native.SetupDiSetClassInstallParamsW(set, ref data, ref p, (uint)Marshal.SizeOf(typeof(Native.SP_PROPCHANGE_PARAMS))) ||
+                    !Native.SetupDiCallClassInstaller(Native.DIF_PROPERTYCHANGE, set, ref data))
+                {
+                    error = "错误 " + Marshal.GetLastWin32Error();
+                    return false;
+                }
+                error = null;
+                return true;
+            }
+            finally
+            {
+                Native.SetupDiDestroyDeviceInfoList(set);
+            }
+        }
+
+        /// <summary>
+        /// --install-display：没有我们的设备就建一个并记下实例 ID，装上 inf 里的驱动，最后停用。
+        /// 电脑上已经有别人装的同一个驱动时什么都不做，退出码 2。返回进程退出码
+        /// </summary>
+        public static int InstallCommand(string inf)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(inf) || !File.Exists(inf)) throw new Exception("找不到驱动的 inf 文件：" + inf);
+                string ours = Recorded();
+                string other = FindInstance(delegate (string id) { return !string.Equals(id, ours, StringComparison.OrdinalIgnoreCase); });
+                if (other != null)
+                {
+                    System.Console.WriteLine("电脑上已经装了别的 Virtual Display Driver（设备 " + other + "），虚拟屏功能不启用，也不动它");
+                    return 2;
+                }
+                if (FindInstance(delegate (string id) { return string.Equals(id, ours, StringComparison.OrdinalIgnoreCase); }) == null)
+                {
+                    string created = CreateRootDevice();
+                    try
+                    {
+                        using (var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(RecordKey))
+                        {
+                            key.SetValue(RecordValue, created);
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // 没记下来的设备下次会被当成别人的，再也装不上：删掉刚建的
+                        RemoveInstance(created);
+                        throw;
+                    }
+                }
+                bool reboot;
+                if (!Native.UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, HardwareId, inf, Native.INSTALLFLAG_FORCE, out reboot))
+                    throw new Win32Exception();
+                string err;
+                if (!SetEnabled(false, out err)) throw new Exception("驱动装好了，但停用设备失败：" + err);
+                System.Console.WriteLine(reboot ? "虚拟屏驱动已安装，要重启电脑才能用" : "虚拟屏驱动已安装（设备平时停用）");
+                return 0;
+            }
+            catch (Exception e)
+            {
+                System.Console.WriteLine("安装虚拟屏驱动失败：" + e.Message);
+                return 1;
+            }
+        }
+
+        /// <summary>--uninstall-display：先停用（开着删要重启），再删设备。驱动包由安装脚本用 pnputil 删。返回进程退出码</summary>
+        public static int UninstallCommand()
+        {
+            try
+            {
+                string err;
+                IntPtr set;
+                Native.SP_DEVINFO_DATA data;
+                if (!Find(out set, out data))
+                {
+                    System.Console.WriteLine("没有虚拟屏设备");
+                    return 0;
+                }
+                string id = InstanceId(set, ref data);
+                Native.SetupDiDestroyDeviceInfoList(set);
+                if (!SetEnabled(false, out err)) throw new Exception("停用设备失败：" + err);
+                RemoveInstance(id);
+                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(RecordKey, true))
+                {
+                    if (key != null) key.DeleteValue(RecordValue, false);
+                }
+                System.Console.WriteLine("虚拟屏设备已删除");
+                return 0;
+            }
+            catch (Exception e)
+            {
+                System.Console.WriteLine("删除虚拟屏设备失败：" + e.Message);
+                return 1;
+            }
+        }
+
+        /// <summary>删掉这个实例 ID 的 Root\MttVDD 设备（DIF_REMOVE）。调用方先停用它：开着删要重启才完全消失</summary>
+        static void RemoveInstance(string instanceId)
+        {
+            IntPtr set;
+            Native.SP_DEVINFO_DATA data;
+            if (!Scan(delegate (string id) { return string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase); }, out set, out data)) return;
+            try
+            {
+                var p = new Native.SP_REMOVEDEVICE_PARAMS();
+                p.ClassInstallHeader.cbSize = (uint)Marshal.SizeOf(typeof(Native.SP_CLASSINSTALL_HEADER));
+                p.ClassInstallHeader.InstallFunction = Native.DIF_REMOVE;
+                p.Scope = Native.DI_REMOVEDEVICE_GLOBAL;
+                if (!Native.SetupDiSetClassInstallParamsW(set, ref data, ref p, (uint)Marshal.SizeOf(typeof(Native.SP_REMOVEDEVICE_PARAMS))) ||
+                    !Native.SetupDiCallClassInstaller(Native.DIF_REMOVE, set, ref data))
+                    throw new Win32Exception();
+            }
+            finally
+            {
+                Native.SetupDiDestroyDeviceInfoList(set);
+            }
+        }
+
+        /// <summary>建一个硬件 ID 为 Root\MttVDD 的根设备节点（驱动随后由 UpdateDriverForPlugAndPlayDevices 装上），返回实例 ID</summary>
+        static string CreateRootDevice()
+        {
+            Guid cls = DisplayClass;
+            IntPtr set = Native.SetupDiCreateDeviceInfoList(ref cls, IntPtr.Zero);
+            if (set == Native.INVALID_HANDLE_VALUE) throw new Win32Exception();
+            try
+            {
+                var data = new Native.SP_DEVINFO_DATA();
+                data.cbSize = (uint)Marshal.SizeOf(typeof(Native.SP_DEVINFO_DATA));
+                if (!Native.SetupDiCreateDeviceInfoW(set, "Display", ref cls, null, IntPtr.Zero, Native.DICD_GENERATE_ID, ref data))
+                    throw new Win32Exception();
+                byte[] ids = Encoding.Unicode.GetBytes(HardwareId + "\0\0");
+                if (!Native.SetupDiSetDeviceRegistryPropertyW(set, ref data, Native.SPDRP_HARDWAREID, ids, (uint)ids.Length))
+                    throw new Win32Exception();
+                if (!Native.SetupDiCallClassInstaller(Native.DIF_REGISTERDEVICE, set, ref data)) throw new Win32Exception();
+                return InstanceId(set, ref data);
+            }
+            finally
+            {
+                Native.SetupDiDestroyDeviceInfoList(set);
+            }
+        }
+
+        /// <summary>我们建的那个设备（实例 ID 和安装时记下的一样）。找到时 set 由调用方用 SetupDiDestroyDeviceInfoList 释放</summary>
+        static bool Find(out IntPtr set, out Native.SP_DEVINFO_DATA data)
+        {
+            string ours = Recorded();
+            if (ours == null)
+            {
+                set = IntPtr.Zero;
+                data = new Native.SP_DEVINFO_DATA();
+                return false;
+            }
+            return Scan(delegate (string id) { return string.Equals(id, ours, StringComparison.OrdinalIgnoreCase); }, out set, out data);
+        }
+
+        /// <summary>硬件 ID 是 Root\MttVDD、实例 ID 让 accept 认可的第一个设备的实例 ID，没有返回 null</summary>
+        static string FindInstance(Func<string, bool> accept)
+        {
+            IntPtr set;
+            Native.SP_DEVINFO_DATA data;
+            if (!Scan(accept, out set, out data)) return null;
+            try
+            {
+                return InstanceId(set, ref data);
+            }
+            finally
+            {
+                Native.SetupDiDestroyDeviceInfoList(set);
+            }
+        }
+
+        /// <summary>在显示类设备里找硬件 ID 是 Root\MttVDD、实例 ID 让 accept 认可的那一个。找到时 set 由调用方释放</summary>
+        static bool Scan(Func<string, bool> accept, out IntPtr set, out Native.SP_DEVINFO_DATA data)
+        {
+            Guid cls = DisplayClass;
+            data = new Native.SP_DEVINFO_DATA();
+            data.cbSize = (uint)Marshal.SizeOf(typeof(Native.SP_DEVINFO_DATA));
+            set = Native.SetupDiGetClassDevsW(ref cls, null, IntPtr.Zero, Native.DIGCF_PRESENT);
+            if (set == Native.INVALID_HANDLE_VALUE)
+            {
+                set = IntPtr.Zero;
+                return false;
+            }
+            var buf = new byte[2048];
+            for (uint i = 0; Native.SetupDiEnumDeviceInfo(set, i, ref data); i++)
+            {
+                uint type, needed;
+                if (!Native.SetupDiGetDeviceRegistryPropertyW(set, ref data, Native.SPDRP_HARDWAREID, out type, buf, (uint)buf.Length, out needed)) continue;
+                string ids = Encoding.Unicode.GetString(buf, 0, (int)Math.Min(needed, (uint)buf.Length));
+                bool match = false;
+                foreach (string id in ids.Split('\0'))
+                {
+                    if (string.Equals(id, HardwareId, StringComparison.OrdinalIgnoreCase)) match = true;
+                }
+                if (match && accept(InstanceId(set, ref data))) return true;
+            }
+            Native.SetupDiDestroyDeviceInfoList(set);
+            set = IntPtr.Zero;
+            return false;
+        }
+
+        static string InstanceId(IntPtr set, ref Native.SP_DEVINFO_DATA data)
+        {
+            var sb = new StringBuilder(260);
+            int needed;
+            return Native.SetupDiGetDeviceInstanceIdW(set, ref data, sb, sb.Capacity, out needed) ? sb.ToString() : "";
         }
     }
 
@@ -1176,18 +1725,41 @@ namespace RemoteClaude
     /// <summary>以 SYSTEM 身份在用户会话的安全桌面上启动注入进程</summary>
     static class Launcher
     {
-        public static int RunInjector(uint session, string password)
+        /// <summary>复制服务自己的 SYSTEM 令牌、改成这个会话号，用来在用户会话里启动子进程。调用方用完要 CloseHandle</summary>
+        public static IntPtr SessionToken(uint session)
         {
             IntPtr token = IntPtr.Zero, dup = IntPtr.Zero;
-            byte[] data = null;
             try
             {
                 if (!Native.OpenProcessToken(Native.GetCurrentProcess(), Native.TOKEN_ALL_ACCESS, out token)) throw new Win32Exception();
                 if (!Native.DuplicateTokenEx(token, Native.MAXIMUM_ALLOWED, IntPtr.Zero, 2 /* SecurityImpersonation */, 1 /* TokenPrimary */, out dup)) throw new Win32Exception();
                 uint sid = session;
                 if (!Native.SetTokenInformation(dup, 12 /* TokenSessionId */, ref sid, 4)) throw new Win32Exception();
+                IntPtr result = dup;
+                dup = IntPtr.Zero;
+                return result;
+            }
+            finally
+            {
+                if (dup != IntPtr.Zero) Native.CloseHandle(dup);
+                if (token != IntPtr.Zero) Native.CloseHandle(token);
+            }
+        }
 
-                string exe = Process.GetCurrentProcess().MainModule.FileName;
+        /// <summary>服务自己的 exe 路径：子进程（注入、黑幕）都是它换个参数启动的</summary>
+        public static string SelfPath()
+        {
+            using (Process self = Process.GetCurrentProcess()) return self.MainModule.FileName;
+        }
+
+        public static int RunInjector(uint session, string password)
+        {
+            IntPtr dup = IntPtr.Zero;
+            byte[] data = null;
+            try
+            {
+                dup = SessionToken(session);
+                string exe = SelfPath();
                 // 密码走匿名管道，不出现在命令行里
                 data = Encoding.ASCII.GetBytes(Convert.ToBase64String(Encoding.UTF8.GetBytes(password)) + "\n");
                 return Spawn.Run(dup, exe, "--inject", @"winsta0\winlogon", data, 20000);
@@ -1196,70 +1768,91 @@ namespace RemoteClaude
             {
                 if (data != null) Array.Clear(data, 0, data.Length);
                 if (dup != IntPtr.Zero) Native.CloseHandle(dup);
-                if (token != IntPtr.Zero) Native.CloseHandle(token);
             }
         }
     }
 
     /// <summary>
-    /// 启动子进程，把 stdinData 从它的标准输入交过去，等它退出，返回退出码（超时返回 98）。
-    /// 用 PROC_THREAD_ATTRIBUTE_HANDLE_LIST 只让子进程继承这一个标准输入句柄，别的可继承句柄一个也不带过去。
-    /// token 为 IntPtr.Zero 时以当前身份用 CreateProcessW 启动，只给测试用；服务里总是传 SYSTEM 令牌
+    /// 在指定桌面上启动子进程，标准输入接一个匿名管道。用 PROC_THREAD_ATTRIBUTE_HANDLE_LIST 只让子进程继承这一个标准输入句柄，
+    /// 别的可继承句柄一个也不带过去。token 为 IntPtr.Zero 时以当前身份用 CreateProcessW 启动，只给测试用；服务里总是传 SYSTEM 令牌
     /// </summary>
     static class Spawn
     {
         public const int TimedOut = 98;
 
+        /// <summary>
+        /// 启动子进程，不等它退出。stdin 是写给它标准输入的那一头，调用方用完要 Dispose（子进程读到 EOF）；
+        /// 返回的进程、线程句柄调用方负责关
+        /// </summary>
+        public static Native.PROCESS_INFORMATION Start(IntPtr token, string exe, string args, string desktop, out AnonymousPipeServerStream stdin)
+        {
+            var pi = new Native.PROCESS_INFORMATION();
+            var pipe = new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.Inheritable);
+            try
+            {
+                IntPtr child = pipe.ClientSafePipeHandle.DangerousGetHandle();
+                IntPtr attrList = IntPtr.Zero, handleBuf = IntPtr.Zero;
+                try
+                {
+                    IntPtr size = IntPtr.Zero;
+                    Native.InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+                    if (size == IntPtr.Zero) throw new Win32Exception();
+                    attrList = Marshal.AllocHGlobal(size);
+                    if (!Native.InitializeProcThreadAttributeList(attrList, 1, 0, ref size))
+                    {
+                        Marshal.FreeHGlobal(attrList);
+                        attrList = IntPtr.Zero;
+                        throw new Win32Exception();
+                    }
+                    handleBuf = Marshal.AllocHGlobal(IntPtr.Size);
+                    Marshal.WriteIntPtr(handleBuf, child);
+                    if (!Native.UpdateProcThreadAttribute(attrList, 0, (IntPtr)Native.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                        handleBuf, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
+
+                    var si = new Native.STARTUPINFOEX();
+                    si.StartupInfo.cb = Marshal.SizeOf(typeof(Native.STARTUPINFOEX));
+                    si.StartupInfo.lpDesktop = desktop;
+                    si.StartupInfo.dwFlags = Native.STARTF_USESTDHANDLES;
+                    si.StartupInfo.hStdInput = child;
+                    si.lpAttributeList = attrList;
+                    string cmd = "\"" + exe + "\" " + args;
+                    uint flags = Native.CREATE_NO_WINDOW | Native.EXTENDED_STARTUPINFO_PRESENT;
+                    string dir = Path.GetDirectoryName(exe);
+                    bool ok = token == IntPtr.Zero
+                        ? Native.CreateProcessW(exe, cmd, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, dir, ref si, out pi)
+                        : Native.CreateProcessAsUserW(token, exe, cmd, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, dir, ref si, out pi);
+                    if (!ok) throw new Win32Exception();
+                }
+                finally
+                {
+                    if (attrList != IntPtr.Zero)
+                    {
+                        Native.DeleteProcThreadAttributeList(attrList);
+                        Marshal.FreeHGlobal(attrList);
+                    }
+                    if (handleBuf != IntPtr.Zero) Marshal.FreeHGlobal(handleBuf);
+                }
+                pipe.DisposeLocalCopyOfClientHandle();
+                stdin = pipe;
+                return pi;
+            }
+            catch
+            {
+                pipe.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>启动子进程，把 stdinData 从它的标准输入交过去，等它退出，返回退出码（超时返回 98）</summary>
         public static int Run(IntPtr token, string exe, string args, string desktop, byte[] stdinData, uint timeoutMs)
         {
             var pi = new Native.PROCESS_INFORMATION();
             try
             {
-                using (var stdin = new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.Inheritable))
+                AnonymousPipeServerStream stdin;
+                pi = Start(token, exe, args, desktop, out stdin);
+                using (stdin)
                 {
-                    IntPtr child = stdin.ClientSafePipeHandle.DangerousGetHandle();
-                    IntPtr attrList = IntPtr.Zero, handleBuf = IntPtr.Zero;
-                    try
-                    {
-                        IntPtr size = IntPtr.Zero;
-                        Native.InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
-                        if (size == IntPtr.Zero) throw new Win32Exception();
-                        attrList = Marshal.AllocHGlobal(size);
-                        if (!Native.InitializeProcThreadAttributeList(attrList, 1, 0, ref size))
-                        {
-                            Marshal.FreeHGlobal(attrList);
-                            attrList = IntPtr.Zero;
-                            throw new Win32Exception();
-                        }
-                        handleBuf = Marshal.AllocHGlobal(IntPtr.Size);
-                        Marshal.WriteIntPtr(handleBuf, child);
-                        if (!Native.UpdateProcThreadAttribute(attrList, 0, (IntPtr)Native.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                            handleBuf, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
-
-                        var si = new Native.STARTUPINFOEX();
-                        si.StartupInfo.cb = Marshal.SizeOf(typeof(Native.STARTUPINFOEX));
-                        si.StartupInfo.lpDesktop = desktop;
-                        si.StartupInfo.dwFlags = Native.STARTF_USESTDHANDLES;
-                        si.StartupInfo.hStdInput = child;
-                        si.lpAttributeList = attrList;
-                        string cmd = "\"" + exe + "\" " + args;
-                        uint flags = Native.CREATE_NO_WINDOW | Native.EXTENDED_STARTUPINFO_PRESENT;
-                        string dir = Path.GetDirectoryName(exe);
-                        bool ok = token == IntPtr.Zero
-                            ? Native.CreateProcessW(exe, cmd, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, dir, ref si, out pi)
-                            : Native.CreateProcessAsUserW(token, exe, cmd, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, dir, ref si, out pi);
-                        if (!ok) throw new Win32Exception();
-                    }
-                    finally
-                    {
-                        if (attrList != IntPtr.Zero)
-                        {
-                            Native.DeleteProcThreadAttributeList(attrList);
-                            Marshal.FreeHGlobal(attrList);
-                        }
-                        if (handleBuf != IntPtr.Zero) Marshal.FreeHGlobal(handleBuf);
-                    }
-                    stdin.DisposeLocalCopyOfClientHandle();
                     try
                     {
                         stdin.Write(stdinData, 0, stdinData.Length);
@@ -1268,7 +1861,7 @@ namespace RemoteClaude
                     catch
                     {
                         // 写到一半失败：先结束注入进程，别让它拿着半截密码继续输
-                        if (pi.hProcess != IntPtr.Zero) Native.TerminateProcess(pi.hProcess, 99);
+                        Native.TerminateProcess(pi.hProcess, 99);
                         throw;
                     }
                 }
@@ -1286,6 +1879,772 @@ namespace RemoteClaude
             {
                 if (pi.hProcess != IntPtr.Zero) Native.CloseHandle(pi.hProcess);
                 if (pi.hThread != IntPtr.Zero) Native.CloseHandle(pi.hThread);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 服务这边的隐私屏（docs/11 第 4.4 节）：以 SYSTEM 身份在控制台会话的普通桌面上启动、停止黑幕程序（--shade）。
+    /// Start、Stop、Reap 只在 PipeServer 的 shadeGate 锁里调用；Running、RunningIn 别的线程（PING、STATUS）也会调，
+    /// 进程句柄和会话号由 handleGate 护着，关句柄前先清字段，不会拿一个已经关掉的句柄去问
+    /// </summary>
+    static class ShadeHost
+    {
+        const int StopWaitMs = 8000; // 黑幕程序锁屏最多等 4 秒，再留些余量
+        // 等黑幕程序把黑幕盖好、钩子装好（它设上就绪事件）最多等多久。实测几百毫秒
+        const int ReadyWaitMs = 5000;
+        const int ReadyPollMs = 100;
+        // Stop 等不到黑幕程序退出、断开会话也失败，只好直接结束它（不是黑幕程序自己的退出码）
+        const int KilledUnlocked = 97;
+        const uint WAIT_TIMEOUT = 0x102;
+        static readonly object handleGate = new object();
+        static IntPtr process = IntPtr.Zero;
+        static uint session;
+        static AnonymousPipeServerStream stdin;
+        // 这一个黑幕程序就绪过（盖好过黑幕）：没就绪就退出的，桌面本来就没盖，不用断开会话
+        static bool wasReady;
+
+        public static bool Running()
+        {
+            lock (handleGate) return process != IntPtr.Zero && Native.WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+        }
+
+        /// <summary>黑幕程序在这个会话里运行着。会话换了（切换了用户）的黑幕不算：它盖的不是现在显示器上的桌面</summary>
+        public static bool RunningIn(uint consoleSession)
+        {
+            lock (handleGate) return process != IntPtr.Zero && session == consoleSession && Native.WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+        }
+
+        /// <summary>
+        /// 黑幕程序自己退出了（电脑前的人按了 Ctrl+Alt+Del、锁了屏，或者它出了错）：收拾句柄，返回它的退出码。
+        /// 还在运行或者没有，返回 -1。就绪过、退出码又不正常（崩了、被人结束了）就断开它的会话，见 AfterAbnormalExit
+        /// </summary>
+        public static int Reap()
+        {
+            IntPtr p;
+            uint s;
+            lock (handleGate)
+            {
+                p = process;
+                s = session;
+            }
+            if (p == IntPtr.Zero || Native.WaitForSingleObject(p, 0) == WAIT_TIMEOUT) return -1;
+            uint exit;
+            Native.GetExitCodeProcess(p, out exit);
+            bool ready = wasReady;
+            Close();
+            if (ready) AfterAbnormalExit((int)exit, s);
+            return (int)exit;
+        }
+
+        /// <summary>
+        /// 在这个会话里启动黑幕程序，等它就绪（黑幕盖好、钩子装好）才返回 true。locked：会话现在是不是锁着。
+        /// ReadyWaitMs 里没就绪，就让它撤掉（不锁屏：开之前桌面本来就露着，或者会话锁着），返回 false
+        /// </summary>
+        public static bool Start(uint consoleSession, bool locked, out string err)
+        {
+            // 就绪事件只有 SYSTEM 能打开：会话里的普通程序设不上它，冒充不了"盖好了"
+            string name = @"Global\RemoteClaudeShadeReady-" + Guid.NewGuid().ToString("N");
+            var security = new EventWaitHandleSecurity();
+            security.AddAccessRule(new EventWaitHandleAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+                EventWaitHandleRights.FullControl, AccessControlType.Allow));
+            bool created;
+            using (var ready = new EventWaitHandle(false, EventResetMode.ManualReset, name, out created, security))
+            {
+                if (!created)
+                {
+                    err = "就绪事件的名字被占了";
+                    return false;
+                }
+                IntPtr token = Launcher.SessionToken(consoleSession);
+                try
+                {
+                    AnonymousPipeServerStream pipe;
+                    Native.PROCESS_INFORMATION pi = Spawn.Start(token, Launcher.SelfPath(), "--shade " + (locked ? "locked" : "unlocked") + " " + name, @"winsta0\default", out pipe);
+                    Native.CloseHandle(pi.hThread);
+                    lock (handleGate)
+                    {
+                        process = pi.hProcess;
+                        session = consoleSession;
+                        stdin = pipe;
+                        wasReady = false;
+                    }
+                }
+                finally
+                {
+                    Native.CloseHandle(token);
+                }
+                var clock = Stopwatch.StartNew();
+                while (!ready.WaitOne(ReadyPollMs))
+                {
+                    if (!Running())
+                    {
+                        err = "黑幕程序没就绪就退出了：" + Describe(Reap());
+                        return false;
+                    }
+                    if (clock.ElapsedMilliseconds >= ReadyWaitMs)
+                    {
+                        err = "黑幕程序 " + ReadyWaitMs / 1000 + " 秒内没就绪，撤掉了：" + Describe(Stop(false));
+                        return false;
+                    }
+                }
+                wasReady = true;
+            }
+            err = null;
+            return true;
+        }
+
+        /// <summary>
+        /// 让黑幕程序撤掉，end 为 true 时先锁屏。等它退出，返回退出码（Shade.Exit*）。
+        /// 等不到：end 时先断开它所在的会话（屏幕回到登录界面，同样要输密码）再结束它，桌面一刻也不露出来；
+        /// 断开也不成功只能记下来照样结束（不然电脑前的键盘鼠标一直被挡着），返回 KilledUnlocked
+        /// </summary>
+        public static int Stop(bool end)
+        {
+            IntPtr p;
+            uint s;
+            AnonymousPipeServerStream pipe;
+            lock (handleGate)
+            {
+                p = process;
+                s = session;
+                pipe = stdin;
+            }
+            if (p == IntPtr.Zero) return -1;
+            try
+            {
+                byte[] line = Encoding.ASCII.GetBytes(end ? "END\n" : "OFF\n");
+                pipe.Write(line, 0, line.Length);
+                pipe.Flush();
+            }
+            catch (Exception) { } // 它已经退出了（管道断了、已关）：下面照常收拾
+            bool ready = wasReady;
+            int code;
+            if (Native.WaitForSingleObject(p, StopWaitMs) == 0)
+            {
+                uint exit;
+                Native.GetExitCodeProcess(p, out exit);
+                code = (int)exit;
+                Close();
+                if (end && ready) AfterAbnormalExit(code, s);
+                return code;
+            }
+            code = Shade.ExitRemoved;
+            if (end)
+            {
+                if (Native.WTSDisconnectSession(IntPtr.Zero, s, true)) code = Shade.ExitDisconnected;
+                else
+                {
+                    Log.Write("黑幕程序没在 " + StopWaitMs / 1000 + " 秒里锁屏退出，断开会话 " + s + " 也失败了（错误 " + Marshal.GetLastWin32Error() + "），只能结束它");
+                    code = KilledUnlocked;
+                }
+            }
+            Native.TerminateProcess(p, 99);
+            Native.WaitForSingleObject(p, 2000);
+            Close();
+            return code;
+        }
+
+        /// <summary>
+        /// 黑幕程序不是正常退出的（崩了、被人结束了），桌面可能露出来了：会话没锁着就断开它。
+        /// 正常的退出码：锁了屏（0）、只撤了黑幕（6，被控端要的）、断开了会话（7）、出了错但自己先锁了屏或断开了会话（8）
+        /// </summary>
+        static void AfterAbnormalExit(int code, uint s)
+        {
+            if (code == Shade.ExitLocked || code == Shade.ExitRemoved || code == Shade.ExitDisconnected || code == Shade.ExitFailed) return;
+            if (Session.IsLocked(s)) return;
+            bool ok = Native.WTSDisconnectSession(IntPtr.Zero, s, true);
+            Log.Write("隐私屏的黑幕程序非正常退出（" + Describe(code) + "），" + (ok ? "已断开会话 " + s + "（回到登录界面）" : "断开会话 " + s + " 失败（错误 " + Marshal.GetLastWin32Error() + "）"));
+        }
+
+        /// <summary>先把字段清掉再关：别的线程看到的要么是还开着的句柄，要么是 IntPtr.Zero</summary>
+        static void Close()
+        {
+            IntPtr p;
+            AnonymousPipeServerStream pipe;
+            lock (handleGate)
+            {
+                p = process;
+                pipe = stdin;
+                process = IntPtr.Zero;
+                stdin = null;
+                wasReady = false;
+                if (p != IntPtr.Zero) Native.CloseHandle(p);
+            }
+            try { if (pipe != null) pipe.Dispose(); } catch (Exception) { }
+        }
+
+        /// <summary>日志里怎么说黑幕程序的退出码</summary>
+        public static string Describe(int code)
+        {
+            if (code == Shade.ExitLocked) return "已锁屏";
+            if (code == Shade.ExitRemoved) return "没有锁屏";
+            if (code == Shade.ExitDisconnected) return "锁屏没成功，断开了会话（回到登录界面）";
+            if (code == Shade.ExitFailed) return "出了错，先锁了屏或断开了会话";
+            if (code == Shade.ExitUnexpected) return "不知怎么退出了，没有锁屏";
+            if (code == KilledUnlocked) return "没退出，锁屏、断开会话都没成功，直接结束了它";
+            return "退出码 " + code;
+        }
+    }
+
+    /// <summary>
+    /// 隐私屏的黑幕程序（docs/11 第 4.4 节）。服务以 SYSTEM 身份在用户会话的普通桌面（winsta0\default）上启动它：
+    /// RemoteClaudeUnlock.exe --shade locked|unlocked &lt;就绪事件名&gt;（启动时会话是不是锁着）。
+    ///   - 每块屏一块黑幕：WS_POPUP，TOPMOST|TRANSPARENT|TOOLWINDOW|LAYERED|NOACTIVATE，不透明，不让截屏。
+    ///     Chromium 不把这种窗口算作遮挡，Claude 照常绘制；点击会穿过去，被控端的点击落在 Claude 上（docs/11 第 3.1 节）；
+    ///   - 低级键盘、鼠标钩子挡掉不带 InjectMark 的输入：电脑前的人动不了，被控端（带着标记注入）照常操作。
+    ///     钩子在专门的线程上（回调慢了 Windows 会悄悄摘掉钩子），每 2 秒发一个不带标记的空键码和一下鼠标移动，看两个钩子还在不在：
+    ///     没收到就重装一次，再没收到（或者重装不上）就锁屏退出；
+    ///   - 黑幕和钩子都就绪了才把就绪事件设上，服务等到它才回 OK（被控端据此才开始输密码）；
+    ///   - 没锁屏时输入桌面切到了安全桌面（电脑前的人按了 Ctrl+Alt+Del，或者弹了管理员确认框）：黑幕先留着，
+    ///     等它回到普通桌面就锁屏（在安全桌面上锁不了）；这期间会话被锁了（点了"锁定"）也退出；
+    ///   - 标准输入读到 OFF：撤黑幕退出（手机上关了隐私屏）；读到 END、或者标准输入断了（服务没了）：先锁屏再撤；
+    ///   - 锁屏没成功：断开这个会话（屏幕回到登录界面，同样要输密码才能进），断开也不成功就留着黑幕、过一会儿再试；
+    ///   - 出了任何没接住的异常：先锁屏、等锁屏画面出来（不行就断开会话）再退出，不让桌面露出来。
+    /// 锁着的时候黑幕在锁屏界面下面，电脑前看到的还是锁屏画面；解锁那一刻直接是黑幕（docs/11 第 3.3 节）
+    /// </summary>
+    static class Shade
+    {
+        /// <summary>被控端、注入进程 SendInput 时带在 dwExtraInfo 里的标记（"RCLD"），黑幕程序只放行带它的输入</summary>
+        public const uint InjectMark = 0x52434C44;
+        public const int ExitLocked = 0;       // 锁了屏才退出
+        public const int ExitRemoved = 6;      // 只撤了黑幕（OFF）
+        public const int ExitDisconnected = 7; // 锁屏没成功，断开了会话
+        public const int ExitFailed = 8;       // 出了错（钩子装不上、异常）：锁了屏或断开了会话才退出
+        public const int ExitUnexpected = 9;   // 消息循环不知怎么结束了，没走到上面任何一个退出点：服务按非正常退出处理
+        const string Notice = "这台电脑正在被远程操作";
+        // 电脑前的人怎么退出隐私屏：Ctrl+Alt+Del 拦不住，回到桌面时黑幕会先锁屏再撤（见类的说明），之后用自己的密码登录
+        const string ExitHint =
+            "要在这台电脑上使用：按 Ctrl+Alt+Del，再选“锁定”或按 Esc，电脑会锁屏，输入密码登录即可\n" +
+            "远程操作的人也可以在 RemoteClaude App 的菜单里关掉隐私屏";
+        // 自检用的键：没分配的虚拟键码（0x97～0x9F 未分配），键盘上没有，也不会有程序拿它当热键；被钩子挡下，到不了任何程序
+        const ushort CanaryKey = 0x9F;
+        const int CanaryEveryTicks = 8; // 每 8 次计时器（2 秒）自检一次
+        const int SyncEveryTicks = 4;   // 每 4 次计时器（1 秒）核对一次锁屏状态
+        const int WM_APP_REHOOK = 0x8001;
+        // KBDLLHOOKSTRUCT、MSLLHOOKSTRUCT 里 dwExtraInfo 的偏移（x64 上 16、24）：回调里只读这一个字段，越快越好
+        static readonly int KeyboardExtraOffset = (int)Marshal.OffsetOf(typeof(Native.KBDLLHOOKSTRUCT), "dwExtraInfo");
+        static readonly int MouseExtraOffset = (int)Marshal.OffsetOf(typeof(Native.MSLLHOOKSTRUCT), "dwExtraInfo");
+
+        static readonly List<ShadeForm> shades = new List<ShadeForm>();
+        // 钩子回调要一直有人引用着，不然被回收以后系统调到的是野指针
+        static readonly Native.LowLevelProc keyboardProc = KeyboardHook;
+        static readonly Native.LowLevelProc mouseProc = MouseHook;
+        static IntPtr keyboardHook, mouseHook;
+        static uint hookThreadId;
+        static volatile bool hooksOk;
+        // 两个钩子最近一次挡下输入的时间（Stopwatch）：自检看它们还在不在。电脑前的人动了键鼠也算
+        static long keyboardSeen, mouseSeen;
+        static long canarySent;
+        static int canaryMisses, ticks, staleLockTicks;
+        static uint ownSession;
+        static SessionWatcher watcher;
+        static System.Windows.Forms.Timer timer;
+        // 会话现在锁着没有：启动参数给初值，之后跟着锁屏、解锁通知走，每秒再核对一次（SyncLockState）
+        static volatile bool sessionLocked;
+        // 没锁屏时进过安全桌面（Ctrl+Alt+Del、管理员确认框）：回到普通桌面就锁屏
+        static bool secureSeen;
+        // 解锁以后已经看到过普通桌面。远程解锁那一刻，解锁通知可能比输入桌面切回普通桌面先到：
+        // 那时看到的安全桌面是解锁的余波，不是有人按了 Ctrl+Alt+Del，所以先看到一次普通桌面才开始盯
+        static volatile bool defaultSeen;
+        static volatile bool rebuildPending;
+        static volatile string command; // 标准输入读到的 OFF / END；null 是还没有
+        static bool quitting;
+        static int exitCode = ExitUnexpected;
+
+        public static int Run(string initial, string readyEvent)
+        {
+            // 没接住的异常一律先锁屏：黑幕一没，桌面就露出来了
+            AppDomain.CurrentDomain.UnhandledException += delegate
+            {
+                EmergencyLock();
+                Environment.Exit(ExitFailed);
+            };
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+            try
+            {
+                return RunShade(initial, readyEvent);
+            }
+            catch (Exception)
+            {
+                EmergencyLock();
+                return ExitFailed;
+            }
+        }
+
+        static int RunShade(string initial, string readyEvent)
+        {
+            Native.SetProcessDpiAwarenessContext(new IntPtr(-4)); // 每个屏按自己的缩放，拿到的坐标是物理像素
+            using (Process self = Process.GetCurrentProcess()) ownSession = (uint)self.SessionId;
+            sessionLocked = initial != "unlocked";
+            var stdinThread = new Thread(ReadCommands);
+            stdinThread.IsBackground = true;
+            stdinThread.Start();
+
+            // 先登记锁屏通知，再按现在的情况核对一次：服务给的初值是启动前看的，中间可能已经变了
+            watcher = new SessionWatcher();
+            SyncLockState(true);
+            if (!sessionLocked)
+            {
+                // 没锁屏时启动：看一眼输入桌面，启动那一刻正弹着 Ctrl+Alt+Del、管理员确认框的，回来就锁
+                if (InputDesktopName() == "Default") defaultSeen = true;
+                else secureSeen = true;
+            }
+            // 这个事件在 SystemEvents 自己的线程上来：只做个记号，计时器里（界面线程）重铺。先登记再铺，铺的时候变了也不漏
+            Microsoft.Win32.SystemEvents.DisplaySettingsChanged += delegate { rebuildPending = true; };
+            Build();
+            if (!StartHooks())
+            {
+                EmergencyLock();
+                return ExitFailed;
+            }
+            try
+            {
+                using (var ready = EventWaitHandle.OpenExisting(readyEvent)) ready.Set();
+            }
+            catch (Exception) { } // 服务等不到就当没盖上，会把这里撤掉
+
+            timer = new System.Windows.Forms.Timer();
+            timer.Interval = 250;
+            timer.Tick += delegate { Tick(); };
+            timer.Start();
+            Application.Run();
+            Native.PostThreadMessageW(hookThreadId, 0x0012 /* WM_QUIT */, IntPtr.Zero, IntPtr.Zero);
+            return exitCode;
+        }
+
+        /// <summary>在专门的线程上装钩子、跑消息循环（低级钩子靠装它的线程收消息）。返回两个钩子是不是都装上了</summary>
+        static bool StartHooks()
+        {
+            System.Runtime.CompilerServices.RuntimeHelpers.PrepareDelegate(keyboardProc);
+            System.Runtime.CompilerServices.RuntimeHelpers.PrepareDelegate(mouseProc);
+            var installed = new ManualResetEvent(false);
+            var thread = new Thread(delegate ()
+            {
+                hookThreadId = Native.GetCurrentThreadId();
+                Install();
+                installed.Set();
+                Native.MSG msg;
+                while (Native.GetMessageW(out msg, IntPtr.Zero, 0, 0) > 0)
+                {
+                    if (msg.message == WM_APP_REHOOK) Install();
+                }
+                Uninstall();
+            });
+            thread.IsBackground = true;
+            thread.Start();
+            installed.WaitOne(5000);
+            return hooksOk;
+        }
+
+        /// <summary>
+        /// 装钩子。重装时先装上新的再摘旧的，中间不留没有钩子的空档；新的装不上就留着旧的、记下 hooksOk 为 false，
+        /// 计时器看到就锁屏退出
+        /// </summary>
+        static void Install()
+        {
+            IntPtr module = Native.GetModuleHandleW(null);
+            IntPtr k = Native.SetWindowsHookExW(Native.WH_KEYBOARD_LL, keyboardProc, module, 0);
+            IntPtr m = Native.SetWindowsHookExW(Native.WH_MOUSE_LL, mouseProc, module, 0);
+            if (k == IntPtr.Zero || m == IntPtr.Zero)
+            {
+                if (k != IntPtr.Zero) Native.UnhookWindowsHookEx(k);
+                if (m != IntPtr.Zero) Native.UnhookWindowsHookEx(m);
+                hooksOk = false;
+                return;
+            }
+            Uninstall();
+            keyboardHook = k;
+            mouseHook = m;
+            hooksOk = true;
+        }
+
+        static void Uninstall()
+        {
+            if (keyboardHook != IntPtr.Zero) Native.UnhookWindowsHookEx(keyboardHook);
+            if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
+            keyboardHook = mouseHook = IntPtr.Zero;
+        }
+
+        /// <summary>服务通过标准输入发 OFF、END；读到头（服务没了、管道断了）按 END 算</summary>
+        static void ReadCommands()
+        {
+            try
+            {
+                using (var reader = new StreamReader(System.Console.OpenStandardInput(), Encoding.ASCII))
+                {
+                    string line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        line = line.Trim();
+                        if (line == "OFF" || line == "END")
+                        {
+                            command = line;
+                            return;
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+            command = "END";
+        }
+
+        static void Tick()
+        {
+            if (quitting) return;
+            if (command == "OFF")
+            {
+                Quit(ExitRemoved);
+                return;
+            }
+            if (rebuildPending)
+            {
+                rebuildPending = false;
+                Rebuild();
+            }
+            ticks++;
+            if (ticks % SyncEveryTicks == 0) SyncLockState(false);
+            // 控制结束、服务没了：不管停在哪个桌面上都先锁屏再撤（锁不上就断开会话）
+            if (command == "END")
+            {
+                LockAndQuit("控制结束了，或者服务没了");
+                return;
+            }
+            if (!sessionLocked)
+            {
+                string desk = InputDesktopName();
+                if (desk == "")
+                {
+                    // 读不出输入桌面：这一轮不判断，不能当成有人按了 Ctrl+Alt+Del
+                    KeepOnTop();
+                    return;
+                }
+                if (desk == "Default") defaultSeen = true;
+                else if (defaultSeen)
+                {
+                    // 没锁屏、输入桌面却切到了安全桌面：电脑前的人按了 Ctrl+Alt+Del（拦不住的组合键），或者弹了管理员确认框。
+                    // 在那里锁不了屏，黑幕先留着，等回到普通桌面再锁
+                    if (!secureSeen) Log.Write("隐私屏：输入桌面切到了「" + desk + "」（有人按了 Ctrl+Alt+Del，或者弹了管理员确认框），回到普通桌面时锁屏");
+                    secureSeen = true;
+                    return;
+                }
+                else return; // 刚解锁、还没回到普通桌面
+                if (!hooksOk)
+                {
+                    LockAndQuit("重装钩子没装上，挡不住电脑前的键鼠了");
+                    return;
+                }
+                CheckHooks();
+            }
+            if (secureSeen)
+            {
+                LockAndQuit("电脑前有人按了 Ctrl+Alt+Del，或者弹了管理员确认框");
+                return;
+            }
+            KeepOnTop();
+        }
+
+        /// <summary>别的置顶窗口可能盖到上面来：把黑幕再提到最前（不抢焦点）</summary>
+        static void KeepOnTop()
+        {
+            foreach (ShadeForm f in shades)
+                Native.SetWindowPos(f.Handle, Native.HWND_TOPMOST, 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+        }
+
+        /// <summary>
+        /// 核对锁屏状态，补上漏掉的通知：以为锁着、输入桌面却一直是普通桌面、也没有登录界面（LogonUI）在跑，就是已经解开了
+        /// （连着 2 秒这样才算，刚锁上时锁屏画面还在普通桌面上）。start 时只看有没有登录界面，不用等
+        /// </summary>
+        static void SyncLockState(bool start)
+        {
+            if (!sessionLocked)
+            {
+                staleLockTicks = 0;
+                return;
+            }
+            bool looksUnlocked = !Session.LogonUiRunning(ownSession) && (start || InputDesktopName() == "Default");
+            if (!looksUnlocked)
+            {
+                staleLockTicks = 0;
+                return;
+            }
+            if (!start && ++staleLockTicks < 2) return;
+            staleLockTicks = 0;
+            sessionLocked = false;
+        }
+
+        /// <summary>
+        /// 两个钩子还在不在：每 2 秒发一个不带标记的空键码和一下鼠标移动（会被钩子挡下，光标不动），下一次看两个钩子都收到了没有。
+        /// 没收到就重装钩子、记日志，不锁屏：2026-11-24 真机上开隐私屏 8 秒后被锁了屏，正好是"连着两次没收到就锁屏"的时间，
+        /// 疑似误报，原因还没查清（日志里记着没收到的是哪个钩子）。重装不上（hooksOk 为 false）时 Tick 照样锁屏。
+        /// 只在没锁屏、普通桌面上做（别的桌面上的输入钩子本来就收不到）
+        /// </summary>
+        static void CheckHooks()
+        {
+            if (ticks % CanaryEveryTicks != 0) return;
+            if (canarySent != 0)
+            {
+                bool keyboardOk = Interlocked.Read(ref keyboardSeen) >= canarySent;
+                bool mouseOk = Interlocked.Read(ref mouseSeen) >= canarySent;
+                if (keyboardOk && mouseOk) canaryMisses = 0;
+                else
+                {
+                    canaryMisses++;
+                    Log.Throttled("shade-canary", "隐私屏的钩子自检没收到（键盘" + (keyboardOk ? "收到了" : "没收到") + "，鼠标" + (mouseOk ? "收到了" : "没收到") +
+                        "，连着第 " + canaryMisses + " 次），重装钩子");
+                    Native.PostThreadMessageW(hookThreadId, WM_APP_REHOOK, IntPtr.Zero, IntPtr.Zero);
+                }
+            }
+            long sent = Stopwatch.GetTimestamp();
+            var key = new Native.INPUT();
+            key.type = Native.INPUT_KEYBOARD;
+            key.u.ki.wVk = CanaryKey;
+            var keyUp = key;
+            keyUp.u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
+            // 一下右、一下左：钩子在的话都被挡下，光标不动；钩子不在了也只是来回动一个像素
+            var right = new Native.INPUT();
+            right.type = Native.INPUT_MOUSE;
+            right.u.mi.dx = 1;
+            right.u.mi.dwFlags = Native.MOUSEEVENTF_MOVE;
+            var left = right;
+            left.u.mi.dx = -1;
+            var inputs = new[] { key, keyUp, right, left };
+            // 没发出去（桌面正好在切换）不算钩子的错：这一轮不算数
+            uint n = Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.INPUT)));
+            if (n == inputs.Length) canarySent = sent;
+            else
+            {
+                canarySent = 0;
+                Log.Throttled("shade-sendinput", "隐私屏的钩子自检发不出去（SendInput 发出 " + n + " 个，错误 " + Marshal.GetLastWin32Error() + "）");
+            }
+        }
+
+        /// <summary>
+        /// 先锁屏再撤黑幕，桌面一刻也不露出来。锁没锁上看锁屏通知（刚锁上时锁屏画面还在普通桌面上，看桌面名字不准）；
+        /// 锁上以后再盖一会儿，等锁屏画面出来
+        /// </summary>
+        static void LockAndQuit(string why)
+        {
+            // 锁不上、断开也不成功时会每次计时器都再来一次：一分钟只记一条
+            Log.Throttled("shade-lock", "隐私屏的黑幕程序要锁屏退出：" + why);
+            quitting = true;
+            if (timer != null) timer.Stop();
+            if (!sessionLocked && Native.LockWorkStation()) Pump(4000, delegate { return sessionLocked; });
+            if (sessionLocked)
+            {
+                Pump(800, delegate { return false; });
+                Quit(ExitLocked);
+                return;
+            }
+            // 锁不上：断开这个会话，屏幕回到登录界面，同样要输密码才能进；断开也不成功就留着黑幕，过一会儿再试
+            if (Native.WTSDisconnectSession(IntPtr.Zero, Native.WTS_CURRENT_SESSION, true))
+            {
+                Quit(ExitDisconnected);
+                return;
+            }
+            quitting = false;
+            timer.Start();
+        }
+
+        /// <summary>最多等 ms 毫秒，直到 done 为真；等的时候照常处理消息（锁屏通知要进得来），黑幕一直提在最前</summary>
+        static void Pump(int ms, Func<bool> done)
+        {
+            var clock = Stopwatch.StartNew();
+            while (clock.ElapsedMilliseconds < ms && !done())
+            {
+                Application.DoEvents();
+                KeepOnTop();
+                Thread.Sleep(50);
+            }
+        }
+
+        /// <summary>
+        /// 出了没接住的异常：锁屏，等登录界面（锁屏画面）出来、再等 0.8 秒才退出，免得黑幕没了、锁屏画面还没出来那一下露出桌面；
+        /// 锁不上、等不到就断开会话。这时界面线程可能已经不行了，不靠消息，直接看有没有登录界面在跑
+        /// </summary>
+        static void EmergencyLock()
+        {
+            try
+            {
+                if (Native.LockWorkStation())
+                {
+                    var clock = Stopwatch.StartNew();
+                    while (clock.ElapsedMilliseconds < 4000)
+                    {
+                        if (Session.LogonUiRunning(ownSession))
+                        {
+                            Thread.Sleep(800);
+                            return;
+                        }
+                        Thread.Sleep(100);
+                    }
+                }
+                Native.WTSDisconnectSession(IntPtr.Zero, Native.WTS_CURRENT_SESSION, true);
+            }
+            catch (Exception) { }
+        }
+
+        static void Quit(int code)
+        {
+            quitting = true;
+            exitCode = code;
+            if (timer != null) timer.Stop();
+            foreach (ShadeForm f in shades) f.Close();
+            shades.Clear();
+            Application.ExitThread();
+        }
+
+        /// <summary>当前接收输入的桌面的名字：Default（普通桌面）、Winlogon（锁屏、Ctrl+Alt+Del、管理员确认框）；打不开时是空串</summary>
+        static string InputDesktopName()
+        {
+            IntPtr desk = Native.OpenInputDesktop(0, false, 0x0001 /* DESKTOP_READOBJECTS */);
+            if (desk == IntPtr.Zero) return "";
+            try
+            {
+                var buf = new byte[256];
+                uint needed;
+                if (!Native.GetUserObjectInformationW(desk, Native.UOI_NAME, buf, (uint)buf.Length, out needed)) return "";
+                int len = (int)Math.Min(needed, (uint)buf.Length);
+                return Encoding.Unicode.GetString(buf, 0, len).TrimEnd('\0');
+            }
+            finally
+            {
+                Native.CloseDesktop(desk);
+            }
+        }
+
+        static void Build()
+        {
+            foreach (Screen s in Screen.AllScreens)
+            {
+                var f = new ShadeForm(s.Bounds);
+                f.Show();
+                Native.SetLayeredWindowAttributes(f.Handle, 0, 255, Native.LWA_ALPHA);
+                // 被控端按窗口截图，黑幕本来就截不进去；这一条防的是整屏截图。Win10 2004 以前没有这个选项，只记一笔
+                if (!Native.SetWindowDisplayAffinity(f.Handle, Native.WDA_EXCLUDEFROMCAPTURE))
+                    Log.Throttled("shade-affinity", "隐私屏的黑幕没能设成不让截屏（错误 " + Marshal.GetLastWin32Error() + "），整屏截图会截到黑幕");
+                f.Cover();
+                shades.Add(f);
+            }
+        }
+
+        /// <summary>插拔了显示器、改了分辨率：先按现在的屏铺好新的，再撤旧的，中间不留空档</summary>
+        static void Rebuild()
+        {
+            var old = new List<ShadeForm>(shades);
+            shades.Clear();
+            Build();
+            foreach (ShadeForm f in old) f.Close();
+        }
+
+        static IntPtr KeyboardHook(int code, IntPtr wParam, IntPtr lParam)
+        {
+            if (code >= 0 && Marshal.ReadIntPtr(lParam, KeyboardExtraOffset) != (IntPtr)InjectMark)
+            {
+                Interlocked.Exchange(ref keyboardSeen, Stopwatch.GetTimestamp());
+                return (IntPtr)1;
+            }
+            return Native.CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+        }
+
+        static IntPtr MouseHook(int code, IntPtr wParam, IntPtr lParam)
+        {
+            if (code >= 0 && Marshal.ReadIntPtr(lParam, MouseExtraOffset) != (IntPtr)InjectMark)
+            {
+                Interlocked.Exchange(ref mouseSeen, Stopwatch.GetTimestamp());
+                return (IntPtr)1;
+            }
+            return Native.CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+        }
+
+        /// <summary>一块黑幕：样式见类的说明。上半屏是标题，下半屏是怎么退出</summary>
+        class ShadeForm : Form
+        {
+            readonly Rectangle bounds;
+
+            public ShadeForm(Rectangle screenBounds)
+            {
+                bounds = screenBounds;
+                BackColor = Color.Black;
+                FormBorderStyle = FormBorderStyle.None;
+                ShowInTaskbar = false;
+                StartPosition = FormStartPosition.Manual;
+                var layout = new TableLayoutPanel();
+                layout.Dock = DockStyle.Fill;
+                layout.BackColor = Color.Black;
+                layout.ColumnCount = 1;
+                layout.RowCount = 2;
+                layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+                layout.Controls.Add(MakeLabel(Notice, 24, Color.FromArgb(160, 160, 160), ContentAlignment.BottomCenter), 0, 0);
+                Label hint = MakeLabel(ExitHint, 14, Color.FromArgb(120, 120, 120), ContentAlignment.TopCenter);
+                hint.Padding = new Padding(0, 24, 0, 0);
+                layout.Controls.Add(hint, 0, 1);
+                Controls.Add(layout);
+            }
+
+            static Label MakeLabel(string text, float size, Color color, ContentAlignment align)
+            {
+                var label = new Label();
+                label.Text = text;
+                label.ForeColor = color;
+                label.Font = new Font("Microsoft YaHei", size);
+                label.Dock = DockStyle.Fill;
+                label.TextAlign = align;
+                return label;
+            }
+
+            /// <summary>铺满这块屏（物理像素）</summary>
+            public void Cover()
+            {
+                Native.SetWindowPos(Handle, Native.HWND_TOPMOST, bounds.X, bounds.Y, bounds.Width, bounds.Height, Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
+            }
+
+            protected override CreateParams CreateParams
+            {
+                get
+                {
+                    CreateParams cp = base.CreateParams;
+                    cp.Style = unchecked((int)Native.WS_POPUP);
+                    cp.ExStyle = (int)(Native.WS_EX_TOPMOST | Native.WS_EX_TRANSPARENT | Native.WS_EX_TOOLWINDOW | Native.WS_EX_LAYERED | Native.WS_EX_NOACTIVATE);
+                    return cp;
+                }
+            }
+
+            protected override bool ShowWithoutActivation { get { return true; } }
+
+            protected override void WndProc(ref Message m)
+            {
+                base.WndProc(ref m);
+                // 挪到缩放不同的屏上时，系统会按它建议的大小改窗口：改回铺满这块屏
+                if (m.Msg == 0x02E0 /* WM_DPICHANGED */) Cover();
+            }
+        }
+
+        /// <summary>不显示的窗口，收这个会话的锁屏、解锁通知。登记不上时只靠每秒核对（SyncLockState）</summary>
+        class SessionWatcher : NativeWindow
+        {
+            public SessionWatcher()
+            {
+                CreateHandle(new CreateParams());
+                if (!Native.WTSRegisterSessionNotification(Handle, 0 /* NOTIFY_FOR_THIS_SESSION */))
+                    Log.Throttled("shade-notify", "隐私屏的黑幕程序收不到锁屏通知（错误 " + Marshal.GetLastWin32Error() + "），只能每秒核对一次");
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == Native.WM_WTSSESSION_CHANGE)
+                {
+                    int reason = m.WParam.ToInt32();
+                    if (reason == Native.WTS_SESSION_LOCK)
+                    {
+                        sessionLocked = true;
+                        defaultSeen = false;
+                    }
+                    else if (reason == Native.WTS_SESSION_UNLOCK) sessionLocked = false;
+                }
+                base.WndProc(ref m);
             }
         }
     }
@@ -1425,6 +2784,12 @@ namespace RemoteClaude
 
         static void Send(params Native.INPUT[] inputs)
         {
+            // 带上标记：隐私屏开着时黑幕程序只放行带标记的输入（Shade.InjectMark）
+            for (int i = 0; i < inputs.Length; i++)
+            {
+                if (inputs[i].type == Native.INPUT_KEYBOARD) inputs[i].u.ki.dwExtraInfo = (IntPtr)Shade.InjectMark;
+                else inputs[i].u.mi.dwExtraInfo = (IntPtr)Shade.InjectMark;
+            }
             Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.INPUT)));
         }
     }
@@ -1622,6 +2987,147 @@ namespace RemoteClaude
         [DllImport("user32.dll")] public static extern short VkKeyScanW(char c);
         [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint type);
         [DllImport("user32.dll")] public static extern short GetKeyState(int vk);
+
+        // ---- 隐私屏的黑幕（Shade）----
+        public const int WH_KEYBOARD_LL = 13;
+        public const int WH_MOUSE_LL = 14;
+        public const uint WS_POPUP = 0x80000000;
+        public const uint WS_EX_TOPMOST = 0x00000008;
+        public const uint WS_EX_TRANSPARENT = 0x00000020;
+        public const uint WS_EX_TOOLWINDOW = 0x00000080;
+        public const uint WS_EX_LAYERED = 0x00080000;
+        public const uint WS_EX_NOACTIVATE = 0x08000000;
+        public const uint LWA_ALPHA = 0x2;
+        public const uint WDA_EXCLUDEFROMCAPTURE = 0x11; // Win10 2004 起
+        public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        public const uint SWP_NOSIZE = 0x1;
+        public const uint SWP_NOMOVE = 0x2;
+        public const uint SWP_NOACTIVATE = 0x10;
+        public const uint SWP_SHOWWINDOW = 0x40;
+        public const int WM_WTSSESSION_CHANGE = 0x2B1;
+        public const int WTS_SESSION_LOCK = 0x7;
+        public const int WTS_SESSION_UNLOCK = 0x8;
+        public const uint WTS_CURRENT_SESSION = 0xFFFFFFFF;
+
+        public delegate IntPtr LowLevelProc(int code, IntPtr wParam, IntPtr lParam);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode, scanCode, flags, time;
+            public UIntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSLLHOOKSTRUCT
+        {
+            public int x, y;
+            public uint mouseData, flags, time;
+            public UIntPtr dwExtraInfo;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetWindowsHookExW(int id, LowLevelProc proc, IntPtr module, uint threadId);
+        [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr hook);
+        [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetModuleHandleW(string name);
+        [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
+        [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint key, byte alpha, uint flags);
+        [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(IntPtr hwnd, uint affinity);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] public static extern bool LockWorkStation();
+        [DllImport("wtsapi32.dll")] public static extern bool WTSRegisterSessionNotification(IntPtr hwnd, uint flags);
+        [DllImport("wtsapi32.dll", SetLastError = true)] public static extern bool WTSDisconnectSession(IntPtr server, uint session, bool wait);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSG
+        {
+            public IntPtr hwnd;
+            public uint message;
+            public IntPtr wParam, lParam;
+            public uint time;
+            public int x, y;
+            public uint lPrivate;
+        }
+
+        [DllImport("user32.dll")] public static extern int GetMessageW(out MSG msg, IntPtr hwnd, uint min, uint max);
+        [DllImport("user32.dll")] public static extern bool PostThreadMessageW(uint threadId, uint msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+
+        // ---- 设备管理（虚拟屏，VirtualDisplay）----
+        public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+        public const uint DIGCF_PRESENT = 0x2;
+        public const uint DICD_GENERATE_ID = 0x1;
+        public const uint SPDRP_HARDWAREID = 0x1;
+        public const uint DIF_REMOVE = 0x05;
+        public const uint DIF_PROPERTYCHANGE = 0x12;
+        public const uint DIF_REGISTERDEVICE = 0x19;
+        public const uint DICS_ENABLE = 1;
+        public const uint DICS_DISABLE = 2;
+        public const uint DICS_FLAG_GLOBAL = 1;
+        public const uint DI_REMOVEDEVICE_GLOBAL = 1;
+        public const uint INSTALLFLAG_FORCE = 0x1;
+        public const uint DN_HAS_PROBLEM = 0x400;
+        public const uint CM_PROB_DISABLED = 22;
+
+        [DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr SetupDiGetClassDevsW(ref Guid cls, string enumerator, IntPtr hwnd, uint flags);
+        [DllImport("setupapi.dll", SetLastError = true)]
+        public static extern IntPtr SetupDiCreateDeviceInfoList(ref Guid cls, IntPtr hwnd);
+        [DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool SetupDiCreateDeviceInfoW(IntPtr set, string name, ref Guid cls, string description, IntPtr hwnd, uint flags,
+            ref SP_DEVINFO_DATA data);
+        [DllImport("setupapi.dll", SetLastError = true)]
+        public static extern bool SetupDiEnumDeviceInfo(IntPtr set, uint index, ref SP_DEVINFO_DATA data);
+        [DllImport("setupapi.dll", SetLastError = true)]
+        public static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr set, ref SP_DEVINFO_DATA data, uint property, out uint type,
+            byte[] buffer, uint size, out uint needed);
+        [DllImport("setupapi.dll", SetLastError = true)]
+        public static extern bool SetupDiSetDeviceRegistryPropertyW(IntPtr set, ref SP_DEVINFO_DATA data, uint property, byte[] buffer, uint size);
+        [DllImport("setupapi.dll", SetLastError = true)]
+        public static extern bool SetupDiSetClassInstallParamsW(IntPtr set, ref SP_DEVINFO_DATA data, ref SP_PROPCHANGE_PARAMS p, uint size);
+        [DllImport("setupapi.dll", SetLastError = true)]
+        public static extern bool SetupDiSetClassInstallParamsW(IntPtr set, ref SP_DEVINFO_DATA data, ref SP_REMOVEDEVICE_PARAMS p, uint size);
+        [DllImport("setupapi.dll", SetLastError = true)]
+        public static extern bool SetupDiCallClassInstaller(uint function, IntPtr set, ref SP_DEVINFO_DATA data);
+        [DllImport("setupapi.dll", SetLastError = true)]
+        public static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
+        [DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool SetupDiGetDeviceInstanceIdW(IntPtr set, ref SP_DEVINFO_DATA data, StringBuilder id, int size, out int needed);
+        [DllImport("newdev.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool UpdateDriverForPlugAndPlayDevicesW(IntPtr hwnd, string hardwareId, string inf, uint flags, out bool reboot);
+        [DllImport("cfgmgr32.dll")]
+        public static extern uint CM_Get_DevNode_Status(out uint status, out uint problem, uint devInst, uint flags);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SP_DEVINFO_DATA
+        {
+            public uint cbSize;
+            public Guid ClassGuid;
+            public uint DevInst;
+            public IntPtr Reserved;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SP_CLASSINSTALL_HEADER
+        {
+            public uint cbSize;
+            public uint InstallFunction;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SP_PROPCHANGE_PARAMS
+        {
+            public SP_CLASSINSTALL_HEADER ClassInstallHeader;
+            public uint StateChange, Scope, HwProfile;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SP_REMOVEDEVICE_PARAMS
+        {
+            public SP_CLASSINSTALL_HEADER ClassInstallHeader;
+            public uint Scope, HwProfile;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         public struct BY_HANDLE_FILE_INFORMATION

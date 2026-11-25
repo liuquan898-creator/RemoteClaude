@@ -75,6 +75,29 @@ test('parseStatus: 旧版、新版回应都能解析，认不出的字段忽略'
   assert.deepEqual(parseStatus('OK attach'), { locked: false, attach: false }, '没有等号的字段忽略');
 });
 
+test('解锁服务支不支持隐私屏：版本 3 的 STATUS 有 shade=，旧版没有；断开的远程会话问到的不算数', async () => {
+  const { statusHasShade } = require('../lockstate');
+  assert.equal(statusHasShade('OK locked=0 attach=0 display=0 shade=0'), true);
+  assert.equal(statusHasShade('OK locked=0 attach=0 display=-1 shade=1'), true);
+  assert.equal(statusHasShade('OK locked=0 attach=0'), false, '版本 2');
+  assert.equal(statusHasShade('OK locked=1'), false, '版本 1');
+  assert.equal(statusHasShade(null), false);
+  assert.equal(statusHasShade('ERR failed'), false);
+
+  const { env, lock } = setup({ reply: () => 'OK locked=0 attach=0 display=0 shade=0' });
+  assert.equal(lock.shadeSupported(), false, '还没问过');
+  await lock.poll();
+  assert.equal(lock.shadeSupported(), true);
+  // 远程桌面断开以后，服务对不在控制台的会话只回 locked、attach：不能因此当成不支持
+  env.session = rdpDisconnected;
+  await lock.poll();
+  assert.equal(lock.shadeSupported(), true);
+
+  const old = setup({ reply: () => 'OK locked=0 attach=0' });
+  await old.lock.poll();
+  assert.equal(old.lock.shadeSupported(), false, '旧版服务');
+});
+
 test('parseStatus: 字段表不带原型，Object.prototype 被污染也读不出 locked/attach；__proto__ 之类的字段名只是普通字段', () => {
   Object.prototype.locked = '1';
   Object.prototype.attach = '1';

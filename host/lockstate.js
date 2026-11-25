@@ -40,6 +40,12 @@ function isDetached(info) {
  * @returns {{ locked: boolean, attach: boolean } | null}
  */
 function parseStatus(reply) {
+  const fields = statusFields(reply);
+  return fields ? { locked: fields.locked === '1', attach: fields.attach === '1' } : null;
+}
+
+/** STATUS 回应里的字段；不是 OK 开头（包括 null）返回 null */
+function statusFields(reply) {
   if (typeof reply !== 'string') return null;
   const parts = reply.trim().split(/\s+/);
   if (parts[0] !== 'OK') return null;
@@ -49,7 +55,16 @@ function parseStatus(reply) {
     const i = p.indexOf('=');
     if (i > 0) fields[p.slice(0, i)] = p.slice(i + 1);
   }
-  return { locked: fields.locked === '1', attach: fields.attach === '1' };
+  return fields;
+}
+
+/**
+ * 服务支不支持隐私屏：解锁服务版本 3 起，控制台会话问 STATUS 时回应里有 shade=（docs/06）。
+ * 被控端自动升级了、电脑上的解锁服务还是旧版时没有，这时解锁不盖隐私屏（main.js 的 unlockWith）
+ */
+function statusHasShade(reply) {
+  const fields = statusFields(reply);
+  return !!fields && fields.shade !== undefined;
 }
 
 /** 服务对 UNLOCK、ATTACH 的回应 → 回给控制端的错误码（成功是 null），码同协议文档 4.6 */
@@ -81,6 +96,8 @@ function createLockState(opts) {
   const now = opts.now || Date.now;
   // untrusted：管道那头有服务，但核实不过（多半是被控端自动升级了、解锁服务还是旧版），要在电脑上重新安装服务
   let state = { locked: false, unlock: false, untrusted: false, detached: false };
+  // 解锁服务支不支持隐私屏（statusHasShade）。断开的远程会话问 STATUS 时服务只回 locked、attach，那时不改它
+  let shade = false;
   let serviceCheckedAt = -Infinity;
   let polling = false;
   let unlocking = false;
@@ -120,6 +137,7 @@ function createLockState(opts) {
         // 断开时还要服务明确说这个会话能接回（旧版服务根本不理不在控制台的程序，回不了 OK）
         unlock = detached ? !!(status && status.attach) : !!status;
         untrusted = r.error === 'untrusted';
+        if (!detached) shade = statusHasShade(r.line);
       }
       if (locked === state.locked && unlock === state.unlock && untrusted === state.untrusted && detached === state.detached) {
         return state;
@@ -160,13 +178,14 @@ function createLockState(opts) {
     return poll();
   }
 
-  return { poll, recheck, unlock, lockedNow, current: () => state };
+  return { poll, recheck, unlock, lockedNow, current: () => state, shadeSupported: () => shade };
 }
 
 module.exports = {
   createLockState,
   isDetached,
   parseStatus,
+  statusHasShade,
   replyCode,
   unlockCommand,
   WTS_DISCONNECTED,

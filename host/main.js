@@ -1225,10 +1225,15 @@ ipcMain.handle('rc:lock-now', (e) => {
  * 远程桌面断开时发的是 ATTACH（先接回电脑的显示器），否则是 UNLOCK，见 lockstate.js
  */
 async function unlockWith(password, privacy) {
-  // 隐私屏（docs/11 第 4.4 节）：先盖好黑幕再输密码，解锁那一刻不露桌面；手机没说就按配置。细节见 privacy.js 的 unlockWithPrivacy
+  // 隐私屏（docs/11 第 4.4 节）：先盖好黑幕再输密码，解锁那一刻不露桌面；手机没说就按配置。细节见 privacy.js 的 unlockWithPrivacy。
+  // 被控端自动升级了、电脑上的解锁服务还是旧版（不认 SHADE）时不盖、照常解锁：手机默认要隐私屏，
+  // 不这样的话每台没在电脑前点过"更新解锁服务"的电脑都从手机解不开了（回 privacy-failed）
+  const supported = lock.shadeSupported();
+  const wanted = typeof privacy === 'boolean' ? privacy : cfg.privacyOnUnlock;
+  if (wanted && !supported) console.log('[隐私屏] 电脑上的解锁服务是旧版，不支持隐私屏，这次解锁不盖（在被控端窗口里更新解锁服务以后就有了）');
   try {
     return await unlockWithPrivacy({
-      privacy,
+      privacy: supported ? privacy : false,
       defaultOn: cfg.privacyOnUnlock,
       detached: lock.current().detached,
       unlock: () => lock.unlock(password),

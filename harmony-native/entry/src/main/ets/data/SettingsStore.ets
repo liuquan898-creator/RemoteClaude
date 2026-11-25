@@ -18,6 +18,8 @@ export class AppSettings {
   appLock: boolean = true;
   /** 看画面时，电脑上新复制的文字自动放进手机剪贴板（协议 4.9） */
   syncClipboard: boolean = true;
+  /** 从手机解锁时先在电脑的真显示器上盖隐私屏的黑幕，电脑前的人看不到桌面（docs/11 第 4.4 节） */
+  privacyOnUnlock: boolean = true;
 
   copy(): AppSettings {
     const s = new AppSettings();
@@ -26,6 +28,7 @@ export class AppSettings {
     s.showStats = this.showStats;
     s.appLock = this.appLock;
     s.syncClipboard = this.syncClipboard;
+    s.privacyOnUnlock = this.privacyOnUnlock;
     return s;
   }
 }
@@ -84,6 +87,7 @@ export class SettingsStore {
     s.showStats = SettingsStore.bool(p, 'show_stats', d.showStats);
     s.appLock = SettingsStore.bool(p, 'app_lock', d.appLock);
     s.syncClipboard = SettingsStore.bool(p, 'sync_clipboard', d.syncClipboard);
+    s.privacyOnUnlock = SettingsStore.bool(p, 'privacy_on_unlock', d.privacyOnUnlock);
     const collapsed = SettingsStore.str(p, 'collapsed_groups');
     let groups: string[] = [];
     if (collapsed.length > 0) {
@@ -143,6 +147,7 @@ export class SettingsStore {
     SettingsStore.put('show_stats', s.showStats);
     SettingsStore.put('app_lock', s.appLock);
     SettingsStore.put('sync_clipboard', s.syncClipboard);
+    SettingsStore.put('privacy_on_unlock', s.privacyOnUnlock);
   }
 
   static saveCollapsedGroups(keys: string[]): void {

@@ -61,6 +61,11 @@ fun SettingsSheet(state: AppState, controller: RemoteController, onDismiss: () -
                 controller.updateSettings { it.copy(syncClipboard = v) }
             }
             SwitchRow(
+                "解锁时打开隐私屏",
+                s.privacyOnUnlock,
+                note = "从手机解锁电脑时，电脑的显示器先盖上黑幕、挡住电脑前的键盘鼠标，旁边的人看不到桌面；不再控制这台电脑时先锁屏再撤掉",
+            ) { v -> controller.updateSettings { it.copy(privacyOnUnlock = v) } }
+            SwitchRow(
                 "打开时验证指纹或锁屏密码",
                 s.appLock && state.canLock,
                 enabled = state.canLock,

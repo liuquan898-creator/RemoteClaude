@@ -27,6 +27,7 @@
       "testMessage": true,
       "ttl": 86400,
       "maxPerHour": 60,
+      "alertDelaySec": 60,
       "showDetail": false
     }
   }

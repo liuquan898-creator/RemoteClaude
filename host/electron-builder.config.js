@@ -29,6 +29,7 @@ module.exports = {
     'winlist.js',
     'winorder.js',
     'unlockkey.js',
+    'unlocksecret.js',
     'unlockpipe.js',
     'unlockpipe-native.js',
     'lockstate.js',
@@ -41,6 +42,9 @@ module.exports = {
     'updater.js',
     'logfile.js',
     'clipwatch.js',
+    'controlsession.js',
+    'vdisplay.js',
+    'privacy.js',
     'claudecheck.js',
     'dialogwatch.js',
     'tiler/**',
@@ -49,9 +53,9 @@ module.exports = {
     'assets/**',
   ],
   asarUnpack: ['sessions/*.ps1', 'node_modules/koffi/**'],
-  // 解锁服务的源码和安装脚本（docs/06），被控端窗口里点"安装"时用。放在 resources\unlock-service，
-  // 不进 asar：PowerShell 和 C# 编译器要读真的文件
-  extraResources: [{ from: 'unlock-service', to: 'unlock-service', filter: ['UnlockService.cs', 'install.ps1'] }],
+  // 解锁服务的源码和安装脚本（docs/06），被控端窗口里点"安装"时用；vdd 是一起装的虚拟屏驱动（docs/11）。
+  // 放在 resources\unlock-service，不进 asar：PowerShell、C# 编译器和驱动安装要读真的文件
+  extraResources: [{ from: 'unlock-service', to: 'unlock-service', filter: ['UnlockService.cs', 'install.ps1', 'vdd/**'] }],
   win: {
     target: ['nsis'],
     icon: 'assets/icon.png',

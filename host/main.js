@@ -21,6 +21,8 @@ const {
   globalShortcut,
   ClipboardItem,
   dialog,
+  screen,
+  safeStorage,
 } = require('electron');
 const fs = require('fs');
 const path = require('path');
@@ -32,6 +34,9 @@ const { isClosable } = require('./sessions');
 const { sortByPosition } = require('./winorder');
 const { createLogFile, teeConsole } = require('./logfile');
 const { createClipWatch } = require('./clipwatch');
+const { createControlSession } = require('./controlsession');
+const { createVirtualDisplay, fitVirtualMode } = require('./vdisplay');
+const { createPrivacy, unlockWithPrivacy } = require('./privacy');
 
 const MAX_TEXT = 20000;
 
@@ -82,6 +87,8 @@ function loadConfig() {
     claudeSelfCheck: raw.claudeSelfCheck !== false,
     // Claude 桌面端自己弹的确认框（"允许 Claude 操作这个网站？"等）提醒到手机（docs/09 第 4 节）。写成 false 可以关掉
     dialogNotice: raw.dialogNotice !== false,
+    // 从手机解锁时先在电脑的真显示器上盖黑幕（隐私屏，docs/11 第 4.4 节）。手机的解锁请求里带了 privacy 就按手机的，没带按这里。写成 false 可以关掉
+    privacyOnUnlock: raw.privacyOnUnlock !== false,
     // Claude 桌面端的日志文件，不写就自己找
     claudeLogFile: raw.claudeLogFile ? path.resolve(String(raw.claudeLogFile)) : '',
   };
@@ -289,6 +296,9 @@ app.whenReady().then(() => {
   setInterval(pollLock, LOCK_POLL_MS);
   pollLock();
   startTiler();
+  // 显示器插拔、DP 显示器断电（系统当它拔掉了）：控制期间据此开关虚拟屏
+  screen.on('display-added', () => virtualDisplay.displaysChanged());
+  screen.on('display-removed', () => virtualDisplay.displaysChanged());
   // Claude 升级后自检。开发测试时另起的第二个被控端（RC_HOST_PROFILE）不做，免得两个一起动 Claude 的窗口
   if (cfg.claudeSelfCheck && (!process.env.RC_HOST_PROFILE || process.env.RC_CLAUDE_CHECK)) {
     setInterval(() => {
@@ -321,6 +331,10 @@ app.on('second-instance', showWindow);
 // 系统关机、注销时也要能退出，不能被"藏到托盘"拦住
 app.on('before-quit', () => {
   quitting = true;
+  // 尽量把为这次控制开的虚拟屏关掉；来不及也没关系，服务 15 秒收不到平安会自己关
+  if (virtualDisplay.state() === 'on') askUnlockService('DISPLAY OFF', 1000).catch(() => {});
+  // 隐私屏开着就先锁屏再撤；来不及的话服务 15 秒收不到平安也会这么做
+  if (privacyScreen.isOn()) askUnlockService('SHADE END', 1000).catch(() => {});
 });
 app.on('window-all-closed', () => {
   if (quitting) app.quit();
@@ -505,22 +519,48 @@ ipcMain.handle('rc:prepare', async (_e, hwnd) => {
   return { sourceId: sourceIdOf(hwnd), title: win32.windowTitle(hwnd), width: b ? b.width : 0, height: b ? b.height : 0 };
 });
 
-// 有人在看的时候不让显示器休眠（锁屏或息屏后既采集不到画面也注入不了输入）。
-// 防休眠只能拦着不关，显示器已经关着时叫不醒，所以有人开始看时先动一下鼠标把它叫醒：
-// 息屏时 Claude 的窗口不刷新画面，手机上看到的会一直是息屏前的样子
+// 手机在控制这台电脑时（看画面，或者列会话、打开会话这些操作之后 3 分钟内，docs/11 第 4.2 节）不让显示器休眠：
+// 锁屏或息屏后既采集不到画面也注入不了输入，息屏时 Claude 的窗口也不刷新画面。
+// 防休眠只能拦着不关，显示器已经关着时叫不醒，所以开始时先动一下鼠标把它叫醒
 let blockerId = null;
-ipcMain.on('rc:active', (_e, count) => {
-  trayState.viewers = Math.max(0, Number(count) || 0);
-  updateTray();
-  // 等没人看画面了再重启换新版本
-  if (trayState.viewers === 0 && updater) updater.maybeInstall();
-  if (count > 0 && blockerId === null) {
+function updateKeepAwake() {
+  const want = trayState.viewers > 0 || controlSession.isActive();
+  if (want && blockerId === null) {
     win32.wakeDisplay();
     blockerId = powerSaveBlocker.start('prevent-display-sleep');
-  } else if (count <= 0 && blockerId !== null) {
+  } else if (!want && blockerId !== null) {
     powerSaveBlocker.stop(blockerId);
     blockerId = null;
   }
+}
+
+/** 手机是不是在控制这台电脑：防息屏、虚拟屏跟着它开关 */
+const controlSession = createControlSession({
+  onChange: (active) => {
+    console.log(active ? '[控制] 手机开始控制这台电脑' : '[控制] 控制结束');
+    updateKeepAwake();
+    virtualDisplay.setActive(active);
+    // 控制结束：先锁屏再撤隐私屏，桌面一刻也不露出来
+    if (!active) privacyScreen.end();
+    if (!active && updater) updater.maybeInstall();
+  },
+});
+
+// 页面从信令消息里看出来的控制端操作、结束控制（docs/11 第 4.2 节）
+ipcMain.on('rc:control', (e, viewerId, kind) => {
+  if (!isOwnSender(e) || typeof viewerId !== 'string' || !viewerId || viewerId.length > 64) return;
+  if (kind === 'activity') controlSession.activity(viewerId);
+  else if (kind === 'release') controlSession.release(viewerId);
+  else if (kind === 'gone') controlSession.gone(viewerId);
+});
+
+ipcMain.on('rc:active', (_e, count) => {
+  trayState.viewers = Math.max(0, Number(count) || 0);
+  updateTray();
+  // 等没人看画面、也没在控制了再重启换新版本（isIdle 里判断）
+  if (updater) updater.maybeInstall();
+  controlSession.setWatching(trayState.viewers);
+  updateKeepAwake();
   // 只在有人看画面的时候盯着剪贴板
   if (cfg.clipboardSync) {
     if (trayState.viewers > 0) clipWatch.start();
@@ -917,7 +957,8 @@ function createUpdater() {
     app,
     log: (msg) => console.log('[升级] ' + msg),
     getFeed: () => (account && account.state ? { url: `${account.httpBase}/download/host`, token: account.state.token } : null),
-    isIdle: () => trayState.viewers === 0,
+    // 有人看画面、或者手机正在控制（列会话、打开会话……）时不重启换新版本
+    isIdle: () => trayState.viewers === 0 && !controlSession.isActive(),
   });
   updater.onChange((state) => {
     refreshTrayMenu();
@@ -1092,6 +1133,54 @@ function askUnlockService(line, timeoutMs) {
   return unlockPipe.request(line, timeoutMs);
 }
 
+/** 虚拟屏（docs/11 第 4.3 节）：手机在控制、电脑上又没有亮着的真显示器时，让解锁服务开；控制结束关 */
+const virtualDisplay = createVirtualDisplay({
+  ask: askUnlockService,
+  displays: () => win32.activeDisplays(),
+  log: (msg) => console.log('[虚拟屏] ' + msg),
+  // 虚拟屏出现在桌面上以后（服务答应后 2 秒多，由 display-added 带过来）：切到驱动支持的分辨率，再把 Claude 的窗口摆上去
+  onReady: () => {
+    fitVirtualMode({
+      displays: () => win32.activeDisplays(),
+      modes: (adapter) => win32.displayModes(adapter),
+      setMode: (adapter, mode) => win32.setDisplayMode(adapter, mode),
+      log: (msg) => console.log('[虚拟屏] ' + msg),
+    });
+    if (tiler) tiler.arrange('虚拟屏');
+  },
+});
+
+/** 隐私屏（docs/11 第 4.4 节）：解锁前、手机上打开时盖黑幕；控制结束先锁屏再撤。开关推给页面，页面推给控制端 */
+const privacyScreen = createPrivacy({
+  ask: askUnlockService,
+  log: (msg) => console.log('[隐私屏] ' + msg),
+  onChange: (on) => {
+    if (mainWindow) mainWindow.webContents.send('rc:privacy-state', on);
+  },
+});
+
+ipcMain.handle('rc:privacy-state', (e) => (isOwnSender(e) ? privacyScreen.isOn() : false));
+
+/**
+ * 记住解锁密码（docs/06"记住解锁密码"）：用 Windows 的数据保护（safeStorage，只有这台电脑上这个 Windows 用户解得开）加密，
+ * 密文经页面的信令连接存到服务器上，这里只在内存里留一份密文。有没有记下的随锁屏状态（saved）推给控制端
+ */
+const { createUnlockSecret, afterManualUnlock, unlockWithSaved } = require('./unlocksecret');
+const unlockSecret = createUnlockSecret({
+  available: () => safeStorage.isEncryptionAvailable(),
+  encrypt: (password) => safeStorage.encryptString(password).toString('base64'),
+  decrypt: (blob) => safeStorage.decryptString(Buffer.from(blob, 'base64')),
+  send: (msg) => {
+    if (!mainWindow) return false;
+    mainWindow.webContents.send('rc:secret-send', msg);
+    return true;
+  },
+  log: (msg) => console.log('[解锁] ' + msg),
+  onChange: () => {
+    if (mainWindow) mainWindow.webContents.send('rc:lock-state', lockStateForPage());
+  },
+});
+
 // 锁屏，以及"远程桌面断开了、没有画面"（对控制端也算锁屏，解锁时先把会话接回电脑的显示器，docs/06）
 const lockStateLib = require('./lockstate');
 const lock = lockStateLib.createLockState({
@@ -1099,18 +1188,23 @@ const lock = lockStateLib.createLockState({
   sessionInfo: () => require('./sessioninfo').current(),
   ask: askUnlockService,
   log: (msg) => console.log('[解锁] ' + msg),
-  // 页面再告诉所有控制端。detached 只给页面用（接回后重新采集），发给控制端的消息只取 locked、unlock、untrusted
+  // 页面再告诉所有控制端。detached 只给页面用（接回后重新采集），发给控制端的消息只取 locked、unlock、untrusted、saved
   onChange: (state) => {
-    if (mainWindow) mainWindow.webContents.send('rc:lock-state', state);
+    if (mainWindow) mainWindow.webContents.send('rc:lock-state', { ...state, saved: unlockSecret.has() });
   },
 });
+
+/** 给页面的锁屏状态：再带上有没有记下的解锁密码 */
+function lockStateForPage() {
+  return { ...lock.current(), saved: unlockSecret.has() };
+}
 
 /** 定时看电脑是否锁屏、远程桌面是否断开、解锁服务在不在，有变化就告诉页面 */
 function pollLock() {
   return lock.poll().catch((err) => console.error('查锁屏状态出错:', err));
 }
 
-ipcMain.handle('rc:lock-state', () => lock.current());
+ipcMain.handle('rc:lock-state', () => lockStateForPage());
 
 // 画面停了时问一下：窗口还在不在、是不是锁屏了（远程桌面断开也算）
 ipcMain.handle('rc:window-state', (e, hwnd) => {
@@ -1130,16 +1224,34 @@ ipcMain.handle('rc:lock-now', (e) => {
  * 把控制端输入的 Windows 密码交给解锁服务。返回错误码，成功返回 null。密码不写日志、不保存。
  * 远程桌面断开时发的是 ATTACH（先接回电脑的显示器），否则是 UNLOCK，见 lockstate.js
  */
-async function unlockWith(password) {
+async function unlockWith(password, privacy) {
+  // 隐私屏（docs/11 第 4.4 节）：先盖好黑幕再输密码，解锁那一刻不露桌面；手机没说就按配置。细节见 privacy.js 的 unlockWithPrivacy
   try {
-    return await lock.unlock(password);
+    return await unlockWithPrivacy({
+      privacy,
+      defaultOn: cfg.privacyOnUnlock,
+      detached: lock.current().detached,
+      unlock: () => lock.unlock(password),
+      shade: privacyScreen,
+      active: () => controlSession.isActive(),
+    });
   } finally {
     setTimeout(pollLock, 300);
   }
 }
 
-// 连着画面时：密码走数据通道（端到端加密）到页面，再交到这里
-ipcMain.handle('rc:unlock', (e, password) => (isOwnSender(e) ? unlockWith(password) : 'failed'));
+/** 手机的解锁请求里带的 privacy：只认 true、false，别的当没说（按配置） */
+function privacyFlag(v) {
+  return typeof v === 'boolean' ? v : undefined;
+}
+
+// 连着画面时：密码走数据通道（端到端加密）到页面，再交到这里。save：解开以后记不记住这个密码
+ipcMain.handle('rc:unlock', async (e, password, privacy, save) => {
+  if (!isOwnSender(e)) return 'failed';
+  const code = await unlockWith(password, privacyFlag(privacy));
+  afterManualUnlock(unlockSecret, code, password, save);
+  return code;
+});
 
 // 没连画面时（协议文档 2.9）：密码经服务器转发，用这把公钥加密过，页面和服务器都只见到密文，在这里解开
 const unlockKey = require('./unlockkey').createUnlockKey({ log: (msg) => console.log('[解锁] ' + msg) });
@@ -1149,10 +1261,39 @@ unlockKey.ready.then(() => {
 
 ipcMain.handle('rc:host-key', (e) => (isOwnSender(e) ? unlockKey.publicKey : null));
 
-ipcMain.handle('rc:unlock-enc', async (e, enc) => {
+ipcMain.handle('rc:unlock-enc', async (e, enc, privacy, save) => {
   if (!isOwnSender(e)) return 'failed';
   const r = unlockKey.open(enc);
-  return r.password ? unlockWith(r.password) : r.code;
+  if (!r.password) return r.code;
+  const code = await unlockWith(r.password, privacyFlag(privacy));
+  afterManualUnlock(unlockSecret, code, r.password, save);
+  return code;
+});
+
+// 用记下的密码解锁（手机点"解锁"时先试这个，不对再让用户输）。连着画面、没连画面都走这里
+ipcMain.handle('rc:unlock-saved', (e, privacy) =>
+  isOwnSender(e) ? unlockWithSaved(unlockSecret, (password) => unlockWith(password, privacyFlag(privacy))) : 'failed'
+);
+
+// 手机上"忘掉记下的解锁密码"
+ipcMain.handle('rc:forget-password', (e) => {
+  if (!isOwnSender(e)) return false;
+  unlockSecret.forget('手机上要求忘掉');
+  return true;
+});
+
+// 服务器对 unlock-secret 的回应，页面原样交过来；连上服务器时页面让这里去取
+ipcMain.on('rc:secret-reply', (e, msg) => {
+  if (isOwnSender(e)) unlockSecret.reply(msg);
+});
+ipcMain.on('rc:secret-fetch', (e) => {
+  if (isOwnSender(e)) unlockSecret.fetch();
+});
+
+// 手机上开、关隐私屏（host-cmd 的 privacy，协议文档 2.9）
+ipcMain.handle('rc:privacy', async (e, on) => {
+  if (!isOwnSender(e) || typeof on !== 'boolean') return false;
+  return on ? privacyScreen.on('手机上打开了隐私屏') : privacyScreen.off();
 });
 
 // 被控端窗口里安装、更新解锁服务（docs/06）。源码和安装脚本跟着安装包走，在 resources\unlock-service 里

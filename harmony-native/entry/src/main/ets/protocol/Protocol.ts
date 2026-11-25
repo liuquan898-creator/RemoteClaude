@@ -105,6 +105,8 @@ export interface LockState {
   unlockAvailable: boolean;
   /** 电脑上有解锁服务，但被控端核实不过它（多半是旧版服务，要在电脑上重新安装）；unlockAvailable 为 true 时总是 false */
   unlockUntrusted: boolean;
+  /** 电脑记着上次解锁的密码（被控端 0.9.32 起，协议 2.9"记住解锁密码"）；解锁服务不能用时总是 false */
+  saved: boolean;
 }
 
 export interface TileState {
@@ -112,11 +114,17 @@ export interface TileState {
   paused: boolean;
 }
 
-/** 电脑经信令通道推来的状态（协议 2.9）；key 是不连画面解锁时加密密码用的公钥（DER 的 Base64） */
+/**
+ * 电脑经信令通道推来的状态（协议 2.9）；key 是不连画面解锁时加密密码用的公钥（DER 的 Base64）。
+ * privacy 是隐私屏开着没有（被控端 0.9.32 起，docs/11 第 4.4 节；旧版没有这个字段，当作没开）。
+ * canRemember 是被控端认"记住解锁密码"（0.9.32 起的 host-state 总带布尔的 privacy，拿它认版本；旧版不认 save）
+ */
 export interface HostState {
   lock: LockState;
   tile: TileState;
   key: string | null;
+  privacy: boolean;
+  canRemember: boolean;
 }
 
 /** 被控端对一张图片的回执；code 为 null 表示已经粘贴进去 */
@@ -232,6 +240,7 @@ function lockStateOf(o: Json | null): LockState {
     locked: o !== null && bool(o, 'locked') === true,
     unlockAvailable: unlock,
     unlockUntrusted: !unlock && o !== null && bool(o, 'untrusted') === true,
+    saved: unlock && o !== null && bool(o, 'saved') === true,
   };
 }
 
@@ -430,6 +439,7 @@ export function parseIncoming(text: string): Incoming | null {
       const lock = obj(o, 'lock');
       const tile = obj(o, 'tile');
       const key = str(o, 'key');
+      const privacy = bool(o, 'privacy');
       return {
         type: 'host-state',
         host,
@@ -440,6 +450,8 @@ export function parseIncoming(text: string): Incoming | null {
             paused: tile !== null && bool(tile, 'paused') === true,
           },
           key: key ? key : null,
+          privacy: privacy === true,
+          canRemember: privacy !== null,
         },
       };
     }
@@ -620,11 +632,36 @@ export function hostUpdateMessage(host: string, op: string): string {
   return JSON.stringify({ type: 'host-update', host, op });
 }
 
-/** 不连画面的命令（协议 2.9）：arrange、raise、pause、resume、lock、unlock */
-export function hostCmdMessage(host: string, op: string, req: string | null = null, enc: string | null = null): string {
+/** host-cmd 的附加字段（协议 2.9，被控端 0.9.32 起；旧版被控端忽略）。没给的不带 */
+export interface HostCmdExtra {
+  /** 解锁：解锁前先在电脑的真显示器上盖隐私屏（docs/11 第 4.4 节） */
+  privacy?: boolean;
+  /** 解锁：解开以后记不记住这个密码；false 还会删掉原来记下的 */
+  save?: boolean;
+  /** 解锁：用电脑记下的密码，这时不带 enc */
+  saved?: boolean;
+  /** privacy 命令：开还是关隐私屏 */
+  on?: boolean;
+}
+
+/**
+ * 不连画面的命令（协议 2.9）：arrange、raise、pause、resume、lock、unlock，
+ * 被控端 0.9.32 起还有 privacy（开关隐私屏）、forget-password（忘掉记下的解锁密码）、release（结束控制，docs/11 第 4.2 节）
+ */
+export function hostCmdMessage(
+  host: string,
+  op: string,
+  req: string | null = null,
+  enc: string | null = null,
+  extra: HostCmdExtra = {},
+): string {
   const m: Json = { type: 'host-cmd', host, op };
   if (req !== null) m['req'] = req;
   if (enc !== null) m['enc'] = enc;
+  if (extra.privacy !== undefined) m['privacy'] = extra.privacy;
+  if (extra.save !== undefined) m['save'] = extra.save;
+  if (extra.saved !== undefined) m['saved'] = extra.saved;
+  if (extra.on !== undefined) m['on'] = extra.on;
   return JSON.stringify(m);
 }
 
@@ -721,7 +758,17 @@ export function lockNowEvent(): string {
   return JSON.stringify({ t: 'lock-now' });
 }
 
-/** 解锁：password 是用户这次输入的 Windows 密码或 PIN，不保存 */
-export function unlockEvent(id: string, password: string): string {
-  return JSON.stringify({ t: 'unlock', id, p: password });
+/**
+ * 解锁：password 是用户这次输入的 Windows 密码或 PIN，手机不保存。privacy：解锁前先在电脑的真显示器上盖隐私屏；
+ * save：解开以后让电脑加密记下这个密码，false 时删掉原来记下的（被控端 0.9.32 起认，旧版忽略）；为 null 时不带、不动
+ */
+export function unlockEvent(id: string, password: string, privacy: boolean, save: boolean | null): string {
+  const m: Json = { t: 'unlock', id, p: password, privacy };
+  if (save !== null) m['save'] = save;
+  return JSON.stringify(m);
+}
+
+/** 用电脑记下的密码解锁（协议 4.6，被控端 0.9.32 起），不带密码 */
+export function savedUnlockEvent(id: string, privacy: boolean): string {
+  return JSON.stringify({ t: 'unlock', id, saved: true, privacy });
 }

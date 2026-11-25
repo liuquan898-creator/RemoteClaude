@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS push_notified (
   PRIMARY KEY (user_id, host_id, approval_id)
 );
 CREATE INDEX IF NOT EXISTS push_notified_by_at ON push_notified(at);
+
+-- 从手机解锁电脑时记下的 Windows 密码（docs/06"记住解锁密码"）。电脑用只有它自己解得开的钥匙（Windows DPAPI）加密，
+-- 这里只有密文，服务器解不开；只有那台电脑自己的连接能读写。每台电脑一条，电脑退出登录、账号重置密码时删掉。
+CREATE TABLE IF NOT EXISTS unlock_secrets (
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  host_id    TEXT NOT NULL,
+  blob       TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, host_id)
+);
 `;
 
 class Store {
@@ -108,6 +118,12 @@ class Store {
       deletePushTokenOfUser: p('DELETE FROM push_tokens WHERE token = ? AND user_id = ?'),
       deletePushTokenIfOwner: p('DELETE FROM push_tokens WHERE token = ? AND user_id = ? AND updated_at <= ?'),
       pushTokensOfUser: p('SELECT token FROM push_tokens WHERE user_id = ? AND platform = ? ORDER BY updated_at DESC'),
+
+      getUnlockSecret: p('SELECT blob FROM unlock_secrets WHERE user_id = ? AND host_id = ?'),
+      putUnlockSecret: p(`INSERT INTO unlock_secrets (user_id, host_id, blob, updated_at) VALUES (?, ?, ?, ?)
+                          ON CONFLICT (user_id, host_id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at`),
+      deleteUnlockSecret: p('DELETE FROM unlock_secrets WHERE user_id = ? AND host_id = ?'),
+      deleteUnlockSecretsOfUser: p('DELETE FROM unlock_secrets WHERE user_id = ?'),
       markNotified: p('INSERT OR IGNORE INTO push_notified (user_id, host_id, approval_id, at) VALUES (?, ?, ?, ?)'),
       countNotified: p('SELECT COUNT(*) AS n FROM push_notified WHERE user_id = ?'),
       trimNotified: p(`DELETE FROM push_notified WHERE rowid IN
@@ -116,6 +132,9 @@ class Store {
       purgeNotified: p('DELETE FROM push_notified WHERE at <= ?'),
 
       purgeTokens: p('DELETE FROM tokens WHERE expires_at <= ?'),
+      // 电脑的登录令牌都没了（过期、被顶掉以后又没再登录）：它记下的解锁密码也删掉
+      purgeOrphanSecrets: p(`DELETE FROM unlock_secrets WHERE NOT EXISTS (SELECT 1 FROM tokens t
+                             WHERE t.user_id = unlock_secrets.user_id AND t.kind = 'host' AND t.device_id = unlock_secrets.host_id)`),
       purgeCodes: p('DELETE FROM email_codes WHERE expires_at <= ?'),
     };
   }
@@ -189,6 +208,24 @@ class Store {
     const ids = this.q.tokensOfUser.all(userId).map((r) => Number(r.id));
     this.q.deleteTokensOfUser.run(userId);
     return ids;
+  }
+
+  /** 这台电脑记下的解锁密码的密文，没有时为 null */
+  getUnlockSecret(userId, hostId) {
+    const row = this.q.getUnlockSecret.get(userId, hostId);
+    return row ? String(row.blob) : null;
+  }
+
+  putUnlockSecret(userId, hostId, blob, now) {
+    this.q.putUnlockSecret.run(userId, hostId, blob, now);
+  }
+
+  deleteUnlockSecret(userId, hostId) {
+    this.q.deleteUnlockSecret.run(userId, hostId);
+  }
+
+  deleteUnlockSecretsOfUser(userId) {
+    this.q.deleteUnlockSecretsOfUser.run(userId);
   }
 
   /** 账号下登录着的电脑（未过期的被控端令牌） */
@@ -266,6 +303,7 @@ class Store {
   purgeExpired(now) {
     this.q.purgeTokens.run(now);
     this.q.purgeCodes.run(now);
+    this.q.purgeOrphanSecrets.run();
   }
 
   close() {

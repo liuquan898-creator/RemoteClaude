@@ -434,7 +434,7 @@ export struct SessionsView {
         if (this.s.pcLocked) {
           LockBanner({
             s: this.s, onUnlock: () => {
-              this.dialogs.unlock = true;
+              controller.requestUnlock();
             }
           })
         }

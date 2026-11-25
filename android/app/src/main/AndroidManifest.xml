@@ -12,6 +12,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 审批通知推迟 60 秒（docs/09 第 6 节）：等的这一会儿不让手机睡，息屏后计时才不会停 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- 只接收画面，不需要录音、摄像头等权限（WebRTC 库本身也没有声明） -->
 
     <application

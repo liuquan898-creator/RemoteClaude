@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
@@ -116,6 +117,20 @@ enum class CatalogPhase { None, Loaded, Unavailable, NoReply }
 data class OpeningSession(val req: String, val label: String)
 
 /**
+ * 开着的解锁输入框。[host] 是点"解锁"那一刻选的电脑，[name] 是它的名字（不知道时为 null）：输入框只解这一台，
+ * 换了电脑就关掉，提交时选的已经不是它也不发。[note] 是框里额外的一句话，比如记下的密码不对了。
+ * [canRemember]：那台电脑的被控端认"记住解锁密码"（0.9.32 起），不认时不显示"记住密码"、不带 save。
+ * [seq] 每次打开都不同，框里输了一半的密码随之清空
+ */
+data class UnlockPrompt(
+    val host: String,
+    val name: String?,
+    val note: String? = null,
+    val canRemember: Boolean = false,
+    val seq: Int = 0,
+)
+
+/**
  * 正在发的图片或文件：[preparing] 表示还在手机上处理（压缩图片、读文件），[pasting] 表示已经传完、等电脑存好并粘贴。
  * [fileName] 不为 null 表示发的是文件（协议文档 4.8），可以取消
  */
@@ -192,10 +207,23 @@ data class AppState(
     val unlockAvailable: Boolean = false,
     /** 电脑上的解锁服务核实不过（多半是旧版，要在电脑上重新安装），和"没装"分开提示 */
     val unlockUntrusted: Boolean = false,
+    /** 电脑记着上次解锁的密码（被控端 0.9.32 起，协议文档 2.9"记住解锁密码"）：点解锁时不弹输入框 */
+    val unlockSaved: Boolean = false,
     val unlocking: Boolean = false,
+    /** 正在用电脑记下的密码解锁 */
+    val unlockingSaved: Boolean = false,
+    /** 开着的解锁输入框，没开时为 null */
+    val unlockPrompt: UnlockPrompt? = null,
     /** 电脑上的窗口平铺在运行（协议文档 4.7） */
     val tileAvailable: Boolean = false,
     val tilePaused: Boolean = false,
+    /** 电脑上的隐私屏开着（被控端 0.9.32 起，docs/11 第 4.4 节）：显示器盖着黑幕，电脑前的键鼠被挡住 */
+    val pcPrivacy: Boolean = false,
+    /**
+     * 电脑的被控端是 0.9.32 起的版本（host-state 带了布尔的 privacy）：认隐私屏的开关和"记住解锁密码"。
+     * 旧版对这两样回 bad-op 或者不理，菜单里不显示隐私屏、解锁框里不显示"记住密码"
+     */
+    val canRemember: Boolean = false,
     /** "全部会话"里折叠起来的环境（组的 key），记在本机 */
     val collapsedGroups: Set<String> = emptySet(),
     val settings: AppSettings = AppSettings(),
@@ -213,8 +241,11 @@ data class AppState(
         pcLocked = hs?.lock?.locked == true,
         unlockAvailable = hs?.lock?.unlockAvailable == true,
         unlockUntrusted = hs?.lock?.unlockUntrusted == true,
+        unlockSaved = hs?.lock?.saved == true,
         tileAvailable = hs?.tile?.available == true,
         tilePaused = hs?.tile?.paused == true,
+        pcPrivacy = hs?.privacy == true,
+        canRemember = hs?.canRemember == true,
     )
 }
 
@@ -272,6 +303,14 @@ class RemoteController(private val app: Application) {
     /** 各台电脑推来的审批列表 */
     private val approvalsByHost = LinkedHashMap<String, List<Approval>>()
     private var approvalSeq = 0
+    /** 推迟着的审批通知到点时再同步一次（docs/09 第 6 节"通知推迟 60 秒"） */
+    private var approvalAlertJob: Job? = null
+    /** 等推迟的审批通知时让手机别睡；带超时，不会一直拿着 */
+    private val alertWakeLock: PowerManager.WakeLock? by lazy {
+        app.getSystemService(PowerManager::class.java)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RemoteClaude:approvalAlert")
+            ?.apply { setReferenceCounted(false) }
+    }
     private val loadedSignal = CompletableDeferred<Unit>()
     private var openJob: Job? = null
     private var openSeq = 0
@@ -287,6 +326,8 @@ class RemoteController(private val app: Application) {
     private var frameProbe: VideoSink? = null
     /** 想看的窗口：断线重连、回到前台、电脑重新上线后自动选回它；为 0 表示停在会话列表 */
     private var wantHwnd = 0L
+    /** 在后台时该要的窗口列表先没要（docs/11 第 4.2 节），回到前台时补上 */
+    private var listDeferred = false
     private var reselectJob: Job? = null
     private var statsJob: Job? = null
     private val statsReader = StatsReader()
@@ -314,6 +355,7 @@ class RemoteController(private val app: Application) {
     /** 不连画面的解锁请求 req -> 等它的回执，格式同 [imageWaiters] */
     private val hostCmdWaiters = HashMap<String, CompletableDeferred<String>>()
     private var hostCmdSeq = 0
+    private var unlockPromptSeq = 0
 
     private val hostId: String? get() = _state.value.hostId
 
@@ -377,12 +419,20 @@ class RemoteController(private val app: Application) {
         update { it.copy(canLock = canLock, locked = it.locked || relock) }
         syncBackgroundService()
         connectIfLoggedIn()
-        // 开着后台接收审批时信令连接没断、只断了画面，connectIfLoggedIn 什么都不做：要一次窗口列表，自动选回刚才看的窗口
-        if (authed && peer == null && wantHwnd != 0L) requestList()
+        // 开着后台接收审批时信令连接没断、只断了画面，connectIfLoggedIn 什么都不做：要一次窗口列表，自动选回刚才看的窗口。
+        // 在后台时重连过、电脑上线过，当时没要的列表也在这里补上（没连上、电脑不在线的，等连上、上线时自己会要）
+        val deferred = listDeferred
+        listDeferred = false
+        if (authed && _state.value.hostOnline) {
+            if (deferred) refreshListWhenForeground() else if (peer == null && wantHwnd != 0L) requestList()
+        }
         publishApprovals()
     }
 
-    /** 切到后台就停止看画面；开着"后台接收审批"时保持和服务器的连接，否则也断开，回来再重连 */
+    /**
+     * 切到后台就停止看画面；开着"后台接收审批"时保持和服务器的连接，否则也断开，回来再重连。
+     * 不发"结束控制"（release）：开着隐私屏时切出去回个消息就会让电脑锁屏，电脑 3 分钟没人操作自己会结束（docs/11 第 4.2 节）
+     */
     fun onBackground() {
         foreground = false
         backgroundSince = SystemClock.elapsedRealtime()
@@ -566,11 +616,13 @@ class RemoteController(private val app: Application) {
     }
 
     fun logout() {
+        // 断开前先 stop 关画面，再告诉正在控制的电脑不控制了（换服务器也走这里）；连接是正常关闭，排在前面的消息会先发出去
         stopStreaming(sendStop = true)
+        releaseHost()
         disconnect()
         ApprovalService.stop(app)
         approvalsByHost.clear()
-        ApprovalNotifier.sync(app, emptyList(), foreground)
+        syncApprovalNotifications(emptyList())
         val token = session
         val base = httpBase
         session = null
@@ -618,7 +670,7 @@ class RemoteController(private val app: Application) {
         session = null
         ApprovalService.stop(app)
         approvalsByHost.clear()
-        ApprovalNotifier.sync(app, emptyList(), foreground)
+        syncApprovalNotifications(emptyList())
         scope.launch { store.saveSession(null) }
         update {
             AppState(
@@ -732,6 +784,7 @@ class RemoteController(private val app: Application) {
             is Incoming.HostStatePush -> {
                 hostStates[msg.host] = msg.state
                 if (msg.host == hostId) update { it.withHostState(msg.state) }
+                closeUnlockPromptIfUnlocked(msg.host, msg.state.lock.locked)
             }
             is Incoming.HostCmdResult -> if (msg.host == hostId) {
                 hostCmdWaiters[msg.req]?.complete(if (msg.ok) HostCommands.OK else msg.code)
@@ -753,8 +806,8 @@ class RemoteController(private val app: Application) {
         if (msg.email.isNotEmpty() && msg.email != _state.value.email) scope.launch { store.saveEmail(msg.email) }
         update { it.copy(link = Link.Online, hosts = msg.hosts, email = msg.email.ifEmpty { it.email }) }
         chooseHost()
-        requestList()
-        if (_state.value.listTab == ListTab.All) refreshCatalog()
+        closeUnlockPromptIfOffline()
+        refreshListWhenForeground()
         val now = SystemClock.elapsedRealtime()
         if (lastUpdateCheck == 0L || now - lastUpdateCheck > UPDATE_CHECK_EVERY_MS) checkAppUpdate(manual = false)
     }
@@ -784,14 +837,41 @@ class RemoteController(private val app: Application) {
         hostStates.keys.retainAll(onlineIds)
         if (hostId != null && hosts.none { it.id == hostId }) setHost(null)
         chooseHost()
+        closeUnlockPromptIfOffline()
         val online = _state.value.hostOnline
         if (wasOnline && !online) stopStreaming(sendStop = false)
         // 电脑下线了：它的锁屏、平铺状态不知道了，等它上线后重新推
         if (!online) update { it.withHostState(null) }
-        if (online && (!wasOnline || _state.value.windows.isEmpty())) {
-            requestList()
-            if (_state.value.listTab == ListTab.All) refreshCatalog()
+        if (online && (!wasOnline || _state.value.windows.isEmpty())) refreshListWhenForeground()
+    }
+
+    /**
+     * 要一次窗口列表（"全部会话"页签开着时连同会话列表）。在后台（开着后台接收审批）时先不要：被控端会当成手机在控制
+     * 这台电脑，防息屏、开虚拟屏（docs/11 第 4.2 节）；记下来，回到前台时补上（[onForeground]）
+     */
+    private fun refreshListWhenForeground() {
+        if (!foreground) {
+            listDeferred = true
+            return
         }
+        requestList()
+        if (_state.value.listTab == ListTab.All) refreshCatalog()
+    }
+
+    /** 解锁框是为下线了的电脑开的：关掉（密码没发出去） */
+    private fun closeUnlockPromptIfOffline() {
+        val prompt = _state.value.unlockPrompt ?: return
+        if (_state.value.hosts.any { it.id == prompt.host && it.online }) return
+        update { it.copy(unlockPrompt = null) }
+        toast(HostCommands.promptOfflineText(prompt.name))
+    }
+
+    /** [host] 推来了新的锁屏状态：解锁框是为它开的、它却已经解开了（比如电脑前有人输了密码），关掉 */
+    private fun closeUnlockPromptIfUnlocked(host: String?, locked: Boolean) {
+        val prompt = _state.value.unlockPrompt ?: return
+        if (locked || host == null || prompt.host != host) return
+        update { it.copy(unlockPrompt = null) }
+        toast(HostCommands.promptUnlockedText(prompt.name))
     }
 
     /** 选电脑：记住的那台还在就用它；否则只有一台（在线）时自动选上 */
@@ -814,9 +894,25 @@ class RemoteController(private val app: Application) {
         requestList()
     }
 
+    /**
+     * 告诉当前这台电脑不控制了：换到别的电脑、退出登录时发，被控端马上关虚拟屏，隐私屏先锁屏再撤（docs/11 第 4.2 节）。
+     * 只发给在线、推过状态（认 host-cmd）的电脑；App 退到后台时不发，见 [onBackground]
+     */
+    private fun releaseHost() {
+        val host = hostId ?: return
+        if (authed && host in hostStates && _state.value.hostOnline) signaling.send(Protocol.hostCmd(host, "release"))
+    }
+
     private fun setHost(id: String?) {
         if (id == hostId) return
+        // 换到别的电脑：先 stop 关画面，再告诉原来那台不控制了（和网页、鸿蒙端一样的顺序）。原来那台下线、被删掉了就不发
         stopStreaming(sendStop = true)
+        releaseHost()
+        // 解锁框是为原来那台开的：关掉，连同输了一半的密码（提交时还会再核对一次）
+        if (_state.value.unlockPrompt.let { it != null && it.host != id }) {
+            update { it.copy(unlockPrompt = null) }
+            toast(HostCommands.PROMPT_CLOSED_TEXT)
+        }
         wantHwnd = 0L
         scope.launch { store.saveLastView(id.orEmpty(), 0L) }
         if (_state.value.opening != null) cancelOpening()
@@ -1064,7 +1160,28 @@ class RemoteController(private val app: Application) {
                 showApprovals = it.showApprovals && list.isNotEmpty(),
             )
         }
-        ApprovalNotifier.sync(app, list, foreground)
+        syncApprovalNotifications(list)
+    }
+
+    /**
+     * 按审批列表增删系统通知。通知推迟 60 秒（docs/09 第 6 节）：还有没到点的，到点时再来一次；
+     * 等的这一会儿让手机别睡（最多一分钟多），息屏后 CPU 睡着了计时会停，通知就晚了
+     */
+    private fun syncApprovalNotifications(list: List<PendingApproval>) {
+        approvalAlertJob?.cancel()
+        approvalAlertJob = null
+        val wait = ApprovalNotifier.sync(app, list, foreground, SystemClock.elapsedRealtime())
+        val lock = alertWakeLock
+        if (wait == null) {
+            if (lock?.isHeld == true) runCatching { lock.release() }
+            return
+        }
+        runCatching { lock?.acquire(wait + ALERT_WAKE_SLACK_MS) }.onFailure { Log.w(TAG, "拿不到唤醒锁", it) }
+        approvalAlertJob = scope.launch {
+            delay(wait)
+            approvalAlertJob = null
+            syncApprovalNotifications(_state.value.approvals)
+        }
     }
 
     fun openApprovals() = update { it.copy(showApprovals = it.approvals.isNotEmpty()) }
@@ -1287,7 +1404,15 @@ class RemoteController(private val app: Application) {
 
         override fun onLockState(session: PeerSession, state: LockState) {
             if (session === peer) {
-                update { it.copy(pcLocked = state.locked, unlockAvailable = state.unlockAvailable, unlockUntrusted = state.unlockUntrusted) }
+                update {
+                    it.copy(
+                        pcLocked = state.locked,
+                        unlockAvailable = state.unlockAvailable,
+                        unlockUntrusted = state.unlockUntrusted,
+                        unlockSaved = state.saved,
+                    )
+                }
+                closeUnlockPromptIfUnlocked(peerHost, state.locked)
             }
         }
 
@@ -1687,8 +1812,8 @@ class RemoteController(private val app: Application) {
         return false
     }
 
-    /** 能经信令通道收命令的那台电脑；不行时提示原因，返回 null */
-    private fun hostCommandTarget(): String? {
+    /** 能经信令通道收命令的那台电脑；不行时提示原因（或者交给 [onFail]），返回 null */
+    private fun hostCommandTarget(onFail: (String) -> Unit = ::toast): String? {
         val host = hostId
         val reason = when {
             host == null || !authed || !_state.value.hostOnline -> "这台电脑不在线"
@@ -1697,7 +1822,7 @@ class RemoteController(private val app: Application) {
             _state.value.screen == Screen.Remote -> NOT_READY
             else -> HostCommands.UNSUPPORTED_TOAST
         }
-        toast(reason)
+        onFail(reason)
         return null
     }
 
@@ -1710,64 +1835,195 @@ class RemoteController(private val app: Application) {
         }
     }
 
-    /** 锁定电脑。只在用户明确点了才发；断开连接不会锁定 */
-    fun lockPc() {
+    /** 锁定 [host]（确认框打开时选的电脑）。只在用户明确点了才发；断开连接不会锁定。选的电脑换了就不发 */
+    fun lockPc(host: String) {
+        if (host != hostId) {
+            toast(HostCommands.HOST_CHANGED_TEXT)
+            return
+        }
         sendHostCommand("lock", InputEvents.lockNow())
     }
 
-    /** 把用户这次输入的 Windows 密码或 PIN 发给电脑解锁。密码不保存 */
-    fun unlockPc(password: String) {
-        if (password.isEmpty() || _state.value.unlocking) return
-        val s = peer?.takeIf { it.inputOpen }
-        // 连着画面：密码走数据通道，端到端加密。没连画面：用电脑给的公钥加密后经服务器转发（协议文档 2.9）
-        val waiter = if (s != null) unlockViaPeer(s, password) else unlockViaServer(password)
-        if (waiter == null) return
-        update { it.copy(unlocking = true) }
+    /**
+     * 开、关隐私屏（docs/11 第 4.4 节，被控端 0.9.32 起）：开是电脑的显示器盖上黑幕、挡住电脑前的键盘鼠标，
+     * 关只撤黑幕。经信令通道发，等回执；开着没有以电脑推来的 host-state 为准
+     */
+    fun setPrivacy(on: Boolean) {
+        val host = hostCommandTarget() ?: return
+        val req = "p${++hostCmdSeq}"
+        val waiter = CompletableDeferred<String>().also { hostCmdWaiters[req] = it }
+        if (!signaling.send(Protocol.hostCmd(host, "privacy", req, on = on))) {
+            hostCmdWaiters.remove(req)
+            toast("这台电脑不在线")
+            return
+        }
         scope.launch {
-            try {
-                val code = withTimeoutOrNull(UNLOCK_REPLY_TIMEOUT_MS) { waiter.await() }
-                toast(HostCommands.unlockText(code) ?: errorText(code.orEmpty()))
-            } finally {
-                unlockWaiters.values.remove(waiter)
-                hostCmdWaiters.values.remove(waiter)
-                update { it.copy(unlocking = false) }
+            val code = withTimeoutOrNull(PRIVACY_REPLY_TIMEOUT_MS) { waiter.await() }
+            hostCmdWaiters.remove(req)
+            toast(
+                when (code) {
+                    HostCommands.OK -> if (on) "已打开隐私屏：电脑的显示器盖上了黑幕" else "已关闭隐私屏"
+                    null -> "电脑没有回应"
+                    "bad-op" -> "电脑上的被控端太旧，不支持隐私屏，请升级"
+                    else -> if (on) "隐私屏没打开，电脑上的解锁服务可能要重新安装" else "隐私屏没关掉"
+                },
+            )
+        }
+    }
+
+    /**
+     * 用户点了"解锁"（锁屏提示条、菜单）。电脑记着密码（lock.saved）就直接让它用记下的解锁，不弹输入框；
+     * 否则弹输入框。输入框绑定点的这一刻选的电脑，免得解错了（协议文档 2.9"记住解锁密码"）
+     */
+    fun requestUnlock() {
+        val s = _state.value
+        val host = s.hostId ?: return
+        if (s.unlocking) return
+        if (s.unlockSaved) unlockWithSaved(host) else showUnlockPrompt(host, note = null)
+    }
+
+    fun dismissUnlockPrompt() = update { it.copy(unlockPrompt = null) }
+
+    private fun showUnlockPrompt(host: String, note: String?) {
+        val canRemember = hostStates[host]?.canRemember == true
+        update { it.copy(unlockPrompt = UnlockPrompt(host, hostName(host), note, canRemember, ++unlockPromptSeq)) }
+    }
+
+    private fun hostName(host: String): String? = _state.value.hosts.firstOrNull { it.id == host }?.name
+
+    /**
+     * 把用户在输入框里输的 Windows 密码或 PIN 发给 [host] 解锁，手机不保存。[host] 是打开输入框时选的电脑，
+     * 现在选的已经不是它就什么都不发（换电脑时输入框已经关掉，这里再核对一次）。[save]：解开以后让电脑记住这个密码
+     * （加密后存在服务器上，只有这台电脑解得开），false 时连原来记下的一起删掉，null 时不带（被控端太旧、不认）
+     */
+    fun unlockPc(host: String, password: String, save: Boolean?) {
+        if (password.isEmpty() || _state.value.unlocking) return
+        update { it.copy(unlockPrompt = null) }
+        if (host != hostId) {
+            toast(HostCommands.HOST_CHANGED_TEXT)
+            return
+        }
+        val privacy = _state.value.settings.privacyOnUnlock
+        val s = peer?.takeIf { it.inputOpen && peerHost == host }
+        // 没发出去（公钥还没到、密码太长、电脑不在线…）：把框重新打开，写上原因。输了的密码不留，要重新输
+        val reopen: (String) -> Unit = { reason -> showUnlockPrompt(host, reason) }
+        // 连着画面：密码走数据通道，端到端加密。没连画面：用电脑给的公钥加密后经服务器转发（协议文档 2.9）
+        val waiter = if (s != null) {
+            unlockViaPeer(s, reopen) { id -> InputEvents.unlock(id, password, privacy, save) }
+        } else {
+            unlockViaServer(password, save, reopen)
+        } ?: return
+        awaitUnlock(waiter, viaSaved = false) { code -> toast(unlockResultText(code)) }
+    }
+
+    /**
+     * 让电脑用记下的密码解锁，不带密码。只试一次（Windows 和解锁服务都限制输错的次数）：
+     * 记下的不对了或者没有了就弹输入框让用户手动输，别的错误照常提示、记下的留着
+     */
+    private fun unlockWithSaved(host: String) {
+        val privacy = _state.value.settings.privacyOnUnlock
+        val s = peer?.takeIf { it.inputOpen && peerHost == host }
+        // 优先走信令通道；电脑没推过状态（连不了信令命令）而画面连着时走数据通道，同样不带密码
+        val waiter = if (host !in hostStates && s != null) {
+            unlockViaPeer(s, ::toast) { id -> InputEvents.unlockSaved(id, privacy) }
+        } else {
+            unlockViaServer(password = null, save = null, onFail = ::toast)
+        } ?: return
+        toast("正在用记下的密码解锁${HostCommands.pcLabel(hostName(host))}…")
+        awaitUnlock(waiter, viaSaved = true) { code ->
+            when {
+                // 选的电脑换了就不弹，免得把输入框套到别的电脑上
+                HostCommands.needsPassword(code) && hostId == host -> showUnlockPrompt(host, HostCommands.unlockText(code))
+                else -> toast(unlockResultText(code))
             }
         }
     }
 
-    private fun unlockViaPeer(s: PeerSession, password: String): CompletableDeferred<String>? {
+    private fun unlockResultText(code: String?): String = HostCommands.unlockText(code) ?: errorText(code.orEmpty())
+
+    /** 等解锁的回执，最多 [UNLOCK_REPLY_TIMEOUT_MS]；[onResult] 收到错误码，成功时是 [HostCommands.OK]，没等到是 null */
+    private fun awaitUnlock(waiter: CompletableDeferred<String>, viaSaved: Boolean, onResult: (String?) -> Unit) {
+        update { it.copy(unlocking = true, unlockingSaved = viaSaved) }
+        scope.launch {
+            try {
+                onResult(withTimeoutOrNull(UNLOCK_REPLY_TIMEOUT_MS) { waiter.await() })
+            } finally {
+                unlockWaiters.values.remove(waiter)
+                hostCmdWaiters.values.remove(waiter)
+                update { it.copy(unlocking = false, unlockingSaved = false) }
+            }
+        }
+    }
+
+    /** [message] 按请求 id 生成数据通道上的解锁消息；没发出去时把原因交给 [onFail]、返回 null */
+    private fun unlockViaPeer(s: PeerSession, onFail: (String) -> Unit, message: (String) -> String): CompletableDeferred<String>? {
         val id = "u" + java.lang.Long.toString(System.nanoTime() and 0xffffffffffL, 36)
-        if (!s.sendInput(InputEvents.unlock(id, password))) {
-            toast(NOT_READY)
+        if (!s.sendInput(message(id))) {
+            onFail(NOT_READY)
             return null
         }
         return CompletableDeferred<String>().also { unlockWaiters[id] = it }
     }
 
-    private fun unlockViaServer(password: String): CompletableDeferred<String>? {
-        val host = hostCommandTarget() ?: return null
-        val key = hostStates[host]?.key
-        if (key == null) {
-            toast("电脑上的被控端刚启动，还没准备好，过几秒再试")
-            return null
-        }
-        val enc = when (val r = UnlockCipher.encrypt(key, password)) {
-            is UnlockCipher.Result.Ok -> r.enc
-            UnlockCipher.Result.TooLong -> {
-                toast("密码太长，在这里发不了。请打开一个会话窗口，在画面页解锁")
-                return null
-            }
-            UnlockCipher.Result.Failed -> {
-                toast("没能加密密码。请打开一个会话窗口，在画面页解锁")
-                return null
-            }
-        }
+    /**
+     * 经信令通道解锁当前这台电脑；[password] 为 null 时用电脑记下的密码（不带密文）。
+     * 没发出去时把原因交给 [onFail]、返回 null
+     */
+    private fun unlockViaServer(password: String?, save: Boolean?, onFail: (String) -> Unit): CompletableDeferred<String>? {
+        val host = hostCommandTarget(onFail) ?: return null
+        val enc = password?.let { p -> encryptPassword(host, p, onFail) ?: return null }
         val req = "u${++hostCmdSeq}"
-        if (!signaling.send(Protocol.hostCmd(host, "unlock", req, enc))) {
-            toast("这台电脑不在线")
+        val cmd = Protocol.hostCmd(
+            host,
+            "unlock",
+            req,
+            enc,
+            privacy = _state.value.settings.privacyOnUnlock,
+            save = save,
+            saved = password == null,
+        )
+        if (!signaling.send(cmd)) {
+            onFail("这台电脑不在线")
             return null
         }
         return CompletableDeferred<String>().also { hostCmdWaiters[req] = it }
+    }
+
+    /** 用电脑给的公钥加密密码；不行时把原因交给 [onFail]，返回 null */
+    private fun encryptPassword(host: String, password: String, onFail: (String) -> Unit): String? {
+        val key = hostStates[host]?.key
+        if (key == null) {
+            onFail("电脑上的被控端刚启动，还没准备好，过几秒再试")
+            return null
+        }
+        return when (val r = UnlockCipher.encrypt(key, password)) {
+            is UnlockCipher.Result.Ok -> r.enc
+            UnlockCipher.Result.TooLong -> {
+                onFail("密码太长，在这里发不了。请打开一个会话窗口，在画面页解锁")
+                null
+            }
+            UnlockCipher.Result.Failed -> {
+                onFail("没能加密密码。请打开一个会话窗口，在画面页解锁")
+                null
+            }
+        }
+    }
+
+    /** 删掉电脑记下的解锁密码（被控端 0.9.32 起），经信令通道发、等回执 */
+    fun forgetUnlockPassword() {
+        val host = hostCommandTarget() ?: return
+        val req = "f${++hostCmdSeq}"
+        val waiter = CompletableDeferred<String>().also { hostCmdWaiters[req] = it }
+        if (!signaling.send(Protocol.hostCmd(host, "forget-password", req))) {
+            hostCmdWaiters.remove(req)
+            toast("这台电脑不在线")
+            return
+        }
+        scope.launch {
+            val code = withTimeoutOrNull(FORGET_REPLY_TIMEOUT_MS) { waiter.await() }
+            hostCmdWaiters.remove(req)
+            toast(HostCommands.forgetText(code))
+        }
     }
 
     // ------------------------------------------------------------------ "全部会话"里折叠环境
@@ -1867,6 +2123,11 @@ class RemoteController(private val app: Application) {
         const val IMAGE_REPLY_TIMEOUT_MS = 20_000L
         const val IMAGE_OK = "ok"
         const val UNLOCK_REPLY_TIMEOUT_MS = 30_000L
+        /** 隐私屏：被控端先锁屏再撤最多十几秒 */
+        const val PRIVACY_REPLY_TIMEOUT_MS = 20_000L
+        const val FORGET_REPLY_TIMEOUT_MS = 15_000L
+        /** 等推迟的审批通知时，唤醒锁比到点多拿这么久，免得到点前就放掉 */
+        const val ALERT_WAKE_SLACK_MS = 5_000L
         /** 电脑上打开会话最慢要等 Claude 启动、再点几级菜单 */
         const val OPEN_TIMEOUT_MS = 60_000L
         /** 自动检查 App 更新的间隔 */

@@ -93,7 +93,8 @@ async function pushServer(t, { clock, timers, extra = {}, dataDir, autoClose = t
   const { file } = keyFile(t);
   const logs = [];
   const s = await startServer(
-    { ...(dataDir ? { dataDir } : {}), push: { huawei: { projectId: PROJECT, serviceAccountFile: file, apiBase: fake.base, ...extra } } },
+    // 原有的用例都按"一出现就推"写的；推迟提醒的用例自己给 alertDelaySec
+    { ...(dataDir ? { dataDir } : {}), push: { huawei: { projectId: PROJECT, serviceAccountFile: file, apiBase: fake.base, alertDelaySec: 0, ...extra } } },
     { log: (...a) => logs.push(a.join(' ')), ...(clock ? { now: () => clock.t } : {}), ...(timers ? { timers } : {}) }
   );
   if (autoClose) t.after(() => s.close());
@@ -160,7 +161,8 @@ const huaweiDown = () => ({ ok: false, status: 500, code: '81000001', msg: 'Inte
  * 直接测 PushService：内存数据库（一个账号、一个推送令牌）、假的华为客户端（回复按次改，返回 Error 就当网络出错）、
  * 手动定时器、可拨的时钟
  */
-function pushUnit(t, { options = {} } = {}) {
+function pushUnit(t, { options: extra = {} } = {}) {
+  const options = { alertDelaySec: 0, ...extra };
   const clock = { t: Date.UTC(2026, 10, 24, 8, 0, 0) };
   const store = new Store(':memory:');
   const userId = store.createUser('a@example.com', 'x', clock.t);
@@ -580,6 +582,65 @@ test('网络不通、超时：信令照常，服务器定时重推', async (t) =
   assert.equal((await v.next('approvals')).list[0].id, 'n1');
   host.close();
   v.close();
+});
+
+test('推迟提醒：审批出现满 60 秒还没处理才推；这期间在电脑上处理掉了就不推（docs/09 第 10 节）', async (t) => {
+  const u = pushUnit(t, { options: { alertDelaySec: 60 } });
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1')]);
+  assert.deepEqual(u.sentIds(), [], '刚出现不推');
+  assert.deepEqual(marked(u.store, u.userId, 'pc'), [], '也不记：到点前服务器重启了，电脑重连发来的列表照样会推它');
+  assert.deepEqual(u.timers.pending.map((x) => x.ms), [60 * 1000]);
+  assert.ok(u.timers.pending[0].unrefed, '定时器不拦着进程退出');
+
+  // 30 秒后又来一条 d2：定时器按最早到点的 d1 定，还剩 30 秒
+  u.clock.t += 30 * 1000;
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1'), permission('d2')]);
+  assert.deepEqual(u.timers.pending.map((x) => x.ms), [30 * 1000]);
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1'), permission('d2')]);
+  assert.equal(u.timers.pending.length, 1, '同一份列表的副本不动定时器');
+
+  // 到点：d1 推了，d2 还差 30 秒
+  u.clock.t += 30 * 1000;
+  await u.timers.fire();
+  assert.deepEqual(u.sentIds(), ['d1']);
+  assert.deepEqual(marked(u.store, u.userId, 'pc'), ['d1']);
+  assert.deepEqual(u.timers.pending.map((x) => x.ms), [30 * 1000]);
+
+  // d2 在电脑上处理掉了（新列表里没有它）：不用再等，也不推
+  u.clock.t += 10 * 1000;
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1')]);
+  assert.equal(u.timers.pending.length, 0);
+  u.clock.t += 60 * 1000;
+  await u.push.onApprovals(u.userId, 'pc', [permission('d1')]);
+  assert.deepEqual(u.sentIds(), ['d1'], 'd1 推过了不再推，d2 没推');
+});
+
+test('推迟提醒：等着的时候电脑下线了就不推，重连后重新等满；close() 取消', async (t) => {
+  const u = pushUnit(t, { options: { alertDelaySec: 60 } });
+  await u.push.onApprovals(u.userId, 'pc', [permission('g1')]);
+  u.clock.t += 50 * 1000;
+  u.push.hostGone(u.userId, 'pc');
+  assert.equal(u.timers.pending.length, 0, '下线时取消');
+  await u.push.onApprovals(u.userId, 'pc', [permission('g1')]);
+  assert.deepEqual(u.sentIds(), []);
+  assert.deepEqual(u.timers.pending.map((x) => x.ms), [60 * 1000], '重连后从头算');
+  u.clock.t += 60 * 1000;
+  await u.timers.fire();
+  assert.deepEqual(u.sentIds(), ['g1']);
+
+  await u.push.onApprovals(u.userId, 'pc', [permission('g1'), permission('g2')]);
+  assert.equal(u.timers.pending.length, 1);
+  u.push.close();
+  assert.equal(u.timers.pending.length, 0, 'close() 取消等着的');
+});
+
+test('推迟提醒：配置 alertDelaySec，不填是 60 秒，0 是一出现就推', () => {
+  const hw = (extra) => normalizeConfig({ push: { huawei: { serviceAccountFile: 'k.json', ...extra } } }, __dirname).push.huawei;
+  assert.equal(hw({}).alertDelaySec, 60);
+  assert.equal(hw({ alertDelaySec: 0 }).alertDelaySec, 0);
+  assert.throws(() => hw({ alertDelaySec: -1 }), /alertDelaySec/);
+  assert.throws(() => hw({ alertDelaySec: 1.5 }), /alertDelaySec/);
+  assert.throws(() => hw({ alertDelaySec: 601 }), /alertDelaySec/);
 });
 
 test('重推按 30 秒、2 分钟、10 分钟最多 3 次；等着重推时新列表只推新的；都没成就等电脑下次发列表', async (t) => {

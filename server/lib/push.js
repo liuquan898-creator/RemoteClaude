@@ -33,6 +33,11 @@ const MAX_LISTS_PER_MIN = 60;
 const RETRY_DELAYS_MS = [30 * 1000, 2 * 60 * 1000, 10 * 60 * 1000];
 /** 电脑最近一份列表留多久不动就忘掉：重推时要看审批还在不在列表里，重推最多拖十几分钟 */
 const LIST_KEEP_MS = 3600 * 1000;
+/**
+ * 审批出现多久还没处理才推送（docs/09 第 10 节）：电脑前的人多半马上就在电脑上处理了，不用再响手机。
+ * 配置 push.huawei.alertDelaySec 可以改，0 是一出现就推
+ */
+const DEFAULT_ALERT_DELAY_SEC = 60;
 /** "可能是配置不对"的警告（80300007）多久最多记一条 */
 const CONFIG_WARN_EVERY_MS = 3600 * 1000;
 const TITLE_MAX = 40;
@@ -148,7 +153,7 @@ class PushService {
    * @param {object} opts
    * @param {import('./store').Store} opts.store
    * @param {ReturnType<import('./huawei-push').createHuaweiPushClient>|null} opts.huawei 没配置时为 null
-   * @param {{ category?: string, testMessage?: boolean, ttl?: number, maxPerHour?: number, showDetail?: boolean }} [opts.options]
+   * @param {{ category?: string, testMessage?: boolean, ttl?: number, maxPerHour?: number, showDetail?: boolean, alertDelaySec?: number }} [opts.options]
    * @param {(...a:any[]) => void} [opts.log]
    * @param {() => number} [opts.now]
    * @param {{ setTimeout: Function, clearTimeout: Function }} [opts.timers] 重推用的定时器，测试里换成手动触发的
@@ -163,6 +168,8 @@ class PushService {
     this.now = now;
     this.timers = timers;
     this.showDetail = options.showDetail === true;
+    const delaySec = Number(options.alertDelaySec ?? DEFAULT_ALERT_DELAY_SEC);
+    this.delayMs = Number.isFinite(delaySec) && delaySec > 0 ? delaySec * 1000 : 0;
     this.perHour = new WindowCounter(Number(options.maxPerHour) || 60, 3600 * 1000, now);
     this.registerRate = new WindowCounter(30, 60 * 1000, now); // 每个账号每分钟登记次数
     this.listRate = new WindowCounter(MAX_LISTS_PER_MIN, 60 * 1000, now); // 每个账号每分钟处理的列表份数
@@ -172,12 +179,15 @@ class PushService {
     /** 正在发的推送，测试和关闭时用 */
     this.inflight = new Set();
     /**
-     * 每台电脑最近一份列表：hostKey -> { ids, done, cappedUntil, at }。ids 是里面的审批编号（重推前看审批还在不在）；
+     * 每台电脑最近一份列表：hostKey -> { ids, items, firstSeen, done, cappedUntil, at }。ids 是里面的审批编号（重推前看审批还在不在）；
+     * items 是校验过的审批，firstSeen 是每条第一次出现在这台电脑的列表里的时间（满 delayMs 才推）；
      * done 表示这份已经处理完，同样的副本可以直接跳过；cappedUntil 不为 0 时，这份里有因为每小时上限没推的，
      * 到这个时间（上限的窗口过了）以后同样的副本要再处理一遍。
-     * @type {Map<string, { ids: Set<string>, done: boolean, cappedUntil: number, at: number }>}
+     * @type {Map<string, { ids: Set<string>, items: object[], firstSeen: Map<string, number>, done: boolean, cappedUntil: number, at: number }>}
      */
     this.lists = new Map();
+    /** 等着审批满 delayMs 再处理的定时器：hostKey -> timer，每台电脑最多一个（定到最早到点的那条） */
+    this.holds = new Map();
     /**
      * 等着重推的审批：retryKey -> { timer, userId, hostId, item }，item 是 slimItem 的结果。
      * @type {Map<string, { timer: any, userId: number, hostId: string, item: ReturnType<typeof slimItem> }>}
@@ -246,6 +256,7 @@ class PushService {
 
   /**
    * 被控端推来一份等待中的审批列表。找出没推送过的，每条推一次。不抛异常。
+   * 出现还不满 delayMs 的先不推，到点看它还在不在（见 process）。
    * 电脑对每个控制端（含虚拟的 push）各发一份同样的列表：和这台电脑上一份处理完的列表一样时直接跳过，
    * 不碰数据库，也不算进每分钟的份数。账号到了每小时推送上限时，列表只记下编号、不碰数据库，等窗口过了再处理。
    * @returns {Promise<void>} 这一批推送都结束时 resolve（测试用；hub 不等）
@@ -258,7 +269,9 @@ class PushService {
     const now = this.now();
     if (last && last.done && !(last.cappedUntil && last.cappedUntil <= now) && sameIds(last.ids, items)) return Promise.resolve();
     // 超限、出错没处理的也记下最新的编号：重推前看审批还在不在，要用最新的列表
-    const entry = { ids: new Set(items.map((x) => x.id)), done: false, cappedUntil: 0, at: now };
+    const firstSeen = new Map();
+    for (const x of items) firstSeen.set(x.id, (last && last.firstSeen.get(x.id)) ?? now);
+    const entry = { ids: new Set(items.map((x) => x.id)), items, firstSeen, done: false, cappedUntil: 0, at: now };
     this.lists.set(key, entry);
     const uk = String(userId);
     if (this.listRate.hit(uk)) {
@@ -268,16 +281,56 @@ class PushService {
       }
       return Promise.resolve();
     }
-    if (this.perHour.blockedFor(uk)) {
+    return this.process(userId, hostId, entry);
+  }
+
+  /**
+   * 处理一台电脑最近的一份列表：出现满 delayMs 的推（推过的 markFresh 会筛掉），不满的定个时，
+   * 到点拿那时最新的列表再处理一遍：还在就推；已经不在了（电脑上处理掉了），就不推。
+   */
+  process(userId, hostId, entry) {
+    this.clearHold(userId, hostId);
+    if (this.perHour.blockedFor(String(userId))) {
       // 这一小时推满了：新审批反正推不了，不记也不撤，窗口过了以后的副本会再处理
       entry.cappedUntil = this.noteCapped(userId);
       entry.done = true;
       return Promise.resolve();
     }
-    const fresh = this.markFresh(userId, hostId, items);
+    const now = this.now();
+    const due = [];
+    let nextAt = Infinity;
+    for (const item of entry.items) {
+      const at = entry.firstSeen.get(item.id) + this.delayMs;
+      if (at <= now) due.push(item);
+      else nextAt = Math.min(nextAt, at);
+    }
+    if (nextAt !== Infinity) this.hold(userId, hostId, nextAt - now);
+    const fresh = this.markFresh(userId, hostId, due);
     if (!fresh) return Promise.resolve();
     entry.done = true;
     return this.pushAll(userId, hostId, fresh);
+  }
+
+  /** ms 以后再处理这台电脑那时最新的列表 */
+  hold(userId, hostId, ms) {
+    const key = hostKey(userId, hostId);
+    const timer = this.timers.setTimeout(() => {
+      this.holds.delete(key);
+      const entry = this.lists.get(key);
+      if (!entry || this.closed) return Promise.resolve();
+      // 定时器里抛出来的没人接，进程会退出：这里兜住
+      return this.process(userId, hostId, entry).catch((err) => this.log(`[push] 到点处理审批列表出错: ${err && err.message}`));
+    }, ms);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+    this.holds.set(key, timer);
+  }
+
+  clearHold(userId, hostId) {
+    const key = hostKey(userId, hostId);
+    const timer = this.holds.get(key);
+    if (timer === undefined) return;
+    this.timers.clearTimeout(timer);
+    this.holds.delete(key);
   }
 
   /** 把没推过的审批记下来，返回要推的；数据库出错时返回 null */
@@ -477,6 +530,7 @@ class PushService {
    */
   hostGone(userId, hostId) {
     this.lists.delete(hostKey(userId, hostId));
+    this.clearHold(userId, hostId);
     for (const [key, r] of this.retries) {
       if (r.userId !== userId || r.hostId !== hostId) continue;
       this.timers.clearTimeout(r.timer);
@@ -505,6 +559,8 @@ class PushService {
     this.closed = true;
     for (const r of this.retries.values()) this.timers.clearTimeout(r.timer);
     this.retries.clear();
+    for (const timer of this.holds.values()) this.timers.clearTimeout(timer);
+    this.holds.clear();
   }
 }
 
@@ -517,4 +573,5 @@ module.exports = {
   MAX_NOTIFIED_PER_USER,
   MAX_LISTS_PER_MIN,
   RETRY_DELAYS_MS,
+  DEFAULT_ALERT_DELAY_SEC,
 };

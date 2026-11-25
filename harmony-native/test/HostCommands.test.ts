@@ -64,9 +64,42 @@ test('解锁提示文字', () => {
   assert.equal(HostCommands.unlockText('closed'), '连接断开了，不知道电脑解锁了没有');
   assert.equal(HostCommands.unlockText('bad-key'), '电脑上的被控端刚重启过，请再试一次');
   assert.equal(HostCommands.unlockText('replayed'), '电脑上的被控端刚重启过，请再试一次');
+  // 要先盖隐私屏却没盖上，被控端没解锁：说清楚为什么、怎么办（和安卓端一样）
+  assert.equal(
+    HostCommands.unlockText('privacy-failed'),
+    '隐私屏没盖上，没有解锁。电脑上的解锁服务可能要重新安装；也可以在设置里关掉“解锁时打开隐私屏”',
+  );
+  assert.equal(HostCommands.unlockText('saved-wrong'), '记下的密码不对了（可能改过密码），已经删掉，请重新输入');
+  assert.ok((HostCommands.unlockText('no-saved') ?? '').includes('请输入'));
+  // 其余的错误码（still-locked、rate-limited…）用和画面页一样的提示
   assert.equal(HostCommands.unlockText('still-locked'), null);
+  assert.equal(HostCommands.unlockText('rate-limited'), null);
   assert.ok(HostCommands.UNSUPPORTED_TEXT.includes(HostCommands.MIN_HOST_VERSION));
   assert.ok(HostCommands.UNSUPPORTED_TOAST.includes(HostCommands.MIN_HOST_VERSION));
+});
+
+test('用记下的密码解锁：不对了或没有时才弹输入框，只试一次', () => {
+  assert.equal(HostCommands.needsPassword('saved-wrong'), true);
+  assert.equal(HostCommands.needsPassword('no-saved'), true);
+  for (const code of [HostCommands.OK, 'still-locked', 'rate-limited', 'privacy-failed', 'busy', 'closed', null]) {
+    assert.equal(HostCommands.needsPassword(code), false, String(code));
+  }
+});
+
+test('隐私屏开关的提示', () => {
+  assert.equal(HostCommands.privacyText(true, HostCommands.OK), '已打开隐私屏：电脑的显示器盖上了黑幕');
+  assert.equal(HostCommands.privacyText(false, HostCommands.OK), '已关闭隐私屏');
+  assert.equal(HostCommands.privacyText(true, null), '电脑没有回应');
+  assert.equal(HostCommands.privacyText(true, 'bad-op'), '电脑上的被控端太旧，不支持隐私屏，请升级');
+  assert.equal(HostCommands.privacyText(true, 'failed'), '隐私屏没打开，电脑上的解锁服务可能要重新安装');
+  assert.equal(HostCommands.privacyText(false, 'failed'), '隐私屏没关掉');
+});
+
+test('忘掉记下的解锁密码的提示', () => {
+  assert.equal(HostCommands.forgetText(HostCommands.OK), '电脑已经忘掉记下的解锁密码');
+  assert.equal(HostCommands.forgetText(null), '电脑没有回应');
+  assert.equal(HostCommands.forgetText('bad-op'), '电脑上的被控端太旧，请升级');
+  assert.equal(HostCommands.forgetText('closed'), '没能忘掉记下的密码（closed）');
 });
 
 test('关掉了或本来就没有窗口时拿掉卡片', () => {

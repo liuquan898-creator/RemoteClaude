@@ -128,6 +128,8 @@ const RELEASED_SOURCES = {
   1: 'd299c0bfffc0fe90dc8fd03753a09f6cdd9ef16139224f9bad3f1d69c02a0488',
   // 2：合进远程桌面接回（ATTACH 命令、接回前核对密码）
   2: '4d74d4f13f0a277f75240acc5cbf4abd12f1b5e67ad78e7269b085ee0be86b7d',
+  // 3：虚拟屏（DISPLAY ON/OFF、PING、--install-display）、隐私屏（SHADE ON/OFF/END、--shade），docs/11
+  3: 'dc941151d6c6b4092386ede1a50f4d12c8547a2c0e3bc18e27898ece3e70f05f',
 };
 
 test('改了 UnlockService.cs 就要加版本号，并在 RELEASED_SOURCES 里登记', () => {

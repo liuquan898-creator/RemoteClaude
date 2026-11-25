@@ -77,7 +77,7 @@ function createApp(cfg, opts = {}) {
     onRevoke: (ids, userId) => hub && hub.revoke(ids, userId),
   });
   const push = new PushService({ store, huawei, options: hw || {}, log, now, ...(opts.timers ? { timers: opts.timers } : {}) });
-  hub = new Hub({ auth, iceServers, limits: cfg.limits, log, push });
+  hub = new Hub({ auth, iceServers, limits: cfg.limits, log, push, store, now });
   push.onTokensChanged = (userId) => hub.syncPushViewer(userId);
 
   const releases = createReleases({ dir: cfg.releasesDir, auth, log });

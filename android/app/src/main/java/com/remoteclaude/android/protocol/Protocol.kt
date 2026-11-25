@@ -246,6 +246,9 @@ object Protocol {
                         lock = lockStateOf(lock),
                         tile = TileState(available = tile?.bool("available") == true, paused = tile?.bool("paused") == true),
                         key = obj.string("key")?.ifEmpty { null },
+                        privacy = obj.bool("privacy") == true,
+                        // 0.9.32 起的 host-state 总带布尔的 privacy，拿它认出被控端认"记住解锁密码"
+                        canRemember = obj.bool("privacy") != null,
                     ),
                 )
             }
@@ -317,6 +320,8 @@ object Protocol {
             locked = o?.bool("locked") == true,
             unlockAvailable = unlock,
             unlockUntrusted = !unlock && o?.bool("untrusted") == true,
+            // 记下的密码要靠解锁服务才用得上：服务不能用时不算（被控端也不带）
+            saved = unlock && o?.bool("saved") == true,
         )
     }
 
@@ -444,15 +449,30 @@ object Protocol {
     }.toString()
 
     /**
-     * 不连画面的命令（协议文档 2.9，被控端 0.9.6 起）。[op]：arrange、raise、pause、resume（窗口平铺）、lock、unlock。
-     * 解锁时 [enc] 是用电脑给的公钥加密过的密码（[UnlockCipher]），[req] 用来认回执；别的命令不用回执
+     * 不连画面的命令（协议文档 2.9，被控端 0.9.6 起）。[op]：arrange、raise、pause、resume（窗口平铺）、lock、unlock，
+     * 被控端 0.9.32 起还有 privacy（开关隐私屏，[on]）、release（结束控制，docs/11 第 4.2 节）、forget-password（删掉记下的解锁密码）。
+     * 解锁时 [enc] 是用电脑给的公钥加密过的密码（[UnlockCipher]），[privacy] 是解锁前要不要先盖隐私屏，
+     * [save] 是解开以后记不记住这个密码；[saved] 为 true 时不带 [enc]，用电脑记下的密码解锁（2.9"记住解锁密码"）。[req] 用来认回执
      */
-    fun hostCmd(host: String, op: String, req: String? = null, enc: String? = null): String = buildJsonObject {
+    fun hostCmd(
+        host: String,
+        op: String,
+        req: String? = null,
+        enc: String? = null,
+        privacy: Boolean? = null,
+        on: Boolean? = null,
+        save: Boolean? = null,
+        saved: Boolean = false,
+    ): String = buildJsonObject {
         put("type", "host-cmd")
         put("host", host)
         put("op", op)
         if (req != null) put("req", req)
         if (enc != null) put("enc", enc)
+        if (privacy != null) put("privacy", privacy)
+        if (on != null) put("on", on)
+        if (save != null) put("save", save)
+        if (saved) put("saved", true)
     }.toString()
 
     /** 解析 GET /api/update/android 的回复；格式不对返回 null */
@@ -608,9 +628,15 @@ data class FileReply(val id: String, val path: String?, val name: String?, val p
 
 /**
  * 电脑是否锁屏，[unlockAvailable] 表示电脑上装了解锁服务。
- * [unlockUntrusted]：电脑上有解锁服务，但被控端核实不过它（多半是旧版，要在电脑上重新安装），这时 [unlockAvailable] 是 false
+ * [unlockUntrusted]：电脑上有解锁服务，但被控端核实不过它（多半是旧版，要在电脑上重新安装），这时 [unlockAvailable] 是 false。
+ * [saved]：电脑记着上次解锁的密码（被控端 0.9.32 起），点解锁时不用再输（协议文档 2.9"记住解锁密码"）
  */
-data class LockState(val locked: Boolean, val unlockAvailable: Boolean, val unlockUntrusted: Boolean = false)
+data class LockState(
+    val locked: Boolean,
+    val unlockAvailable: Boolean,
+    val unlockUntrusted: Boolean = false,
+    val saved: Boolean = false,
+)
 
 data class UnlockResult(val id: String, val code: String?)
 
@@ -625,9 +651,16 @@ data class ClipChunk(val id: String, val index: Int, val count: Int, val text: S
 
 /**
  * 电脑经信令通道推来的状态（协议文档 2.9，被控端 0.9.6 起）。[key] 是不连画面解锁时加密密码用的公钥
- * （DER 的 Base64），被控端刚启动、还没生成好时为 null
+ * （DER 的 Base64），被控端刚启动、还没生成好时为 null。[privacy] 是隐私屏开着没有（被控端 0.9.32 起，旧版没有，当作没开）。
+ * [canRemember]：被控端认"记住解锁密码"（解锁时的 save，0.9.32 起）；这一版起 host-state 总带 privacy，带了就算
  */
-data class HostState(val lock: LockState, val tile: TileState, val key: String?)
+data class HostState(
+    val lock: LockState,
+    val tile: TileState,
+    val key: String?,
+    val privacy: Boolean = false,
+    val canRemember: Boolean = false,
+)
 
 object InputEvents {
     const val BUTTON_LEFT = 0
@@ -719,10 +752,24 @@ object InputEvents {
     /** 锁定电脑，相当于在电脑上按 Win+L（协议文档 4.6） */
     fun lockNow(): String = buildJsonObject { put("t", "lock-now") }.toString()
 
-    /** 解锁：[password] 是用户这次输入的 Windows 密码或 PIN，不保存 */
-    fun unlock(id: String, password: String): String = buildJsonObject {
+    /**
+     * 解锁：[password] 是用户这次输入的 Windows 密码或 PIN，手机不保存。[privacy]：解锁前先在电脑的真显示器上盖隐私屏；
+     * [save]：解开以后让电脑记住这个密码（加密后存在服务器上），false 时连原来记下的一起删掉，null 时不带（被控端太旧、不认）。
+     * 两个都是被控端 0.9.32 起认，旧版忽略
+     */
+    fun unlock(id: String, password: String, privacy: Boolean, save: Boolean?): String = buildJsonObject {
         put("t", "unlock")
         put("id", id)
         put("p", password)
+        put("privacy", privacy)
+        if (save != null) put("save", save)
+    }.toString()
+
+    /** 用电脑记下的密码解锁，不带密码（协议文档 4.6、2.9"记住解锁密码"，被控端 0.9.32 起） */
+    fun unlockSaved(id: String, privacy: Boolean): String = buildJsonObject {
+        put("t", "unlock")
+        put("id", id)
+        put("saved", true)
+        put("privacy", privacy)
     }.toString()
 }

@@ -5,12 +5,12 @@ import { userAuth } from '@kit.UserAuthenticationKit';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import BuildProfile from 'BuildProfile';
 import {
-  Approval, FileReply, HostInfo, HostState, IceCandidateSpec, IceServerSpec, ImageReply, Incoming, LockState,
-  RemoteWindow, SessionEntry, SessionGroup, THUMBS_DONE, THUMBS_PENDING, TileState, UnlockResult,
+  Approval, FileReply, HostCmdExtra, HostInfo, HostState, IceCandidateSpec, IceServerSpec, ImageReply, Incoming,
+  LockState, RemoteWindow, SessionEntry, SessionGroup, THUMBS_DONE, THUMBS_PENDING, TileState, UnlockResult,
   answerMessage, approvalAnswerMessage, authMessage, closeWindowMessage, fileBeginEvent, fileCancelEvent, fileEndEvent,
   hostCmdMessage, hostUpdateMessage, iceMessage, imageBeginEvent, imageEndEvent, listMessage, listSessionsMessage,
-  lockNowEvent, newSessionMessage, openSessionMessage, pushRegisterMessage, pushUnregisterMessage, selectMessage,
-  stopMessage, tileEvent, unlockEvent, BUTTON_LEFT, BUTTON_RIGHT
+  lockNowEvent, newSessionMessage, openSessionMessage, pushRegisterMessage, pushUnregisterMessage, savedUnlockEvent,
+  selectMessage, stopMessage, tileEvent, unlockEvent, BUTTON_LEFT, BUTTON_RIGHT
 } from './protocol/Protocol';
 import { parseServerAddress, restoreServerAddress, ServerAddressResult } from './protocol/ServerAddress';
 import { UnlockCipher } from './protocol/UnlockCipher';
@@ -50,6 +50,11 @@ const MAX_BUFFERED = 256 * 1024;
 const IMAGE_REPLY_TIMEOUT_MS = 20000;
 const IMAGE_OK = 'ok';
 const UNLOCK_REPLY_TIMEOUT_MS = 30000;
+/** 隐私屏：被控端先锁屏再撤最多十几秒 */
+const PRIVACY_REPLY_TIMEOUT_MS = 20000;
+const FORGET_REPLY_TIMEOUT_MS = 10000;
+/** 锁定确认、解锁框打开以后换了电脑：是给原来那台的，不发 */
+const HOST_CHANGED = '已经换到别的电脑了，没有发出去';
 /** 电脑上打开会话最慢要等 Claude 启动、再点几级菜单 */
 const OPEN_TIMEOUT_MS = 60000;
 /** 画面连接 disconnected 持续这么久就重新要画面（协议第 3 节） */
@@ -127,6 +132,8 @@ export class RemoteController {
   private hostStates: Map<string, HostState> = new Map<string, HostState>();
   private hostCmdWaiters: Map<string, Waiter<string>> = new Map<string, Waiter<string>>();
   private hostCmdSeq: number = 0;
+  /** 在后台连上了服务器，窗口列表没要，回到前台再要（docs/11 第 4.2 节） */
+  private listDeferred: boolean = false;
   /** 推送令牌：已经登记到服务器的那个 */
   private pushToken: string = '';
   /** 点推送通知打开 App 时要直接弹审批面板 */
@@ -192,7 +199,9 @@ export class RemoteController {
     s.canLock = canLock;
     s.locked = s.locked || relock;
     this.connectIfLoggedIn();
-    if (this.authed && this.peer === null && this.wantHwnd !== 0) {
+    if (this.authed && this.listDeferred) {
+      this.refreshHostLists();
+    } else if (this.authed && this.peer === null && this.wantHwnd !== 0) {
       this.requestList();
     }
   }
@@ -204,6 +213,8 @@ export class RemoteController {
   onBackground(): void {
     this.foreground = false;
     this.backgroundSince = Date.now();
+    // 输了一半的解锁密码不留到后台（回来时可能要先过 App 锁）
+    this.state.unlockPrompt = null;
     if (this.authenticating) {
       return;
     }
@@ -428,6 +439,8 @@ export class RemoteController {
 
   logout(): void {
     this.stopStreaming(true);
+    // 不再控制这台电脑了（更换服务器也走这里）：先 stop 关画面，再让它马上关虚拟屏、隐私屏先锁屏再撤（docs/11 第 4.2 节）
+    this.releaseHost();
     // 先在还连着的信令上注销推送，免得退出后还收到这个账号的通知。没连着时靠下面删掉本机令牌
     // （服务器那边，这个登录作废时推送令牌也一起删，协议 2.10）
     if (this.pushToken.length > 0 && this.authed) {
@@ -512,6 +525,7 @@ export class RemoteController {
     s.showApprovals = false;
     s.answering = [];
     s.locked = false;
+    s.unlockPrompt = null;
     s.applyHostState(null);
   }
 
@@ -723,11 +737,24 @@ export class RemoteController {
     this.state.link = Link.Online;
     this.state.hosts = hosts;
     this.chooseHost();
+    this.refreshHostLists();
+    this.registerPush();
+  }
+
+  /**
+   * 要窗口列表，"全部会话"页签开着时连会话列表一起要。在后台（选图、发文件时还连着）不要：被控端会当成手机在控制
+   * 这台电脑，防息屏、开虚拟屏（docs/11 第 4.2 节），回到前台再要
+   */
+  private refreshHostLists(): void {
+    if (!this.foreground) {
+      this.listDeferred = true;
+      return;
+    }
+    this.listDeferred = false;
     this.requestList();
     if (this.state.listTab === ListTab.All) {
       this.refreshCatalog();
     }
-    this.registerPush();
   }
 
   /** 每次连上都登记一次推送令牌（令牌可能变，服务器按令牌去重） */
@@ -803,10 +830,7 @@ export class RemoteController {
       this.state.applyHostState(null);
     }
     if (nowOnline && (!wasOnline || this.state.windows.length === 0)) {
-      this.requestList();
-      if (this.state.listTab === ListTab.All) {
-        this.refreshCatalog();
-      }
+      this.refreshHostLists();
     }
   }
 
@@ -839,11 +863,28 @@ export class RemoteController {
     }
   }
 
+  /** 告诉当前这台电脑手机不控制它了（host-cmd 的 release，被控端 0.9.32 起；旧版回 bad-op，不影响什么） */
+  private releaseHost(): void {
+    const host = this.state.hostId;
+    if (this.authed && host.length > 0 && this.state.hostOnline()) {
+      this.signaling.send(hostCmdMessage(host, 'release'));
+    }
+  }
+
   private setHost(id: string): void {
     if (id === this.state.hostId) {
       return;
     }
     this.stopStreaming(true);
+    // 换到别的电脑：先 stop 关画面，再告诉原来那台不控制了（马上关虚拟屏，隐私屏先锁屏再撤，docs/11 第 4.2 节）。
+    // 原来那台下线、被删掉了就不发
+    this.releaseHost();
+    // 解锁框是为原来那台开的：关掉，连同输了一半的密码（提交时还会再核对一次）
+    const prompt = this.state.unlockPrompt;
+    if (prompt !== null && prompt.hostId !== id) {
+      this.state.unlockPrompt = null;
+      this.toast('选的电脑换了，解锁框已经关掉，密码没有发出去');
+    }
     this.wantHwnd = 0;
     SettingsStore.saveLastView(id, 0);
     if (this.state.opening !== null) {
@@ -1281,6 +1322,7 @@ export class RemoteController {
             this.state.pcLocked = st.locked;
             this.state.unlockAvailable = st.unlockAvailable;
             this.state.unlockUntrusted = st.unlockUntrusted;
+            this.state.unlockSaved = st.saved;
           }
         },
         onUnlockResult: (r: UnlockResult) => {
@@ -1874,27 +1916,101 @@ export class RemoteController {
     }
   }
 
-  /** 锁定电脑。只在用户明确点了才发；断开连接不会锁定 */
-  lockPc(): void {
+  /** 锁定电脑。只在用户明确点了才发；断开连接不会锁定。hostId 是确认框打开时的那台电脑，换了就不发 */
+  lockPc(hostId: string): void {
+    if (hostId !== this.state.hostId) {
+      this.toast(HOST_CHANGED);
+      return;
+    }
     this.sendHostCommand('lock', lockNowEvent());
   }
 
-  /** 把用户这次输入的 Windows 密码或 PIN 发给电脑解锁。密码不保存 */
-  async unlockPc(password: string): Promise<void> {
+  /**
+   * 用户点了"解锁"：电脑记着密码就不弹输入框，直接让电脑用记下的解锁（协议 2.9"记住解锁密码"）；否则弹输入框
+   */
+  requestUnlock(): void {
+    if (this.state.unlocking) {
+      return;
+    }
+    if (this.state.unlockSaved) {
+      this.unlockWithSaved();
+    } else {
+      this.openUnlockPrompt('');
+    }
+  }
+
+  /** 弹输密码的对话框，绑定当前这台电脑；note 是额外的说明，没有时为空串 */
+  private openUnlockPrompt(note: string): void {
+    this.state.unlockPrompt = this.state.unlockPromptFor(note);
+  }
+
+  dismissUnlockPrompt(): void {
+    this.state.unlockPrompt = null;
+  }
+
+  /**
+   * 把用户这次输入的 Windows 密码或 PIN 发给电脑解锁，手机不保存。hostId 是对话框打开时的那台电脑，换了就不发。
+   * save：解开以后让电脑加密记下（解锁框里勾着"记住密码"），false 时电脑删掉原来记下的；
+   * 为 null 时不带（被控端太旧、不认"记住密码"，框里没显示那个勾）
+   */
+  async unlockPc(hostId: string, password: string, save: boolean | null): Promise<void> {
     if (password.length === 0 || this.state.unlocking) {
       return;
     }
+    if (hostId !== this.state.hostId) {
+      this.toast(HOST_CHANGED);
+      return;
+    }
+    const privacy = this.state.settings.privacyOnUnlock;
     const s = this.peer !== null && this.peer.inputOpen ? this.peer : null;
     // 连着画面：密码走数据通道，端到端加密。没连画面：用电脑给的公钥加密后经服务器转发（协议 2.9）
-    const waiter = s !== null ? this.unlockViaPeer(s, password) : this.unlockViaServer(password);
+    const waiter = s !== null ?
+      this.unlockViaPeer(s, (id: string): string => unlockEvent(id, password, privacy, save)) :
+      this.unlockViaServer(password, privacy, save);
     if (waiter === null) {
       return;
     }
+    const code = await this.awaitUnlock(waiter);
+    this.toast(HostCommands.unlockText(code) ?? this.errorText(code ?? ''));
+  }
+
+  /**
+   * 用电脑记下的密码解锁，不带密码，只试一次（Windows 和解锁服务都限制输错的次数）。优先走信令通道；
+   * 记下的不对了（saved-wrong）或电脑上其实没有（no-saved）时弹输入框，让用户手动输
+   */
+  private async unlockWithSaved(): Promise<void> {
+    const hostId = this.state.hostId;
+    const label = this.state.pcLabel();
+    const privacy = this.state.settings.privacyOnUnlock;
+    const p = this.peer !== null && this.peer.inputOpen ? this.peer : null;
+    let waiter: Waiter<string> | null = null;
+    if (this.authed && this.state.hostOnline() && this.hostStates.has(hostId)) {
+      const extra: HostCmdExtra = { privacy: privacy, saved: true };
+      waiter = this.sendHostCmd(hostId, 'unlock', 'u', null, extra);
+    } else if (p !== null) {
+      waiter = this.unlockViaPeer(p, (id: string): string => savedUnlockEvent(id, privacy));
+    } else {
+      this.hostCommandTarget(); // 只为提示发不了的原因
+      return;
+    }
+    if (waiter === null) {
+      return;
+    }
+    this.toast(`正在用记下的密码解锁${label}…`);
+    const code = await this.awaitUnlock(waiter);
+    const text = HostCommands.unlockText(code) ?? this.errorText(code ?? '');
+    if (HostCommands.needsPassword(code) && hostId === this.state.hostId) {
+      this.openUnlockPrompt(text);
+      return;
+    }
+    this.toast(text);
+  }
+
+  /** 等解锁回执，最多 30 秒，没等到返回 null。等的期间界面上显示"正在解锁" */
+  private async awaitUnlock(waiter: Waiter<string>): Promise<string | null> {
     this.state.unlocking = true;
     try {
-      const code = await withTimeout(waiter.promise, UNLOCK_REPLY_TIMEOUT_MS);
-      const text = HostCommands.unlockText(code);
-      this.toast(text ?? this.errorText(code ?? ''));
+      return await withTimeout(waiter.promise, UNLOCK_REPLY_TIMEOUT_MS);
     } finally {
       this.deleteWaiter(this.unlockWaiters, waiter);
       this.deleteWaiter(this.hostCmdWaiters, waiter);
@@ -1910,9 +2026,10 @@ export class RemoteController {
     });
   }
 
-  private unlockViaPeer(s: PeerSession, password: string): Waiter<string> | null {
+  /** 经数据通道发解锁消息（协议 4.6）；build 用编号拼出消息 */
+  private unlockViaPeer(s: PeerSession, build: (id: string) => string): Waiter<string> | null {
     const id = shortId('u');
-    if (!s.sendInput(unlockEvent(id, password))) {
+    if (!s.sendInput(build(id))) {
       this.toast(NOT_READY);
       return null;
     }
@@ -1921,7 +2038,7 @@ export class RemoteController {
     return w;
   }
 
-  private unlockViaServer(password: string): Waiter<string> | null {
+  private unlockViaServer(password: string, privacy: boolean, save: boolean | null): Waiter<string> | null {
     const host = this.hostCommandTarget();
     if (host.length === 0) {
       return null;
@@ -1937,15 +2054,66 @@ export class RemoteController {
         '没能加密密码。请打开一个会话窗口，在画面页解锁');
       return null;
     }
+    const extra: HostCmdExtra = save !== null ? { privacy: privacy, save: save } : { privacy: privacy };
+    return this.sendHostCmd(host, 'unlock', 'u', r.enc, extra);
+  }
+
+  /**
+   * 经信令通道发一条要回执的命令（协议 2.9），返回等回执的 Waiter；发不出去时提示、返回 null。
+   * prefix 是 req 编号的前缀，enc 只有输了密码的解锁才有
+   */
+  private sendHostCmd(host: string, op: string, prefix: string, enc: string | null, extra: HostCmdExtra): Waiter<string> | null {
     this.hostCmdSeq++;
-    const req = `u${this.hostCmdSeq}`;
-    if (!this.signaling.send(hostCmdMessage(host, 'unlock', req, r.enc))) {
+    const req = `${prefix}${this.hostCmdSeq}`;
+    if (!this.signaling.send(hostCmdMessage(host, op, req, enc, extra))) {
       this.toast('这台电脑不在线');
       return null;
     }
     const w = new Waiter<string>();
     this.hostCmdWaiters.set(req, w);
     return w;
+  }
+
+  /** 等 sendHostCmd 的回执，最多 ms 毫秒；ok 时是 HostCommands.OK，没等到返回 null */
+  private async awaitHostCmd(w: Waiter<string>, ms: number): Promise<string | null> {
+    try {
+      return await withTimeout(w.promise, ms);
+    } finally {
+      this.deleteWaiter(this.hostCmdWaiters, w);
+    }
+  }
+
+  /**
+   * 开、关隐私屏（docs/11 第 4.4 节，被控端 0.9.32 起）：开是电脑的显示器盖上黑幕、挡住电脑前的键盘鼠标，
+   * 关只撤黑幕。经信令通道发，等回执；开着没有以电脑推来的 host-state 为准
+   */
+  async setPrivacy(on: boolean): Promise<void> {
+    const host = this.hostCommandTarget();
+    if (host.length === 0) {
+      return;
+    }
+    const extra: HostCmdExtra = { on: on };
+    const w = this.sendHostCmd(host, 'privacy', 'p', null, extra);
+    if (w === null) {
+      return;
+    }
+    const code = await this.awaitHostCmd(w, PRIVACY_REPLY_TIMEOUT_MS);
+    this.toast(HostCommands.privacyText(on, code));
+  }
+
+  /** 让电脑删掉记下的解锁密码（协议 2.9，被控端 0.9.32 起）；删掉以后电脑推来的状态里不再带 saved */
+  async forgetUnlockPassword(): Promise<void> {
+    const host = this.hostCommandTarget();
+    if (host.length === 0) {
+      return;
+    }
+    const extra: HostCmdExtra = {};
+    const w = this.sendHostCmd(host, 'forget-password', 'f', null, extra);
+    if (w === null) {
+      return;
+    }
+    const code = await this.awaitHostCmd(w, FORGET_REPLY_TIMEOUT_MS);
+    this.toast(HostCommands.forgetText(code));
   }
 
   // ------------------------------------------------------------------ "全部会话"里折叠环境

@@ -62,6 +62,52 @@ const GetClassNameW = user32.func('int __stdcall GetClassNameW(uintptr_t hWnd, _
 const GetWindowThreadProcessId = user32.func('uint32_t __stdcall GetWindowThreadProcessId(uintptr_t hWnd, _Out_ uint32_t *pid)');
 const GetWindowRect = user32.func('bool __stdcall GetWindowRect(uintptr_t hWnd, _Out_ RECT *rect)');
 const GetWindowPlacement = user32.func('bool __stdcall GetWindowPlacement(uintptr_t hWnd, _Inout_ WINDOWPLACEMENT *wp)');
+const DISPLAY_DEVICEW = koffi.struct('DISPLAY_DEVICEW', {
+  cb: 'uint32_t',
+  DeviceName: koffi.array('char16_t', 32, 'String'),
+  DeviceString: koffi.array('char16_t', 128, 'String'),
+  StateFlags: 'uint32_t',
+  DeviceID: koffi.array('char16_t', 128, 'String'),
+  DeviceKey: koffi.array('char16_t', 128, 'String'),
+});
+const EnumDisplayDevicesW = user32.func('bool __stdcall EnumDisplayDevicesW(str16 device, uint32_t index, _Inout_ DISPLAY_DEVICEW *dd, uint32_t flags)');
+// 显示器用的 DEVMODEW（打印机那一半的字段这里用不上，按显示器的布局写）
+const DEVMODEW = koffi.struct('DEVMODEW', {
+  dmDeviceName: koffi.array('char16_t', 32, 'String'),
+  dmSpecVersion: 'uint16_t',
+  dmDriverVersion: 'uint16_t',
+  dmSize: 'uint16_t',
+  dmDriverExtra: 'uint16_t',
+  dmFields: 'uint32_t',
+  dmPositionX: 'int32_t',
+  dmPositionY: 'int32_t',
+  dmDisplayOrientation: 'uint32_t',
+  dmDisplayFixedOutput: 'uint32_t',
+  dmColor: 'int16_t',
+  dmDuplex: 'int16_t',
+  dmYResolution: 'int16_t',
+  dmTTOption: 'int16_t',
+  dmCollate: 'int16_t',
+  dmFormName: koffi.array('char16_t', 32, 'String'),
+  dmLogPixels: 'uint16_t',
+  dmBitsPerPel: 'uint32_t',
+  dmPelsWidth: 'uint32_t',
+  dmPelsHeight: 'uint32_t',
+  dmDisplayFlags: 'uint32_t',
+  dmDisplayFrequency: 'uint32_t',
+  dmICMMethod: 'uint32_t',
+  dmICMIntent: 'uint32_t',
+  dmMediaType: 'uint32_t',
+  dmDitherType: 'uint32_t',
+  dmReserved1: 'uint32_t',
+  dmReserved2: 'uint32_t',
+  dmPanningWidth: 'uint32_t',
+  dmPanningHeight: 'uint32_t',
+});
+const EnumDisplaySettingsW = user32.func('bool __stdcall EnumDisplaySettingsW(str16 device, int mode, _Inout_ DEVMODEW *dm)');
+const ChangeDisplaySettingsExW = user32.func(
+  'int __stdcall ChangeDisplaySettingsExW(str16 device, DEVMODEW *dm, uintptr_t hwnd, uint32_t flags, uintptr_t param)'
+);
 const GetForegroundWindow = user32.func('uintptr_t __stdcall GetForegroundWindow()');
 const SetForegroundWindow = user32.func('bool __stdcall SetForegroundWindow(uintptr_t hWnd)');
 const BringWindowToTop = user32.func('bool __stdcall BringWindowToTop(uintptr_t hWnd)');
@@ -146,6 +192,9 @@ const OEM = {
 
 const num = (v) => (typeof v === 'bigint' ? Number(v) : v);
 
+/** 注入的键盘鼠标都在 dwExtraInfo 里带上这个标记（"RCLD"）：隐私屏的黑幕程序只放行带它的输入，挡掉电脑前的人（docs/11 第 4.4 节） */
+const INJECT_MARK = 0x52434c44;
+
 function readWide(fn, hwnd, cap) {
   const buf = new Uint16Array(cap);
   const len = fn(hwnd, buf, cap);
@@ -205,6 +254,65 @@ function processExePath(pid) {
   } finally {
     CloseHandle(h);
   }
+}
+
+const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x1;
+const DISPLAY_DEVICE_MIRRORING_DRIVER = 0x8;
+
+/**
+ * 现在接在桌面上的显示输出（EnumDisplayDevicesW），每个 { adapter: '\\.\DISPLAY1', adapterName: 显卡名, monitor: 显示器的设备 ID }。
+ * monitor 形如 MONITOR\AOC2790\{...}；虚拟屏驱动的是 MONITOR\MTT1337\...（vdisplay.js 据此分出真显示器）。取不到时是空串。
+ * 一块屏都没有（没接显示器、DP 显示器断了电）时返回空数组
+ */
+function activeDisplays() {
+  const out = [];
+  for (let i = 0; i < 64; i++) {
+    const adapter = { cb: koffi.sizeof(DISPLAY_DEVICEW) };
+    if (!EnumDisplayDevicesW(null, i, adapter, 0)) break;
+    if (!(adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) || adapter.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER) continue;
+    const monitor = { cb: koffi.sizeof(DISPLAY_DEVICEW) };
+    const found = EnumDisplayDevicesW(adapter.DeviceName, 0, monitor, 0);
+    out.push({ adapter: adapter.DeviceName, adapterName: adapter.DeviceString, monitor: found ? monitor.DeviceID : '' });
+  }
+  return out;
+}
+
+const ENUM_CURRENT_SETTINGS = -1;
+const DM_PELSWIDTH = 0x80000;
+const DM_PELSHEIGHT = 0x100000;
+const DM_DISPLAYFREQUENCY = 0x400000;
+const CDS_UPDATEREGISTRY = 0x1;
+
+/**
+ * 显示输出现在用的分辨率，和它支持的分辨率里面积最大的一档（同样大小取刷新率高的）：{ current, best }，
+ * 每个是 { width, height, frequency }。取不到返回 null
+ */
+function displayModes(adapter) {
+  const mode = (dm) => ({ width: dm.dmPelsWidth, height: dm.dmPelsHeight, frequency: dm.dmDisplayFrequency });
+  const cur = { dmSize: koffi.sizeof(DEVMODEW) };
+  if (!EnumDisplaySettingsW(adapter, ENUM_CURRENT_SETTINGS, cur)) return null;
+  let best = null;
+  for (let i = 0; i < 1000; i++) {
+    const dm = { dmSize: koffi.sizeof(DEVMODEW) };
+    if (!EnumDisplaySettingsW(adapter, i, dm)) break;
+    const m = mode(dm);
+    const area = m.width * m.height;
+    const bestArea = best ? best.width * best.height : -1;
+    if (area > bestArea || (area === bestArea && m.frequency > best.frequency)) best = m;
+  }
+  return best ? { current: mode(cur), best } : null;
+}
+
+/** 把显示输出切到这个分辨率，并记进系统设置（下次接上时也用它）。返回 ChangeDisplaySettingsExW 的结果，0 是成功 */
+function setDisplayMode(adapter, { width, height, frequency }) {
+  const dm = {
+    dmSize: koffi.sizeof(DEVMODEW),
+    dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
+    dmPelsWidth: width,
+    dmPelsHeight: height,
+    dmDisplayFrequency: frequency,
+  };
+  return ChangeDisplaySettingsExW(adapter, dm, 0, CDS_UPDATEREGISTRY, 0);
 }
 
 const LockWorkStation = user32.func('bool __stdcall LockWorkStation()');
@@ -322,7 +430,7 @@ function isFront(hwnd) {
 function keyInput(vk, flags) {
   const scan = vk ? MapVirtualKeyW(vk, 0) & 0xffff : 0;
   const ext = EXTENDED.has(vk) ? KEYEVENTF_EXTENDEDKEY : 0;
-  return { type: INPUT_KEYBOARD, u: { ki: { wVk: vk, wScan: scan, dwFlags: flags | ext, time: 0, dwExtraInfo: 0 } } };
+  return { type: INPUT_KEYBOARD, u: { ki: { wVk: vk, wScan: scan, dwFlags: flags | ext, time: 0, dwExtraInfo: INJECT_MARK } } };
 }
 
 function sendInputs(inputs) {
@@ -381,7 +489,7 @@ function pointHitsWindow(pt, hwnd) {
 
 /** 只松开/按下按键、不移动指针（目标窗口已不在前台时用来安全地松开按键） */
 function buttonOnlyInput(flags) {
-  return { type: INPUT_MOUSE, u: { mi: { dx: 0, dy: 0, mouseData: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } } };
+  return { type: INPUT_MOUSE, u: { mi: { dx: 0, dy: 0, mouseData: 0, dwFlags: flags, time: 0, dwExtraInfo: INJECT_MARK } } };
 }
 
 function mouseInput(pt, flags, data) {
@@ -401,7 +509,7 @@ function mouseInput(pt, flags, data) {
         mouseData: (data || 0) >>> 0,
         dwFlags: flags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: INJECT_MARK,
       },
     },
   };
@@ -414,7 +522,7 @@ function mouseInput(pt, flags, data) {
  * 返回注入成功的事件数；锁屏时注入不了，返回 0。
  */
 function wakeDisplay() {
-  const move = (dx) => ({ type: INPUT_MOUSE, u: { mi: { dx, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 } } });
+  const move = (dx) => ({ type: INPUT_MOUSE, u: { mi: { dx, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: INJECT_MARK } } });
   return sendInputs([move(1), move(-1)]);
 }
 
@@ -447,8 +555,8 @@ function textInputs(text) {
   const inputs = [];
   for (let i = 0; i < text.length; i++) {
     const unit = text.charCodeAt(i);
-    inputs.push({ type: INPUT_KEYBOARD, u: { ki: { wVk: 0, wScan: unit, dwFlags: KEYEVENTF_UNICODE, time: 0, dwExtraInfo: 0 } } });
-    inputs.push({ type: INPUT_KEYBOARD, u: { ki: { wVk: 0, wScan: unit, dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0 } } });
+    inputs.push({ type: INPUT_KEYBOARD, u: { ki: { wVk: 0, wScan: unit, dwFlags: KEYEVENTF_UNICODE, time: 0, dwExtraInfo: INJECT_MARK } } });
+    inputs.push({ type: INPUT_KEYBOARD, u: { ki: { wVk: 0, wScan: unit, dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, time: 0, dwExtraInfo: INJECT_MARK } } });
   }
   return inputs;
 }
@@ -500,6 +608,9 @@ module.exports = {
   frameBounds,
   isFront,
   isLocked,
+  activeDisplays,
+  displayModes,
+  setDisplayMode,
   lockWorkStation: () => !!LockWorkStation(),
   /** 让窗口自己关闭，效果和点窗口的 × 一样（发 WM_CLOSE，不动鼠标键盘）。只表示消息发出去了 */
   postClose: (hwnd) => !!PostMessageW(hwnd, WM_CLOSE, 0, 0),

@@ -18,6 +18,18 @@ const PUSH_TYPES = new Set(['push-register', 'push-unregister']);
  * 发给它的消息服务器收下、不转发。真的控制端编号是 12 位十六进制，不会和它撞。
  */
 const PUSH_VIEWER_ID = 'push';
+/**
+ * 电脑记下的解锁密码的密文（docs/06"记住解锁密码"）：电脑发给服务器自己的消息，不转发。
+ * 密文是电脑用 Windows DPAPI 加密的，服务器解不开；Base64 之后一般一千多个字符
+ */
+const SECRET_TYPE = 'unlock-secret';
+const MAX_SECRET_LEN = 4096;
+/**
+ * 每台电脑每小时最多存、删几次（正常只在解锁成功时存一次），最多取几次（每次连上服务器取一次，网络不好时重连多）。
+ * 分开算：重连得再勤也不会把存、删的次数用掉
+ */
+const MAX_SECRET_WRITES_PER_HOUR = 60;
+const MAX_SECRET_READS_PER_HOUR = 600;
 const HOST_TYPES = new Set(['windows', 'offer', 'ice', 'selected', 'error', 'window-closed', 'sessions', 'session-opened', 'session-failed', 'close-window-result', 'host-update-state', 'approvals', 'approval-result', 'host-state', 'host-cmd-result']);
 
 function send(ws, obj) {
@@ -30,9 +42,14 @@ class Hub {
    * @param {import('./auth').AuthService} opts.auth
    * @param {() => object[]} opts.iceServers 每次鉴权成功时调用，签发新的 TURN 临时凭据
    * @param {import('./push').PushService} [opts.push] 厂商推送；不给或没配置时不推送
+   * @param {import('./store').Store} [opts.store] 存电脑记下的解锁密码的密文；不给时回 unsupported
    */
-  constructor({ auth, iceServers, limits, log, push = null, now = Date.now }) {
+  constructor({ auth, iceServers, limits, log, push = null, store = null, now = Date.now }) {
     this.auth = auth;
+    this.store = store;
+    this.now = now;
+    this.secretWrites = new WindowCounter(MAX_SECRET_WRITES_PER_HOUR, 3600 * 1000, now);
+    this.secretReads = new WindowCounter(MAX_SECRET_READS_PER_HOUR, 3600 * 1000, now);
     this.push = push && push.enabled ? push : null;
     this.iceServers = iceServers;
     this.log = log || (() => {});
@@ -185,6 +202,7 @@ class Hub {
   }
 
   fromHost(ws, msg) {
+    if (msg.type === SECRET_TYPE) return this.unlockSecret(ws, msg);
     if (!HOST_TYPES.has(msg.type) || typeof msg.to !== 'string') return;
     // 电脑对每个控制端（含虚拟的）各发一份同样的列表；推过的不会再推，所以每份都交过去也没关系
     if (msg.type === 'approvals' && this.push) {
@@ -199,6 +217,39 @@ class Hub {
     if (!viewer) return;
     const { to, ...rest } = msg;
     send(viewer, { ...rest, host: ws.ctx.hostId });
+  }
+
+  /**
+   * 电脑存、取、删自己记下的解锁密码的密文：{ type: 'unlock-secret', op: 'get'|'put'|'delete', blob? }，
+   * 回 { type: 'unlock-secret', op, ok, blob?, error? }。只碰发消息的这台电脑自己那一条：
+   * 账号和电脑编号来自它的登录令牌，不看消息里写了什么；控制端碰不到（fromViewer 不认这个类型）。日志里不写密文
+   */
+  unlockSecret(ws, msg) {
+    const { userId, hostId } = ws.ctx;
+    const op = typeof msg.op === 'string' ? msg.op : '';
+    const reply = (extra) => send(ws, { type: SECRET_TYPE, op, ...extra });
+    if (!this.store) return reply({ ok: false, error: 'unsupported' });
+    if (op !== 'get' && op !== 'put' && op !== 'delete') return reply({ ok: false, error: 'bad-op' });
+    if ((op === 'get' ? this.secretReads : this.secretWrites).hit(JSON.stringify([userId, hostId]))) {
+      return reply({ ok: false, error: 'rate-limited' });
+    }
+    try {
+      if (op === 'get') return reply({ ok: true, blob: this.store.getUnlockSecret(userId, hostId) });
+      if (op === 'delete') {
+        this.store.deleteUnlockSecret(userId, hostId);
+        return reply({ ok: true });
+      }
+      const blob = msg.blob;
+      if (typeof blob !== 'string' || !blob || blob.length > MAX_SECRET_LEN || !/^[A-Za-z0-9+/]+={0,2}$/.test(blob)) {
+        return reply({ ok: false, error: 'bad-blob' });
+      }
+      this.store.putUnlockSecret(userId, hostId, blob, this.now());
+      this.log(`[host] ${ws.ctx.email} 的电脑 ${hostId} 记下了解锁密码（密文）`);
+      return reply({ ok: true });
+    } catch (err) {
+      this.log(`[host] 电脑 ${hostId} 的解锁密码 ${op} 失败: ${err && err.message}`);
+      return reply({ ok: false, error: 'failed' });
+    }
   }
 
   detach(ws) {
@@ -282,6 +333,8 @@ class Hub {
       ws.ping();
     }
     this.authFails.cleanup();
+    this.secretWrites.cleanup();
+    this.secretReads.cleanup();
   }
 }
 

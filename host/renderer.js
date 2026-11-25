@@ -108,9 +108,24 @@ function disconnect() {
     ws = null;
   }
   for (const id of [...peers.keys()]) closePeer(id);
+  // 和服务器断开了（被顶替、登录失效、网络断了）：控制端都看不到了，1 分钟内没重新连上、没人来操作就算控制结束
+  for (const id of viewers) bridge.controlGone(id);
 }
 
+/**
+ * 这些请求说明手机在控制这台电脑（docs/11 第 4.2 节），主进程据此防息屏、没有显示器时开虚拟屏。
+ * 审批的回答不算：那是 Claude Code 的钩子，不用画面。host-cmd 里的锁定电脑也不算（锁了还防息屏、开虚拟屏，和锁屏的意思相反）。
+ * 结束控制（host-cmd 的 release）在 hostcmd.js 里
+ */
+const CONTROL_TYPES = new Set(['list', 'select', 'list-sessions', 'open-session', 'new-session', 'close-window', 'host-cmd']);
+const NOT_CONTROL_OPS = new Set(['release', 'lock']);
+
 async function onMessage(msg) {
+  if (typeof msg.from === 'string' && CONTROL_TYPES.has(msg.type) && !(msg.type === 'host-cmd' && NOT_CONTROL_OPS.has(msg.op))) {
+    bridge.controlActivity(msg.from);
+  }
+  // 结束控制时它的画面连接也关掉：画面开着就一直算在控制（看画面的人数），release 就不起作用了
+  if (msg.type === 'host-cmd' && msg.op === 'release' && typeof msg.from === 'string') closePeer(msg.from);
   switch (msg.type) {
     case 'auth-ok': {
       iceServers = Array.isArray(msg.iceServers) ? msg.iceServers : [];
@@ -120,14 +135,21 @@ async function onMessage(msg) {
       // 断线期间离开的控制端，清掉它们残留的连接
       const alive = new Set(msg.viewers || []);
       for (const id of [...peers.keys()]) if (!alive.has(id)) closePeer(id);
+      for (const id of viewers) if (!alive.has(id)) bridge.controlGone(id);
       viewers.clear();
       for (const id of alive) {
         viewers.add(id);
         sendHostState(id);
         sendApprovals(id);
       }
+      // 记下的解锁密码（docs/06"记住解锁密码"）：密文在服务器上，每次连上取一次
+      bridge.secretFetch();
       break;
     }
+    case 'unlock-secret':
+      // 服务器对存、取、删密文的回应，交给主进程（这里只经手密文）
+      bridge.secretReply(msg);
+      break;
     case 'auth-fail':
       log('鉴权失败:', msg.reason);
       if (msg.reason === 'locked') {
@@ -160,6 +182,8 @@ async function onMessage(msg) {
       updateWatchers.delete(msg.id);
       viewers.delete(msg.id);
       closePeer(msg.id);
+      // 断开了不马上算结束：鸿蒙 App 退到后台就断开，回来会重新连上（docs/11 第 4.2 节）
+      bridge.controlGone(msg.id);
       break;
     case 'list':
       // 控制端说缩略图可以后补时，先回不带图的列表，截完图再补一份（winlist.js）
@@ -655,8 +679,13 @@ function closePeer(viewerId) {
 function lockMessage() {
   const msg = { t: 'lock', locked: lockState.locked, unlock: lockState.unlock };
   if (lockState.untrusted) msg.untrusted = true; // 只在是 true 时带，旧控制端不认这个字段
+  // 有记下的解锁密码（docs/06"记住解锁密码"）：手机点"解锁"时先用它，不弹输入框
+  if (lockState.saved && lockState.unlock) msg.saved = true;
   return msg;
 }
+
+// 主进程要和服务器存、取、删记下的解锁密码的密文
+bridge.onSecretSend((msg) => send({ type: 'unlock-secret', ...msg }));
 
 bridge.getLockState().then((s) => {
   if (s) lockState = s;
@@ -813,12 +842,23 @@ function tile(viewerId, ev) {
 let hostKey = null;
 
 function sendHostState(viewerId) {
-  send(RcHostCmd.stateMessage(viewerId, lockState, tileState, hostKey));
+  send(RcHostCmd.stateMessage(viewerId, lockState, tileState, hostKey, privacyOn));
 }
 
 function broadcastHostState() {
   for (const id of viewers) sendHostState(id);
 }
+
+/** 隐私屏开着没有（docs/11 第 4.4 节），放进 host-state 推给控制端 */
+let privacyOn = false;
+bridge.getPrivacyState().then((on) => {
+  privacyOn = !!on;
+  broadcastHostState();
+});
+bridge.onPrivacyState((on) => {
+  privacyOn = !!on;
+  broadcastHostState();
+});
 
 bridge.getHostKey().then((k) => {
   if (!k) return;
@@ -949,9 +989,12 @@ function unlock(viewerId, peer, ev) {
   const password = typeof ev.p === 'string' ? ev.p : '';
   ev.p = null; // 密码只交给主进程，不留在这里
   if (!id) return;
-  if (!password) return sendToViewer(peer, { t: 'unlock-result', id, ok: false, code: 'failed' });
-  log(`控制端 ${viewerId} 请求解锁`);
-  bridge.unlock(password).then((code) => {
+  // saved：用记下的密码（docs/06"记住解锁密码"），不带密码
+  if (!password && ev.saved !== true) return sendToViewer(peer, { t: 'unlock-result', id, ok: false, code: 'failed' });
+  log(`控制端 ${viewerId} 请求${password ? '' : '用记下的密码'}解锁`);
+  // privacy：手机要不要先盖隐私屏（docs/11 第 4.4 节）；save：解开以后记不记住这次的密码。主进程只认 true、false
+  const done = password ? bridge.unlock(password, ev.privacy, ev.save) : bridge.unlockSaved(ev.privacy);
+  done.then((code) => {
     log(code ? `解锁没有成功: ${code}` : '已从控制端解锁');
     sendToViewer(peer, code ? { t: 'unlock-result', id, ok: false, code } : { t: 'unlock-result', id, ok: true });
   });

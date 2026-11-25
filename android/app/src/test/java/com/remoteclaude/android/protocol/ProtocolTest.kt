@@ -241,8 +241,19 @@ class ProtocolTest {
             Protocol.parseLockState("""{"t":"lock","locked":true,"unlock":true,"untrusted":true}"""),
         )
         assertNull(Protocol.parseLockState("""{"t":"err","code":"locked"}"""))
+        // 电脑记着解锁密码（被控端 0.9.32 起）：要解锁服务能用才算；旧版没有这个字段，当作没记
+        assertEquals(
+            LockState(locked = true, unlockAvailable = true, saved = true),
+            Protocol.parseLockState("""{"t":"lock","locked":true,"unlock":true,"saved":true}"""),
+        )
+        assertEquals(false, Protocol.parseLockState("""{"t":"lock","locked":true,"unlock":false,"saved":true}""")?.saved)
+        assertEquals(false, Protocol.parseLockState("""{"t":"lock","locked":true,"unlock":true}""")?.saved)
 
         assertEquals(UnlockResult("u1", null), Protocol.parseUnlockResult("""{"t":"unlock-result","id":"u1","ok":true}"""))
+        assertEquals(
+            UnlockResult("u2", "saved-wrong"),
+            Protocol.parseUnlockResult("""{"t":"unlock-result","id":"u2","ok":false,"code":"saved-wrong"}"""),
+        )
         assertEquals(
             UnlockResult("u1", "still-locked"),
             Protocol.parseUnlockResult("""{"t":"unlock-result","id":"u1","ok":false,"code":"still-locked"}"""),
@@ -257,10 +268,27 @@ class ProtocolTest {
         assertEquals("arrange", tile.str("op"))
 
         assertEquals("lock-now", obj(InputEvents.lockNow()).str("t"))
-        val unlock = obj(InputEvents.unlock("u1", "p@ss 中文\"引号"))
+        val unlock = obj(InputEvents.unlock("u1", "p@ss 中文\"引号", privacy = true, save = true))
         assertEquals("unlock", unlock.str("t"))
         assertEquals("u1", unlock.str("id"))
         assertEquals("p@ss 中文\"引号", unlock.str("p"))
+        // 解锁前要不要先盖隐私屏（docs/11 第 4.4 节）、解开以后记不记住密码：开着、关着都明说，旧版被控端忽略
+        assertEquals("true", unlock["privacy"].toString())
+        assertEquals("true", unlock["save"].toString())
+        val plain = obj(InputEvents.unlock("u2", "x", privacy = false, save = false))
+        assertEquals("false", plain["privacy"].toString())
+        assertEquals("false", plain["save"].toString())
+        assertNull("手动输密码时不带 saved", plain["saved"])
+        // 被控端太旧、不认记住密码：不带 save
+        assertEquals(setOf("t", "id", "p", "privacy"), obj(InputEvents.unlock("u5", "x", privacy = true, save = null)).keys)
+
+        // 用记下的密码解锁：不带密码，带 saved: true
+        val saved = obj(InputEvents.unlockSaved("u3", privacy = true))
+        assertEquals(setOf("t", "id", "saved", "privacy"), saved.keys)
+        assertEquals(listOf("unlock", "u3"), listOf(saved.str("t"), saved.str("id")))
+        assertEquals("true", saved["saved"].toString())
+        assertEquals("true", saved["privacy"].toString())
+        assertEquals("false", obj(InputEvents.unlockSaved("u4", privacy = false))["privacy"].toString())
     }
 
     @Test
@@ -432,6 +460,61 @@ class ProtocolTest {
         assertEquals("arrange", arrange.str("op"))
         val unlock = obj(Protocol.hostCmd("pc-1", "unlock", req = "u1", enc = "QUJD"))
         assertEquals(listOf("unlock", "u1", "QUJD"), listOf(unlock.str("op"), unlock.str("req"), unlock.str("enc")))
+        assertEquals("没给 privacy 就不带", setOf("type", "host", "op", "req", "enc"), unlock.keys)
+        val unlockPrivate = obj(Protocol.hostCmd("pc-1", "unlock", req = "u1", enc = "QUJD", privacy = true))
+        assertEquals("true", unlockPrivate["privacy"].toString())
+        // 隐私屏开关、结束控制（被控端 0.9.32 起，docs/11）
+        val privacyOn = obj(Protocol.hostCmd("pc-1", "privacy", req = "p1", on = true))
+        assertEquals(setOf("type", "host", "op", "req", "on"), privacyOn.keys)
+        assertEquals("true", privacyOn["on"].toString())
+        assertEquals("false", obj(Protocol.hostCmd("pc-1", "privacy", req = "p2", on = false))["on"].toString())
+        assertEquals(setOf("type", "host", "op"), obj(Protocol.hostCmd("pc-1", "release")).keys)
+
+        // 记住解锁密码（被控端 0.9.32 起，2.9"记住解锁密码"）：手动输的带 save，用记下的带 saved、不带 enc
+        val unlockSave = obj(Protocol.hostCmd("pc-1", "unlock", req = "u1", enc = "QUJD", privacy = true, save = true))
+        assertEquals(setOf("type", "host", "op", "req", "enc", "privacy", "save"), unlockSave.keys)
+        assertEquals("true", unlockSave["save"].toString())
+        assertEquals("false", obj(Protocol.hostCmd("pc-1", "unlock", req = "u1", enc = "QUJD", save = false))["save"].toString())
+        val unlockSaved = obj(Protocol.hostCmd("pc-1", "unlock", req = "u2", privacy = false, saved = true))
+        assertEquals(setOf("type", "host", "op", "req", "privacy", "saved"), unlockSaved.keys)
+        assertEquals("true", unlockSaved["saved"].toString())
+        val forget = obj(Protocol.hostCmd("pc-1", "forget-password", req = "f1"))
+        assertEquals(setOf("type", "host", "op", "req"), forget.keys)
+        assertEquals(listOf("forget-password", "f1"), listOf(forget.str("op"), forget.str("req")))
+
+        // host-state 的 lock.saved：电脑记着密码；要解锁服务能用才算，旧版没有这个字段
+        assertEquals(
+            true,
+            (Protocol.parse("""{"type":"host-state","host":"pc-1","lock":{"locked":true,"unlock":true,"saved":true}}""") as Incoming.HostStatePush)
+                .state.lock.saved,
+        )
+        assertEquals(
+            false,
+            (Protocol.parse("""{"type":"host-state","host":"pc-1","lock":{"locked":true,"unlock":false,"saved":true}}""") as Incoming.HostStatePush)
+                .state.lock.saved,
+        )
+        assertEquals(
+            false,
+            (Protocol.parse("""{"type":"host-state","host":"pc-1","lock":{"locked":true,"unlock":true}}""") as Incoming.HostStatePush).state.lock.saved,
+        )
+
+        // 认不认"记住解锁密码"：0.9.32 起的 host-state 总带布尔的 privacy（开、关都算），旧版没有
+        fun canRemember(json: String) = (Protocol.parse(json) as Incoming.HostStatePush).state.canRemember
+        assertEquals(true, canRemember("""{"type":"host-state","host":"pc-1","lock":{"locked":true},"privacy":false}"""))
+        assertEquals(true, canRemember("""{"type":"host-state","host":"pc-1","lock":{"locked":true},"privacy":true}"""))
+        assertEquals(false, canRemember("""{"type":"host-state","host":"pc-1","lock":{"locked":true}}"""))
+        assertEquals(false, canRemember("""{"type":"host-state","host":"pc-1","lock":{"locked":true},"privacy":"true"}"""))
+        assertEquals(false, canRemember("""{"type":"host-state","host":"pc-1","lock":{"locked":true},"privacy":null}"""))
+
+        // host-state 的 privacy：开着时 true，旧版被控端没有这个字段，当作没开
+        assertEquals(
+            true,
+            (Protocol.parse("""{"type":"host-state","host":"pc-1","lock":{"locked":false},"privacy":true}""") as Incoming.HostStatePush).state.privacy,
+        )
+        assertEquals(
+            false,
+            (Protocol.parse("""{"type":"host-state","host":"pc-1","lock":{"locked":false}}""") as Incoming.HostStatePush).state.privacy,
+        )
 
         assertEquals(
             Incoming.HostCmdResult("pc-1", "u1", "unlock", ok = true, code = ""),

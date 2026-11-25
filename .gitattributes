@@ -5,3 +5,7 @@
 *.png binary
 *.jpg binary
 *.ico binary
+# 虚拟屏驱动（docs/11）：.cat 签名包含 .inf 的哈希，内容一个字节都不能改，不做行尾转换
+host/unlock-service/vdd/MttVDD.dll binary
+host/unlock-service/vdd/MttVDD.inf binary
+host/unlock-service/vdd/mttvdd.cat binary

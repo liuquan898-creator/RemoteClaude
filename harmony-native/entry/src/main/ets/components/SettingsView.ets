@@ -175,6 +175,13 @@ export struct SettingsView {
             })
           })
           SwitchRow({
+            title: '解锁时打开隐私屏', checked: this.s.settings.privacyOnUnlock,
+            note: '从手机解锁电脑时，电脑的显示器先盖上黑幕、挡住电脑前的键盘鼠标，旁边的人看不到桌面；不再控制这台电脑时先锁屏再撤掉',
+            onChange: (v: boolean) => controller.updateSettings((st: AppSettings) => {
+              st.privacyOnUnlock = v;
+            })
+          })
+          SwitchRow({
             title: '打开时验证身份', checked: this.s.settings.appLock && this.s.canLock, enabledRow: this.s.canLock,
             note: this.s.canLock ? '人脸、指纹或锁屏密码；离开超过 30 秒再回来时也要验证' : '这台手机没有设置锁屏密码，无法启用',
             onChange: (v: boolean) => controller.updateSettings((st: AppSettings) => {

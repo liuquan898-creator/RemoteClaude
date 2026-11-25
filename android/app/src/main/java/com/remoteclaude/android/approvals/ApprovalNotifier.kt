@@ -19,8 +19,8 @@ import com.remoteclaude.android.protocol.Approval
 data class PendingApproval(val hostId: String, val hostName: String, val item: Approval)
 
 /**
- * 审批的系统通知（docs/09 第 6 节）。App 在前台时不发（界面上能看到），切到后台后只给没在界面上看过的新审批发；
- * 审批在别处答了或结束了，通知自动撤掉。审批类的通知上有"允许""拒绝"，按了要先解锁手机；提问类的点开 App 作答。
+ * 审批的系统通知（docs/09 第 6 节）。App 在前台时不发（界面上能看到），切到后台后只给没在界面上看过的新审批发，
+ * 而且等手机收到它满 60 秒、电脑上还没处理才发（列表里马上就有）；审批在别处答了或结束了，通知自动撤掉。审批类的通知上有"允许""拒绝"，按了要先解锁手机；提问类的点开 App 作答。
  * 提示音是渠道的铃声，默认布谷鸟叫，用户在系统的通知设置里换或关；连着来几条只响第一条，断线重连后重发的不再响。
  * 审批通知归在同一组里，带一条不响的汇总。
  */
@@ -49,6 +49,8 @@ object ApprovalNotifier {
     private val seen = HashSet<String>()
     /** 响过、震过的审批：断线重连后同一个审批重新发通知时不再响 */
     private val alerted = LinkedHashSet<String>()
+    /** 新审批的通知推迟发（docs/09 第 6 节） */
+    private val alertDelay = ApprovalAlertDelay()
     /** 汇总通知上写的条数，0 表示没发 */
     private var summaryCount = 0
 
@@ -99,12 +101,15 @@ object ApprovalNotifier {
 
     /**
      * 按当前的审批列表增删通知；[foreground] 为真时撤掉全部（界面上能看到）。
-     * 一次发出几条新通知时只有第一条响铃、震动，其余静默；响过的审批重发通知也静默。
+     * 新审批推迟发（[ApprovalAlertDelay]）：手机收到满 60 秒、还没处理才发；[now] 是 SystemClock.elapsedRealtime。
+     * 一次发出几条新通知时只有第一条响铃、震动，其余静默；响过的审批重发通知也静默，也不再等。
+     * 返回还有推迟着的、多久以后要再调一次，没有为 null。
      */
     @SuppressLint("MissingPermission") // areNotificationsEnabled 已经检查过
-    fun sync(ctx: Context, list: List<PendingApproval>, foreground: Boolean) {
+    fun sync(ctx: Context, list: List<PendingApproval>, foreground: Boolean, now: Long): Long? {
         val nm = NotificationManagerCompat.from(ctx)
-        val ids = list.map { it.item.id }.toSet()
+        val order = list.map { it.item.id }
+        val ids = order.toSet()
         for (id in shown.toList()) {
             if (foreground || id !in ids) {
                 nm.cancel(TAG, notificationId(id))
@@ -114,18 +119,22 @@ object ApprovalNotifier {
         seen.retainAll(ids)
         if (foreground) {
             seen.addAll(ids)
+            alertDelay.track(order, now)
             syncSummary(ctx, nm)
-            return
+            return null
         }
         if (!nm.areNotificationsEnabled()) {
+            alertDelay.track(order, now)
             syncSummary(ctx, nm)
-            return
+            return null
         }
+        val decision = alertDelay.decide(order, skip = shown + seen, alerted = alerted, now = now)
+        val due = decision.post.toSet()
         val manyHosts = list.map { it.hostId }.distinct().size > 1
         var rang = false
         for (a in list) {
             val id = a.item.id
-            if (id in shown || id in seen) continue
+            if (id !in due || id in shown) continue
             val ring = alerted.add(id) && !rang
             if (ring) rang = true
             nm.notify(TAG, notificationId(id), build(ctx, a, manyHosts, silent = !ring))
@@ -133,6 +142,7 @@ object ApprovalNotifier {
         }
         while (alerted.size > 200) alerted.remove(alerted.first())
         syncSummary(ctx, nm)
+        return decision.recheckInMs
     }
 
     fun cancel(ctx: Context, approvalId: String) {

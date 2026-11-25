@@ -140,7 +140,7 @@ fun SessionsScreen(state: AppState, controller: RemoteController) {
             HostBar(state.hosts, state.hostId, onPick = controller::selectHost)
         }
         StatusBanner(state)
-        if (state.pcLocked) LockBanner(state, onUnlock = { hostDialogs.unlock = true })
+        if (state.pcLocked) LockBanner(state, onUnlock = controller::requestUnlock)
         ApprovalBanner(state, onOpen = controller::openApprovals)
         UpdateBanner(state, onUpdate = controller::startAppUpdate)
 

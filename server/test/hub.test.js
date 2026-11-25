@@ -125,6 +125,70 @@ test('电脑退出登录后从列表消失，连接被断开', async (t) => {
   viewer.close();
 });
 
+test('电脑记下的解锁密码（密文）：只有它自己能存、取、删，别的电脑、控制端碰不到；格式不对拒收', async (t) => {
+  const s = await startServer();
+  t.after(() => s.close());
+  const { viewerToken, hostToken } = await account(s, 'a@example.com');
+  const other = await s.login('a@example.com', 'password-123', 'host', 'pc-2', '家里电脑');
+  const host = await connect(s.wsUrl, auth('host', hostToken));
+  await host.next('auth-ok');
+  const host2 = await connect(s.wsUrl, auth('host', other.body.token));
+  await host2.next('auth-ok');
+  const ask = async (ws, msg) => {
+    ws.send(JSON.stringify({ type: 'unlock-secret', ...msg }));
+    return ws.next('unlock-secret');
+  };
+
+  assert.deepEqual(await ask(host, { op: 'get' }), { type: 'unlock-secret', op: 'get', ok: true, blob: null });
+  assert.deepEqual(await ask(host, { op: 'put', blob: 'djEwAAEC+/8=' }), { type: 'unlock-secret', op: 'put', ok: true });
+  assert.equal((await ask(host, { op: 'get' })).blob, 'djEwAAEC+/8=');
+  // 编号来自登录令牌：消息里写别的电脑也没用
+  assert.equal((await ask(host2, { op: 'get', host: 'pc-1' })).blob, null, '别的电脑读不到');
+  assert.equal((await ask(host, { op: 'put', blob: 'not base64!' })).error, 'bad-blob');
+  assert.equal((await ask(host, { op: 'put', blob: 'A'.repeat(4097) })).error, 'bad-blob');
+  assert.equal((await ask(host, { op: 'put' })).error, 'bad-blob');
+  assert.equal((await ask(host, { op: 'steal' })).error, 'bad-op');
+  assert.equal((await ask(host, { op: 'get' })).blob, 'djEwAAEC+/8=', '拒收的没把原来的盖掉');
+
+  // 控制端发这个类型不处理、也不转发给电脑
+  const viewer = await connect(s.wsUrl, auth('viewer', viewerToken));
+  await viewer.next('auth-ok');
+  viewer.send(JSON.stringify({ type: 'unlock-secret', op: 'get', host: 'pc-1' }));
+  await viewer.none('unlock-secret');
+  await host.none('unlock-secret');
+
+  assert.deepEqual(await ask(host, { op: 'delete' }), { type: 'unlock-secret', op: 'delete', ok: true });
+  assert.equal((await ask(host, { op: 'get' })).blob, null);
+  // 等服务器处理完控制端断开，再关服务器（不然断开时刷新电脑列表会碰到已经关掉的数据库）
+  viewer.close();
+  await host.next('viewer-leave');
+});
+
+test('电脑退出登录、账号重置密码时，记下的解锁密码一起删掉', async (t) => {
+  const s = await startServer();
+  t.after(() => s.close());
+  const { hostToken } = await account(s, 'a@example.com');
+  const store = s.app.store;
+  const userId = store.findUserByEmail('a@example.com').id;
+  store.putUnlockSecret(userId, 'pc-1', 'QUJD', 1);
+  store.putUnlockSecret(userId, 'pc-2', 'REVG', 1);
+  // 定时清理：没有登录令牌的电脑（过期了、没再登录）记下的删掉，登录着的留着
+  const other = await s.login('a@example.com', 'password-123', 'host', 'pc-2', '家里电脑');
+  store.putUnlockSecret(userId, 'pc-gone', 'R0hJ', 1);
+  store.purgeExpired(Date.now());
+  assert.equal(store.getUnlockSecret(userId, 'pc-gone'), null);
+  assert.equal(store.getUnlockSecret(userId, 'pc-2'), 'REVG');
+  assert.equal(other.status, 200);
+  await s.post('/api/auth/logout', {}, { token: hostToken });
+  assert.equal(store.getUnlockSecret(userId, 'pc-1'), null, '退出登录的那台删掉');
+  assert.equal(store.getUnlockSecret(userId, 'pc-2'), 'REVG', '别的电脑的不动');
+
+  await s.post('/api/auth/send-code', { email: 'a@example.com', purpose: 'reset' });
+  const r = await s.post('/api/auth/reset-password', { email: 'a@example.com', password: 'password-456', code: s.lastCode('a@example.com') });
+  assert.equal(r.status, 200);
+  assert.equal(store.getUnlockSecret(userId, 'pc-2'), null, '重置密码后都删掉');
+});
+
 test('电脑先断开、再退出登录，控制端的列表也会刷新', async (t) => {
   const s = await startServer();
   t.after(() => s.close());

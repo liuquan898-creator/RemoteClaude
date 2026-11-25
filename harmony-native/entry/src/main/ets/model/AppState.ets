@@ -81,6 +81,25 @@ export interface UploadProgress {
   fileName: string | null;
 }
 
+/**
+ * 锁定确认是为哪台电脑开的：打开时记下，提交时当前电脑换了就不发。label 是提示里的叫法（「电脑名」或"这台电脑"）
+ */
+export interface PcTarget {
+  hostId: string;
+  label: string;
+}
+
+/**
+ * 输密码解锁的对话框，为哪台电脑开的（同 PcTarget）。note 是额外的说明（比如记下的密码不对了），没有时为空串；
+ * canRemember：那台电脑的被控端认"记住密码"（0.9.32 起），不认时不显示那个勾、也不带 save
+ */
+export interface UnlockPrompt {
+  hostId: string;
+  label: string;
+  note: string;
+  canRemember: boolean;
+}
+
 /** 一条等作答的审批，带上它来自哪台电脑 */
 export interface PendingApproval {
   hostId: string;
@@ -159,8 +178,16 @@ export class AppState {
   /** 电脑上的解锁服务核实不过（多半是旧版，要在电脑上重新安装），和"没装"分开提示 */
   @Trace unlockUntrusted: boolean = false;
   @Trace unlocking: boolean = false;
+  /** 电脑记着上次解锁的密码（协议 2.9"记住解锁密码"）：点解锁时不弹输入框，直接用记下的 */
+  @Trace unlockSaved: boolean = false;
+  /** 电脑的被控端认"记住解锁密码"（0.9.32 起，看 host-state 里有没有布尔的 privacy） */
+  @Trace unlockCanRemember: boolean = false;
+  /** 输密码解锁的对话框开着，为哪台电脑开的；为 null 表示没开 */
+  @Trace unlockPrompt: UnlockPrompt | null = null;
   @Trace tileAvailable: boolean = false;
   @Trace tilePaused: boolean = false;
+  /** 电脑上的隐私屏开着（被控端 0.9.32 起，docs/11 第 4.4 节）：显示器盖着黑幕，电脑前的键鼠被挡住 */
+  @Trace pcPrivacy: boolean = false;
   @Trace collapsedGroups: string[] = [];
   @Trace settings: AppSettings = new AppSettings();
   /** App 锁着（要验证身份才能看） */
@@ -183,14 +210,35 @@ export class AppState {
     return h !== undefined && h.online;
   }
 
-  /** 换成这台电脑的锁屏、平铺状态；hs 为 null 表示不知道 */
+  /** 当前这台电脑在提示里的叫法：「电脑名」；没选电脑时是"这台电脑" */
+  pcLabel(): string {
+    const h = this.currentHost();
+    return h !== undefined && h.name.length > 0 ? `「${h.name}」` : '这台电脑';
+  }
+
+  /** 为当前这台电脑开锁定确认时记下它 */
+  pcTarget(): PcTarget {
+    const t: PcTarget = { hostId: this.hostId, label: this.pcLabel() };
+    return t;
+  }
+
+  /** 为当前这台电脑开解锁框时记下它；note 是额外的说明，没有时为空串 */
+  unlockPromptFor(note: string): UnlockPrompt {
+    const t: UnlockPrompt = { hostId: this.hostId, label: this.pcLabel(), note: note, canRemember: this.unlockCanRemember };
+    return t;
+  }
+
+  /** 换成这台电脑的锁屏、平铺、隐私屏状态；hs 为 null 表示不知道 */
   applyHostState(hs: HostState | null): void {
     this.hostCommands = hs !== null;
     this.hostTooOld = false;
     this.pcLocked = hs !== null && hs.lock.locked;
     this.unlockAvailable = hs !== null && hs.lock.unlockAvailable;
     this.unlockUntrusted = hs !== null && hs.lock.unlockUntrusted;
+    this.unlockSaved = hs !== null && hs.lock.saved;
+    this.unlockCanRemember = hs !== null && hs.canRemember;
     this.tileAvailable = hs !== null && hs.tile.available;
     this.tilePaused = hs !== null && hs.tile.paused;
+    this.pcPrivacy = hs !== null && hs.privacy;
   }
 }

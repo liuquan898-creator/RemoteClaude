@@ -117,6 +117,10 @@
       <button id="btnFont" type="button" role="menuitem" title="调电脑上 Claude 的字体大小">字体大小</button>
       <button id="menuLock" type="button" role="menuitem">锁定电脑</button>
       <div id="menuLockNote" class="menu-note muted" hidden></div>
+      <button id="menuPrivacy" type="button" role="menuitem" title="电脑的显示器盖上黑幕、挡住电脑前的键盘鼠标；关掉只撤黑幕，不锁屏" hidden>打开隐私屏</button>
+      <button id="menuForget" type="button" role="menuitem" title="电脑记着上次从这里解锁时输的密码，忘掉以后下次解锁要重新输入" hidden>忘掉记下的解锁密码</button>
+      <button id="menuPrivacyOnUnlock" type="button" role="menuitemcheckbox" aria-checked="true" class="toggle"
+        title="从这里解锁电脑时，电脑的显示器先盖上黑幕、挡住电脑前的键盘鼠标；不再控制这台电脑时先锁屏再撤掉">解锁时打开隐私屏<span id="menuPrivacyOnUnlockState" class="toggle-state">开</span></button>
       <button id="menuLogout" type="button" role="menuitem">退出登录</button>
       <div class="menu-note muted">账号 <span id="menuEmail"></span></div>
     </div>
@@ -135,11 +139,17 @@
 
   <div id="unlockDlg" class="overlay center" hidden>
     <!-- 不用 <form>：免得浏览器把 Windows 密码当成网站密码提示保存。一直用 type=password：
-         手机输入法才会当密码框处理，不记联想词、不走云联想，也不会在中文输入状态下打字 -->
+         手机输入法才会当密码框处理，不记联想词、不走云联想，也不会在中文输入状态下打字。
+         "记住密码"是电脑解开以后自己加密记下（docs/06"记住解锁密码"），浏览器里什么都不存 -->
     <div id="unlockForm" class="dialog" role="dialog" aria-labelledby="unlockDlgTitle">
       <strong id="unlockDlgTitle">解锁电脑</strong>
-      <p class="muted">输入这台电脑的 Windows 登录密码或 PIN。只用这一次，手机和电脑都不保存。</p>
+      <p id="unlockDlgNote" class="warn-text" hidden></p>
+      <p id="unlockDlgHint" class="muted">输入这台电脑的 Windows 登录密码或 PIN。</p>
       <input id="unlockPw" type="password" placeholder="密码或 PIN" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go" data-lpignore="true" data-1p-ignore>
+      <div id="unlockRememberBox" class="remember">
+        <label class="check"><input id="unlockRemember" type="checkbox" checked>记住密码</label>
+        <p class="muted fine">勾上时，电脑解开以后把密码加密存到服务器上，只有这台电脑解得开，以后登录这个账号就能直接解锁；浏览器自己不保存。不勾就只用这一次，原来记下的也删掉。</p>
+      </div>
       <div class="dialog-actions">
         <button id="unlockCancel" type="button">取消</button>
         <button id="unlockOk" type="button" class="primary">解锁</button>
